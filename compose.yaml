@@ -1,0 +1,78 @@
+# Shaferhund — Wazuh Manager + Alert Triage Agent
+# Wazuh 4.x Manager only (no OpenSearch, no indexer, no dashboard).
+# Alerts written to mounted volume, tailed by shaferhund-agent.
+#
+# Required env vars (pass via .env or shell):
+#   ANTHROPIC_API_KEY  — Claude API key for triage
+#   SHAFERHUND_TOKEN   — optional; unset = localhost-only binding
+#
+# Usage:
+#   cp .env.example .env && edit .env
+#   docker compose up -d   (or: podman compose up -d)
+
+services:
+  wazuh.manager:
+    image: wazuh/wazuh-manager:4.9.2
+    hostname: wazuh.manager
+    container_name: shaferhund-wazuh-manager
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -u $$API_USERNAME:$$API_PASSWORD -k -s -f -X POST https://localhost:55000/security/user/authenticate?raw=true -o /dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 655360
+        hard: 655360
+    ports:
+      - "1514:1514"
+      - "1515:1515"
+      - "514:514/udp"
+      - "55000:55000"
+    environment:
+      - WAZUH_NODE_NAME=manager
+      - WAZUH_CLUSTER_NODES=wazuh.manager
+      - WAZUH_CLUSTER_BIND_ADDR=wazuh.manager
+      - API_USERNAME=wazuh-wui
+      - API_PASSWORD=MyS3cr37P450r.*-
+    volumes:
+      - wazuh_api_configuration:/var/ossec/api/configuration
+      - wazuh_etc:/var/ossec/etc
+      - wazuh_logs:/var/ossec/logs
+      - wazuh_queue:/var/ossec/queue
+      - wazuh_var_multigroups:/var/ossec/var/multigroups
+
+  shaferhund-agent:
+    build: .
+    container_name: shaferhund-agent
+    restart: unless-stopped
+    depends_on:
+      wazuh.manager:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ALERTS_FILE=/var/ossec/logs/alerts/alerts.json
+      - DB_PATH=/data/shaferhund.db
+      - RULES_DIR=/rules
+      - TRIAGE_HOURLY_BUDGET=20
+      - SHAFERHUND_TOKEN=${SHAFERHUND_TOKEN:-}
+    volumes:
+      - wazuh_logs:/var/ossec/logs:ro
+      - shaferhund_rules:/rules
+      - shaferhund_data:/data
+
+volumes:
+  wazuh_api_configuration:
+  wazuh_etc:
+  wazuh_logs:
+  wazuh_queue:
+  wazuh_var_multigroups:
+  shaferhund_rules:
+  shaferhund_data:

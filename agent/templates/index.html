@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Shaferhund — Alert Triage</title>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0d1117; color: #e6edf3; min-height: 100vh; }
+    header { background: #161b22; border-bottom: 1px solid #30363d; padding: 1rem 2rem; display: flex; align-items: center; gap: 1rem; }
+    header h1 { font-size: 1.25rem; font-weight: 600; }
+    header .badge { font-size: 0.75rem; background: #1f6feb; color: #fff; padding: 0.2rem 0.6rem; border-radius: 12px; }
+    main { padding: 2rem; max-width: 1200px; margin: 0 auto; }
+    .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; }
+    .toolbar h2 { font-size: 1rem; color: #8b949e; }
+    .refresh-note { font-size: 0.75rem; color: #8b949e; }
+    table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
+    th { background: #21262d; color: #8b949e; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; padding: 0.75rem 1rem; text-align: left; }
+    td { padding: 0.75rem 1rem; border-top: 1px solid #21262d; font-size: 0.875rem; vertical-align: middle; }
+    tr:hover td { background: #1c2128; }
+    a { color: #58a6ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .sev { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
+    .sev-Critical { background: #3d0000; color: #ff7b72; }
+    .sev-High     { background: #2d1a00; color: #ffa657; }
+    .sev-Medium   { background: #2a2200; color: #e3b341; }
+    .sev-Low      { background: #0d2a0d; color: #56d364; }
+    .sev-Unknown  { background: #21262d; color: #8b949e; }
+    .pending      { color: #8b949e; font-style: italic; }
+    .empty        { text-align: center; padding: 3rem; color: #8b949e; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Shaferhund</h1>
+    <span class="badge">Alert Triage</span>
+  </header>
+  <main>
+    <div class="toolbar">
+      <h2>Alert Clusters</h2>
+      <span class="refresh-note">Auto-refreshes every 10s</span>
+    </div>
+
+    <div id="cluster-table"
+         hx-get="/"
+         hx-trigger="every 10s"
+         hx-target="#cluster-table"
+         hx-swap="outerHTML">
+      {% if clusters %}
+      <table>
+        <thead>
+          <tr>
+            <th>Severity</th>
+            <th>Source IP</th>
+            <th>Rule ID</th>
+            <th>Alerts</th>
+            <th>Window Start</th>
+            <th>Window End</th>
+            <th>Assessment</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for c in clusters %}
+          <tr>
+            <td>
+              {% if c.ai_severity %}
+                <span class="sev sev-{{ c.ai_severity }}">{{ c.ai_severity }}</span>
+              {% else %}
+                <span class="pending">pending</span>
+              {% endif %}
+            </td>
+            <td><a href="/clusters/{{ c.id }}">{{ c.src_ip }}</a></td>
+            <td>{{ c.rule_id }}</td>
+            <td>{{ c.alert_count }}</td>
+            <td>{{ c.window_start }}</td>
+            <td>{{ c.window_end }}</td>
+            <td>
+              {% if c.ai_analysis %}
+                {{ c.ai_analysis[:120] }}{% if c.ai_analysis|length > 120 %}…{% endif %}
+              {% else %}
+                <span class="pending">—</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <div class="empty" id="cluster-table">
+        No clusters yet. Waiting for alerts from Wazuh…
+      </div>
+      {% endif %}
+    </div>
+  </main>
+</body>
+</html>

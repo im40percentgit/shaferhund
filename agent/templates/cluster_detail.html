@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cluster {{ cluster.id[:8] }} — Shaferhund</title>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0d1117; color: #e6edf3; min-height: 100vh; }
+    header { background: #161b22; border-bottom: 1px solid #30363d; padding: 1rem 2rem; display: flex; align-items: center; gap: 1rem; }
+    header h1 { font-size: 1.25rem; font-weight: 600; }
+    a.back { color: #58a6ff; font-size: 0.875rem; text-decoration: none; }
+    a.back:hover { text-decoration: underline; }
+    main { padding: 2rem; max-width: 1200px; margin: 0 auto; }
+    section { margin-bottom: 2rem; }
+    h2 { font-size: 0.875rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.75rem; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.25rem; }
+    .meta-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 1rem; }
+    .meta-item label { display: block; font-size: 0.7rem; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.25rem; }
+    .meta-item span { font-size: 0.9rem; }
+    .sev { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 4px; font-size: 0.8rem; font-weight: 600; }
+    .sev-Critical { background: #3d0000; color: #ff7b72; }
+    .sev-High     { background: #2d1a00; color: #ffa657; }
+    .sev-Medium   { background: #2a2200; color: #e3b341; }
+    .sev-Low      { background: #0d2a0d; color: #56d364; }
+    .sev-Unknown  { background: #21262d; color: #8b949e; }
+    .assessment { margin-top: 1rem; font-size: 0.9rem; line-height: 1.6; color: #c9d1d9; }
+    .iocs { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.5rem; }
+    .ioc-tag { background: #21262d; border: 1px solid #30363d; border-radius: 4px; padding: 0.2rem 0.5rem; font-size: 0.75rem; font-family: monospace; }
+    pre { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 1rem; overflow-x: auto; font-size: 0.8rem; line-height: 1.5; color: #c9d1d9; }
+    .deploy-btn { margin-top: 1rem; background: #238636; color: #fff; border: none; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; font-size: 0.875rem; }
+    .deploy-btn:hover { background: #2ea043; }
+    .deployed-badge { display: inline-block; background: #0d2a0d; color: #56d364; border-radius: 4px; padding: 0.2rem 0.6rem; font-size: 0.75rem; margin-top: 0.5rem; }
+    table { width: 100%; border-collapse: collapse; }
+    th { background: #21262d; color: #8b949e; font-size: 0.7rem; text-transform: uppercase; padding: 0.6rem 0.75rem; text-align: left; }
+    td { padding: 0.6rem 0.75rem; border-top: 1px solid #21262d; font-size: 0.8rem; font-family: monospace; vertical-align: top; max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <a class="back" href="/">← Back</a>
+    <h1>Cluster {{ cluster.id[:8] }}</h1>
+  </header>
+  <main>
+
+    <!-- Cluster metadata -->
+    <section>
+      <h2>Summary</h2>
+      <div class="card">
+        <div class="meta-grid">
+          <div class="meta-item">
+            <label>Severity</label>
+            {% if cluster.ai_severity %}
+              <span class="sev sev-{{ cluster.ai_severity }}">{{ cluster.ai_severity }}</span>
+            {% else %}
+              <span style="color:#8b949e">pending triage</span>
+            {% endif %}
+          </div>
+          <div class="meta-item">
+            <label>Source IP</label>
+            <span>{{ cluster.src_ip }}</span>
+          </div>
+          <div class="meta-item">
+            <label>Rule ID</label>
+            <span>{{ cluster.rule_id }}</span>
+          </div>
+          <div class="meta-item">
+            <label>Alert Count</label>
+            <span>{{ cluster.alert_count }}</span>
+          </div>
+          <div class="meta-item">
+            <label>Window Start</label>
+            <span>{{ cluster.window_start }}</span>
+          </div>
+          <div class="meta-item">
+            <label>Window End</label>
+            <span>{{ cluster.window_end }}</span>
+          </div>
+        </div>
+        {% if cluster.ai_analysis %}
+        <div class="assessment">{{ cluster.ai_analysis }}</div>
+        {% endif %}
+      </div>
+    </section>
+
+    <!-- IOCs (parsed from ai_analysis JSON if present) -->
+    {% if rules %}
+    <section>
+      <h2>YARA Rules</h2>
+      {% for rule in rules %}
+      <div class="card" style="margin-bottom:1rem">
+        <div style="display:flex;align-items:center;gap:1rem;margin-bottom:0.75rem">
+          <span style="font-size:0.8rem;color:#8b949e">{{ rule.id[:8] }}</span>
+          {% if rule.syntax_valid %}
+            <span style="color:#56d364;font-size:0.75rem">syntax valid</span>
+          {% else %}
+            <span style="color:#ff7b72;font-size:0.75rem">syntax error</span>
+          {% endif %}
+          {% if rule.deployed %}
+            <span class="deployed-badge">deployed</span>
+          {% endif %}
+        </div>
+        <pre>{{ rule.rule_content }}</pre>
+        {% if rule.syntax_valid and not rule.deployed %}
+        <button class="deploy-btn"
+                hx-post="/rules/{{ rule.id }}/deploy"
+                hx-swap="outerHTML"
+                hx-target="this">
+          Deploy to /rules/
+        </button>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </section>
+    {% endif %}
+
+    <!-- Alert table -->
+    <section>
+      <h2>Alerts ({{ alerts|length }})</h2>
+      <div class="card" style="padding:0;overflow:hidden">
+        <table>
+          <thead>
+            <tr>
+              <th>Alert ID</th>
+              <th>Severity</th>
+              <th>Ingested At</th>
+              <th>Raw (truncated)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for a in alerts %}
+            <tr>
+              <td>{{ a.id }}</td>
+              <td>{{ a.severity }}</td>
+              <td>{{ a.ingested_at }}</td>
+              <td>{{ a.raw_json[:120] if a.raw_json else '' }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+</body>
+</html>

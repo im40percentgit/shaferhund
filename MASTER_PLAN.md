@@ -15,7 +15,7 @@ Agentic blue-team cybersecurity defense platform for solo security engineers at 
 
 ## Phase 1: Alert Triage Agent (Weekend Prototype)
 
-**Status:** planned
+**Status:** in-progress
 
 ### Architecture
 
@@ -119,6 +119,16 @@ shaferhund/
 - Offensive-defensive loop
 - Auto-generated honeypots and canary tokens
 - Threat intel mesh (requires separate design)
+
+## Decision Log
+
+| ID | Title | Status |
+|----|-------|--------|
+| DEC-CONFIG-001 | pydantic-settings for env var validation | accepted |
+| DEC-CLUSTER-001 | In-memory clusterer with SQLite persistence | accepted |
+| DEC-TRIAGE-001 | asyncio.Queue with hourly budget + exp backoff | accepted |
+| DEC-YARA-001 | Write YARA to /rules/ volume, no docker exec | accepted |
+| DEC-AUTH-001 | SHAFERHUND_TOKEN; unset = localhost-only binding | accepted |
 
 ## TODOs
 - [ ] Convert hund to ROADMAP.md (map 25 domains to phases)

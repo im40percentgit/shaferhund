@@ -1,0 +1,361 @@
+"""
+Claude API triage integration for Shaferhund.
+
+Sends alert clusters to Claude for:
+  - Severity classification (Critical / High / Medium / Low)
+  - IOC extraction (IPs, domains, file hashes, paths)
+  - YARA rule generation (when cluster looks malicious)
+  - Brief threat assessment narrative
+
+Queue design:
+  - asyncio.Queue fed by the file tailer, drained by a single worker task.
+  - Hourly budget (TRIAGE_HOURLY_BUDGET) tracked via a sliding counter.
+    When the budget is exhausted the worker sleeps until the next hour.
+  - Exponential backoff on API failure (base 2s, cap 300s, jitter ±10%).
+  - Queue depth capped at queue_max_depth; oldest item dropped on overflow.
+
+@decision DEC-TRIAGE-001
+@title asyncio.Queue with hourly budget and exponential backoff
+@status accepted
+@rationale Eng review mandated queue-and-retry with exp backoff. asyncio.Queue
+           is the natural fit for an async FastAPI app. The hourly budget
+           prevents runaway Claude API spend; the backoff avoids hammering
+           the API during transient failures. Both parameters are env-var
+           configurable (TRIAGE_HOURLY_BUDGET).
+"""
+
+import asyncio
+import json
+import logging
+import random
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Optional
+
+import anthropic
+
+from .cluster import Cluster
+from .config import Settings
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Structured response schema
+# ---------------------------------------------------------------------------
+
+TRIAGE_PROMPT = """\
+You are a cybersecurity analyst. Analyse the following alert cluster from a \
+Wazuh SIEM and respond with a JSON object matching the schema exactly.
+
+Alert cluster:
+{cluster_summary}
+
+Respond ONLY with valid JSON — no markdown fences, no commentary — matching:
+{{
+  "severity": "<Critical|High|Medium|Low>",
+  "threat_assessment": "<2-4 sentence summary>",
+  "iocs": {{
+    "ips": ["<ip>", ...],
+    "domains": ["<domain>", ...],
+    "hashes": ["<hash>", ...],
+    "paths": ["<filepath>", ...]
+  }},
+  "yara_rule": "<complete YARA rule string or empty string if not applicable>"
+}}
+
+For yara_rule: generate a syntactically valid YARA rule only if the cluster \
+indicates malicious activity (malware, lateral movement, exfiltration). \
+Leave as empty string for noisy/low-signal clusters.
+"""
+
+
+@dataclass
+class TriageResult:
+    """Parsed response from the Claude triage call."""
+
+    severity: str
+    threat_assessment: str
+    iocs: dict
+    yara_rule: str
+    cluster_id: str
+    raw_response: str = ""
+
+
+@dataclass
+class _BudgetTracker:
+    """Sliding hourly call counter.
+
+    Resets when the hour boundary changes. Not persisted across restarts —
+    acceptable for the prototype (worst case: a fresh start gets a full
+    hour's budget).
+    """
+
+    hourly_limit: int
+    _calls_this_hour: int = field(default=0, init=False)
+    _hour_key: int = field(default=-1, init=False)
+
+    def _current_hour(self) -> int:
+        return int(time.time()) // 3600
+
+    def can_call(self) -> bool:
+        hour = self._current_hour()
+        if hour != self._hour_key:
+            self._hour_key = hour
+            self._calls_this_hour = 0
+        return self._calls_this_hour < self.hourly_limit
+
+    def record_call(self) -> None:
+        hour = self._current_hour()
+        if hour != self._hour_key:
+            self._hour_key = hour
+            self._calls_this_hour = 0
+        self._calls_this_hour += 1
+
+    @property
+    def calls_this_hour(self) -> int:
+        return self._calls_this_hour
+
+    def seconds_until_reset(self) -> int:
+        return 3600 - (int(time.time()) % 3600)
+
+
+def _build_cluster_summary(cluster: Cluster) -> str:
+    """Summarise a cluster as a compact JSON string for the prompt."""
+    sample_alerts = cluster.alerts[:10]  # cap prompt size at 10 samples
+    return json.dumps(
+        {
+            "cluster_id": cluster.id,
+            "src_ip": cluster.src_ip,
+            "rule_id": cluster.rule_id,
+            "alert_count": cluster.alert_count,
+            "window_start": cluster.window_start.isoformat(),
+            "window_end": cluster.window_end.isoformat(),
+            "sample_alerts": [a.raw for a in sample_alerts],
+        },
+        default=str,
+        indent=2,
+    )
+
+
+def _parse_response(raw: str, cluster_id: str) -> TriageResult:
+    """Parse the JSON response from Claude into a TriageResult.
+
+    Falls back to a safe default if the response is malformed so the
+    worker never crashes on a bad API response.
+    """
+    try:
+        data = json.loads(raw)
+        return TriageResult(
+            severity=data.get("severity", "Unknown"),
+            threat_assessment=data.get("threat_assessment", ""),
+            iocs=data.get("iocs", {"ips": [], "domains": [], "hashes": [], "paths": []}),
+            yara_rule=data.get("yara_rule", ""),
+            cluster_id=cluster_id,
+            raw_response=raw,
+        )
+    except json.JSONDecodeError:
+        log.warning("Claude returned non-JSON for cluster %s: %s", cluster_id, raw[:200])
+        return TriageResult(
+            severity="Unknown",
+            threat_assessment="Parse error — see raw_response.",
+            iocs={"ips": [], "domains": [], "hashes": [], "paths": []},
+            yara_rule="",
+            cluster_id=cluster_id,
+            raw_response=raw,
+        )
+
+
+async def call_claude(
+    client: anthropic.AsyncAnthropic,
+    cluster: Cluster,
+    model: str,
+) -> TriageResult:
+    """Call Claude API for a single cluster. Raises on API error.
+
+    The worker wraps this in its retry loop — this function itself does
+    not retry; it just raises so the caller can apply backoff.
+    """
+    summary = _build_cluster_summary(cluster)
+    prompt = TRIAGE_PROMPT.format(cluster_summary=summary)
+
+    message = await client.messages.create(
+        model=model,
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = message.content[0].text
+    return _parse_response(raw, cluster.id)
+
+
+class TriageQueue:
+    """Async queue that drains cluster triage requests against Claude API.
+
+    Instantiated once at app startup; the background worker task runs for
+    the lifetime of the process.
+
+    Usage::
+
+        queue = TriageQueue(settings, on_result=save_to_db)
+        await queue.start()
+        await queue.enqueue(cluster)   # from the file tailer
+        # ... later at shutdown:
+        await queue.stop()
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        on_result,  # Callable[[TriageResult], Awaitable[None]]
+    ) -> None:
+        self._settings = settings
+        self._on_result = on_result
+        self._queue: asyncio.Queue[Cluster] = asyncio.Queue(
+            maxsize=settings.queue_max_depth
+        )
+        self._budget = _BudgetTracker(hourly_limit=settings.triage_hourly_budget)
+        self._client: Optional[anthropic.AsyncAnthropic] = None
+        self._worker_task: Optional[asyncio.Task] = None
+        self._running = False
+
+    async def start(self) -> None:
+        """Initialise the Claude client and start the background worker."""
+        self._client = anthropic.AsyncAnthropic(
+            api_key=self._settings.anthropic_api_key
+        )
+        self._running = True
+        self._worker_task = asyncio.create_task(self._worker(), name="triage-worker")
+        log.info(
+            "Triage queue started (budget=%d/hr, model=%s)",
+            self._settings.triage_hourly_budget,
+            self._settings.claude_model,
+        )
+
+    async def stop(self) -> None:
+        """Signal the worker to stop and wait for it to drain."""
+        self._running = False
+        if self._worker_task:
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+        if self._client:
+            await self._client.close()
+        log.info("Triage queue stopped")
+
+    async def enqueue(self, cluster: Cluster) -> bool:
+        """Add a cluster to the queue. Returns False and drops oldest if full.
+
+        Queue depth is capped at queue_max_depth. When full, the oldest
+        item is discarded (FIFO overflow = oldest dropped per eng review).
+        """
+        if self._queue.full():
+            try:
+                dropped = self._queue.get_nowait()
+                log.warning(
+                    "Queue full (depth=%d); dropped oldest cluster %s",
+                    self._settings.queue_max_depth,
+                    dropped.id,
+                )
+            except asyncio.QueueEmpty:
+                pass
+
+        try:
+            self._queue.put_nowait(cluster)
+            return True
+        except asyncio.QueueFull:
+            log.warning("Queue still full after drop attempt; cluster %s lost", cluster.id)
+            return False
+
+    @property
+    def depth(self) -> int:
+        """Current number of items waiting in the queue."""
+        return self._queue.qsize()
+
+    @property
+    def calls_this_hour(self) -> int:
+        return self._budget.calls_this_hour
+
+    # ------------------------------------------------------------------
+    # Internal worker
+    # ------------------------------------------------------------------
+
+    async def _worker(self) -> None:
+        """Background task: drain queue, apply budget, retry on failure."""
+        backoff = 2.0
+        backoff_cap = 300.0
+
+        while self._running:
+            try:
+                cluster = await asyncio.wait_for(self._queue.get(), timeout=5.0)
+            except asyncio.TimeoutError:
+                continue
+
+            # Budget gate
+            if not self._budget.can_call():
+                wait = self._budget.seconds_until_reset()
+                log.info(
+                    "Hourly budget exhausted (%d calls). Sleeping %ds.",
+                    self._settings.triage_hourly_budget,
+                    wait,
+                )
+                # Re-enqueue so the cluster isn't lost
+                await self.enqueue(cluster)
+                await asyncio.sleep(min(wait, 60))
+                continue
+
+            # Attempt triage with exponential backoff
+            attempt = 0
+            while True:
+                try:
+                    result = await call_claude(
+                        self._client,
+                        cluster,
+                        self._settings.claude_model,
+                    )
+                    self._budget.record_call()
+                    backoff = 2.0  # reset on success
+                    await self._on_result(result)
+                    log.info(
+                        "Triaged cluster %s → %s", cluster.id, result.severity
+                    )
+                    break
+                except anthropic.RateLimitError as exc:
+                    jitter = random.uniform(0.9, 1.1)
+                    sleep = min(backoff * jitter, backoff_cap)
+                    log.warning(
+                        "Rate limit on attempt %d for cluster %s; retry in %.1fs: %s",
+                        attempt,
+                        cluster.id,
+                        sleep,
+                        exc,
+                    )
+                    backoff = min(backoff * 2, backoff_cap)
+                    await asyncio.sleep(sleep)
+                    attempt += 1
+                except anthropic.APIError as exc:
+                    jitter = random.uniform(0.9, 1.1)
+                    sleep = min(backoff * jitter, backoff_cap)
+                    log.warning(
+                        "API error on attempt %d for cluster %s; retry in %.1fs: %s",
+                        attempt,
+                        cluster.id,
+                        sleep,
+                        exc,
+                    )
+                    backoff = min(backoff * 2, backoff_cap)
+                    await asyncio.sleep(sleep)
+                    attempt += 1
+                except Exception as exc:
+                    log.error(
+                        "Unexpected error triaging cluster %s (attempt %d): %s",
+                        cluster.id,
+                        attempt,
+                        exc,
+                        exc_info=True,
+                    )
+                    # Don't retry on unexpected errors — move on
+                    break
+
+            self._queue.task_done()
