@@ -6,18 +6,36 @@ Four tables: alerts, alert_details, clusters, rules.
 Raw alert JSON is stored separately (alert_details) to keep the
 alerts table lean for indexed queries.
 
+Phase 2 additions: multi-source alert columns on `alerts` table
+(added via idempotent ALTER TABLE in init_db) and a new `deploy_events`
+table for the policy-gated auto-deploy audit trail.
+
 @decision DEC-CLUSTER-001
 @title In-memory clusterer with SQLite persistence
 @status accepted
 @rationale Keeps the hot path (clustering) in memory for speed while
            persisting results durably. SQLite is sufficient for the
            target scale (<100 endpoints). No external DB dependency.
+
+@decision DEC-SCHEMA-002
+@title Extend alerts table via idempotent ALTER TABLE, no migration framework
+@status accepted
+@rationale Phase 1 databases are already deployed. Alembic or any migration
+           framework would require a migration script per deployment and adds
+           an operational dependency for a solo-dev tool. Instead, init_db
+           checks PRAGMA table_info(alerts) on every startup and issues
+           ALTER TABLE ADD COLUMN only for columns that are absent. This is
+           safe to run repeatedly (idempotent), requires no migration history
+           table, and upgrades a Phase 1 DB in place without data loss.
+           deploy_events is a new table created with CREATE TABLE IF NOT EXISTS,
+           which is already idempotent by definition.
 """
 
 import sqlite3
 import json
 import logging
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Generator, Optional
 
@@ -65,9 +83,44 @@ CREATE TABLE IF NOT EXISTS rules (
 );
 """
 
+# ---------------------------------------------------------------------------
+# Phase 2 schema additions
+# ---------------------------------------------------------------------------
+#
+# New columns for the alerts table.  Each entry is (column_name, full_definition)
+# where full_definition is the fragment that follows the column name in ALTER TABLE.
+# These are applied by init_db via PRAGMA table_info + conditional ALTER TABLE so
+# that Phase 1 databases upgrade in place and fresh databases land at the same shape.
+#
+_ALERTS_PHASE2_COLUMNS: list[tuple[str, str]] = [
+    ("source",             "TEXT NOT NULL DEFAULT 'wazuh'"),
+    ("dest_ip",            "TEXT"),
+    ("protocol",           "TEXT"),
+    ("normalized_severity","TEXT"),
+]
+
+# deploy_events tracks every auto-deploy and manual-deploy with enough context
+# to support one-click undo.  Created with IF NOT EXISTS so it is idempotent
+# for both fresh DBs and Phase 1 upgrades.
+_DEPLOY_EVENTS_SQL = """
+CREATE TABLE IF NOT EXISTS deploy_events (
+    id          INTEGER PRIMARY KEY,
+    rule_id     INTEGER NOT NULL,
+    action      TEXT    NOT NULL,
+    reason      TEXT,
+    actor       TEXT    NOT NULL DEFAULT 'orchestrator',
+    deployed_at TEXT    NOT NULL,
+    reverted_at TEXT
+);
+"""
+
 
 def init_db(db_path: str) -> sqlite3.Connection:
     """Open (or create) the SQLite database and apply schema.
+
+    Applies the Phase 1 base schema, then idempotently adds Phase 2 columns
+    to the alerts table via PRAGMA table_info checks before each ALTER TABLE.
+    Creates the deploy_events table with CREATE TABLE IF NOT EXISTS (always safe).
 
     Returns a connection with WAL mode enabled for concurrent reads.
     Caller is responsible for closing the connection.
@@ -79,6 +132,22 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA_SQL)
+
+    # Idempotent Phase 2 column additions — safe for Phase 1 DBs and fresh DBs.
+    existing_cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(alerts)").fetchall()
+    }
+    for col_name, col_def in _ALERTS_PHASE2_COLUMNS:
+        if col_name not in existing_cols:
+            conn.execute(
+                f"ALTER TABLE alerts ADD COLUMN {col_name} {col_def}"
+            )
+            log.info("alerts table: added column %s", col_name)
+
+    # deploy_events — idempotent by virtue of CREATE TABLE IF NOT EXISTS.
+    conn.executescript(_DEPLOY_EVENTS_SQL)
+
     conn.commit()
     log.info("Database initialised at %s", db_path)
     return conn
@@ -266,3 +335,88 @@ def get_stats(conn: sqlite3.Connection) -> dict:
         """
     ).fetchone()
     return dict(row) if row else {}
+
+
+# ---------------------------------------------------------------------------
+# Deploy Events CRUD  (Phase 2 — REQ-P0-P2-007)
+# ---------------------------------------------------------------------------
+
+def insert_deploy_event(
+    conn: sqlite3.Connection,
+    rule_id: int,
+    action: str,
+    reason: Optional[str] = None,
+    actor: str = "orchestrator",
+) -> int:
+    """Record a deploy lifecycle event and return the new row id.
+
+    Args:
+        rule_id: The integer PK of the rule being deployed/skipped/undone.
+        action:  One of 'auto-deploy', 'manual-deploy', 'skipped', 'undo-deploy'.
+        reason:  Human-readable explanation (optional).
+        actor:   Who triggered the event; defaults to 'orchestrator'.
+
+    Returns:
+        The newly inserted row id (INTEGER PRIMARY KEY).
+    """
+    deployed_at = datetime.now(timezone.utc).isoformat()
+    with get_cursor(conn) as cur:
+        cur.execute(
+            """
+            INSERT INTO deploy_events (rule_id, action, reason, actor, deployed_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (rule_id, action, reason, actor, deployed_at),
+        )
+        return cur.lastrowid
+
+
+def list_deploy_events(
+    conn: sqlite3.Connection,
+    rule_id: Optional[int] = None,
+    since: Optional[str] = None,
+) -> list[sqlite3.Row]:
+    """Return deploy events, optionally filtered by rule_id and/or a since timestamp.
+
+    Args:
+        rule_id: If given, return only events for this rule.
+        since:   ISO8601 string; if given, return only events where
+                 deployed_at >= since.
+
+    Returns:
+        List of rows ordered by deployed_at descending (newest first).
+    """
+    clauses: list[str] = []
+    params: list = []
+
+    if rule_id is not None:
+        clauses.append("rule_id = ?")
+        params.append(rule_id)
+    if since is not None:
+        clauses.append("deployed_at >= ?")
+        params.append(since)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = conn.execute(
+        f"SELECT * FROM deploy_events {where} ORDER BY deployed_at DESC",
+        params,
+    ).fetchall()
+    return rows
+
+
+def mark_deploy_reverted(conn: sqlite3.Connection, deploy_event_id: int) -> None:
+    """Set reverted_at to the current UTC time for the given deploy event.
+
+    Idempotent — calling twice sets reverted_at to a newer timestamp but
+    does not raise an error.  The undo endpoint always records the most
+    recent revert time.
+
+    Args:
+        deploy_event_id: The id (INTEGER PRIMARY KEY) of the deploy_events row.
+    """
+    reverted_at = datetime.now(timezone.utc).isoformat()
+    with get_cursor(conn) as cur:
+        cur.execute(
+            "UPDATE deploy_events SET reverted_at = ? WHERE id = ?",
+            (reverted_at, deploy_event_id),
+        )
