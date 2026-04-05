@@ -15,7 +15,9 @@ Agentic blue-team cybersecurity defense platform for solo security engineers at 
 
 ## Phase 1: Alert Triage Agent (Weekend Prototype)
 
-**Status:** in-progress
+**Status:** completed
+**Landed:** 2026-04-05 (commit `cc301c8`, fast-forward merge of `feature/phase1-alert-triage`)
+**Verified:** 2026-04-03 via tester trace `tester-20260403-184125-0382e0` — 7-layer verification, High confidence (unit tests ×9, module imports, YARA native extension, Docker image build, FastAPI live `/health`, parse→filter→cluster→SQLite pipeline smoke, source review vs spec). Acknowledged gaps: no live Claude API call (no key — mocked in unit tests), no full Wazuh compose stack run, no browser UI render.
 
 ### Architecture
 
@@ -101,6 +103,17 @@ shaferhund/
 - Feed simulated alerts, AI triage produces severity rankings
 - At least one YARA rule passes `yara --syntax-check`
 
+### Decision Log
+
+| ID | Title | Status |
+|----|-------|--------|
+| DEC-CONFIG-001 | pydantic-settings for env var validation | accepted |
+| DEC-CLUSTER-001 | In-memory clusterer with SQLite persistence | accepted |
+| DEC-TRIAGE-001 | asyncio.Queue with hourly budget + exp backoff | accepted |
+| DEC-YARA-001 | Write YARA to /rules/ volume, no docker exec | accepted |
+| DEC-AUTH-001 | SHAFERHUND_TOKEN; unset = localhost-only binding | accepted |
+| DEC-PHASE1-LAND | Phase 1 merged to main after High-confidence verification (trace `tester-20260403-184125-0382e0`) | accepted |
+
 ## Phase 2: Unified Defense Agent (Weeks 2-4)
 
 **Status:** planned
@@ -119,16 +132,6 @@ shaferhund/
 - Offensive-defensive loop
 - Auto-generated honeypots and canary tokens
 - Threat intel mesh (requires separate design)
-
-## Decision Log
-
-| ID | Title | Status |
-|----|-------|--------|
-| DEC-CONFIG-001 | pydantic-settings for env var validation | accepted |
-| DEC-CLUSTER-001 | In-memory clusterer with SQLite persistence | accepted |
-| DEC-TRIAGE-001 | asyncio.Queue with hourly budget + exp backoff | accepted |
-| DEC-YARA-001 | Write YARA to /rules/ volume, no docker exec | accepted |
-| DEC-AUTH-001 | SHAFERHUND_TOKEN; unset = localhost-only binding | accepted |
 
 ## TODOs
 - [ ] Convert hund to ROADMAP.md (map 25 domains to phases)
