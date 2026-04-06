@@ -1,6 +1,16 @@
-# Shaferhund — Wazuh Manager + Alert Triage Agent
+# Shaferhund — Wazuh Manager + Alert Triage Agent + Suricata NIDS
 # Wazuh 4.x Manager only (no OpenSearch, no indexer, no dashboard).
 # Alerts written to mounted volume, tailed by shaferhund-agent.
+# Suricata 7 runs in pcap-read mode fed by tcpreplay (no live NIC tap).
+#
+# @decision DEC-SURICATA-001
+# @title Suricata 7 container + pcap-replay via tcpreplay (no NIC tap)
+# @status accepted
+# @rationale Deterministic CI-friendly test stand: tcpreplay feeds known pcap
+#   fixtures into Suricata's pcap reader so eve.json output is reproducible
+#   without requiring a physical NIC or host network promiscuous mode.
+#   ET Open community rules baked at image build time; per-deploy rule
+#   updates deferred to Phase 3.
 #
 # Required env vars (pass via .env or shell):
 #   ANTHROPIC_API_KEY  — Claude API key for triage
@@ -47,6 +57,50 @@ services:
       - wazuh_queue:/var/ossec/queue
       - wazuh_var_multigroups:/var/ossec/var/multigroups
 
+  suricata:
+    image: jasonish/suricata:7.0-latest
+    container_name: shaferhund-suricata
+    restart: unless-stopped
+    # pcap-read mode (-r): processes the specified pcap file and writes
+    # alerts to /var/log/suricata/eve.json.  No live NIC is tapped.
+    # The -l flag sets the log directory. ET Open rules are baked into the
+    # jasonish/suricata image at build time via suricata-update.
+    command: >
+      -r /pcaps/${TCPREPLAY_PCAP:-malicious.pcap}
+      -l /var/log/suricata/
+    cap_add:
+      - NET_ADMIN
+      - SYS_NICE
+    volumes:
+      - suricata_logs:/var/log/suricata/
+      - ./tests/pcap-fixtures:/pcaps:ro
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /var/log/suricata/eve.json"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  tcpreplay:
+    image: ghcr.io/appneta/tcpreplay:latest
+    container_name: shaferhund-tcpreplay
+    restart: "no"
+    depends_on:
+      suricata:
+        condition: service_started
+    environment:
+      # Override TCPREPLAY_PCAP to replay a different fixture.
+      # The value is a filename relative to /pcaps/ inside the container.
+      - TCPREPLAY_PCAP=${TCPREPLAY_PCAP:-malicious.pcap}
+    volumes:
+      - ./tests/pcap-fixtures:/pcaps:ro
+    # Replay the selected pcap file onto the loopback interface.
+    # Suricata in this stack reads the pcap file directly via -r, so
+    # tcpreplay is provided for environments where live-replay testing is
+    # desired (e.g. running Suricata in af-packet mode during manual testing).
+    entrypoint: >
+      sh -c "tcpreplay --intf1=lo /pcaps/${TCPREPLAY_PCAP:-malicious.pcap} && echo '[tcpreplay] replay complete'"
+
   shaferhund-agent:
     build: .
     container_name: shaferhund-agent
@@ -67,6 +121,7 @@ services:
       - wazuh_logs:/var/ossec/logs:ro
       - shaferhund_rules:/rules
       - shaferhund_data:/data
+      - suricata_logs:/var/log/suricata:ro
 
 volumes:
   wazuh_api_configuration:
@@ -76,3 +131,4 @@ volumes:
   wazuh_var_multigroups:
   shaferhund_rules:
   shaferhund_data:
+  suricata_logs:
