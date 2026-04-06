@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     # Claude model
     claude_model: str = "claude-opus-4-5"
 
+    # Orchestrator caps (Phase 2)
+    orch_max_tool_calls: int = 5
+    orch_wall_timeout_seconds: float = 10.0
+
     @field_validator("triage_hourly_budget")
     @classmethod
     def budget_positive(cls, v: int) -> int:
