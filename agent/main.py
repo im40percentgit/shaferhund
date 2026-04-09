@@ -8,8 +8,8 @@ Responsibilities:
   - Wire together: file tailer → clusterer → triage queue → SQLite
 
 Background task lifecycle:
-  - startup: init DB, start triage queue worker, start tailer loop
-  - shutdown: cancel tailer, stop triage queue gracefully
+  - startup: init DB, start triage queue worker, start Wazuh + Suricata tailer loops
+  - shutdown: cancel tailers, stop triage queue gracefully
 
 Auth:
   - If SHAFERHUND_TOKEN is set, every non-health request requires
@@ -23,6 +23,22 @@ Auth:
 @rationale Simple token is sufficient for a single-user local deployment.
            Unset token = localhost-only is safer than unset token = open.
            No session management needed at this scale.
+
+@decision DEC-TAILER-001
+@title Dual independent tailer tasks feeding a single shared AlertClusterer
+@status accepted
+@rationale Wazuh and Suricata alert sources have different file formats,
+           poll paths, and severity scales. Running them as independent
+           asyncio Tasks allows each to maintain its own byte-offset state
+           and backoff behaviour without coupling. Both feed into the same
+           AlertClusterer instance so clustering, triage, and persistence
+           logic stays unified. The clusterer key includes `source` so
+           Wazuh and Suricata alerts on the same (src_ip, rule_id) pair
+           remain in separate clusters (DEC-CLUSTER-002).
+           Suricata severity (1-3) is mapped to the Wazuh 0-15 scale so
+           the same severity_min_level filter applies to both sources:
+           sev 1 → 7 (Critical), sev 2 → 6 (High), sev 3 → 5 (Medium).
+           Only sev 1 and 2 pass the default threshold of 7.
 """
 
 import asyncio
@@ -42,6 +58,7 @@ from fastapi.templating import Jinja2Templates
 
 from .cluster import Alert, AlertClusterer, Cluster, parse_wazuh_alert
 from .config import Settings, get_settings
+from .sources.suricata import parse_suricata_alert, tail_eve_json
 from .models import (
     get_cluster,
     get_cluster_alerts,
@@ -67,6 +84,7 @@ _db = None
 _triage_queue: Optional[TriageQueue] = None
 _clusterer: Optional[AlertClusterer] = None
 _tailer_task: Optional[asyncio.Task] = None
+_suricata_tailer_task: Optional[asyncio.Task] = None
 _poller_healthy: bool = False
 _last_poll_at: Optional[str] = None
 
@@ -77,7 +95,7 @@ _last_poll_at: Optional[str] = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _settings, _db, _triage_queue, _clusterer, _tailer_task
+    global _settings, _db, _triage_queue, _clusterer, _tailer_task, _suricata_tailer_task
 
     _settings = get_settings()
     _db = init_db(_settings.db_path)
@@ -88,18 +106,22 @@ async def lifespan(app: FastAPI):
     _triage_queue = TriageQueue(_settings, on_result=_save_triage_result)
     await _triage_queue.start()
 
-    _tailer_task = asyncio.create_task(_tailer_loop(), name="alert-tailer")
-    log.info("Shaferhund agent started")
+    _tailer_task = asyncio.create_task(_tailer_loop(), name="wazuh-tailer")
+    _suricata_tailer_task = asyncio.create_task(
+        _suricata_tailer_loop(), name="suricata-tailer"
+    )
+    log.info("Shaferhund agent started (wazuh-tailer + suricata-tailer running)")
 
     yield
 
-    # Shutdown
-    if _tailer_task:
-        _tailer_task.cancel()
-        try:
-            await _tailer_task
-        except asyncio.CancelledError:
-            pass
+    # Shutdown — cancel both tailer tasks
+    for task in (_tailer_task, _suricata_tailer_task):
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     if _triage_queue:
         await _triage_queue.stop()
     if _db:
@@ -300,6 +322,126 @@ async def _tailer_loop() -> None:
             continue
 
         await asyncio.sleep(_settings.poll_interval_seconds)
+
+
+# Suricata severity (1-3) → Wazuh-scale integer for the shared severity_min_level filter.
+# Mapping: 1=Critical→7, 2=High→6, 3=Medium→5.
+# Only sev 1 (→7) and sev 2 (→6) pass the default threshold of 7.
+# sev 3 (→5) and unknown (→0) are filtered out.
+_SURICATA_SEVERITY_MAP: dict[int, int] = {1: 7, 2: 6, 3: 5}
+
+
+async def _suricata_tailer_loop() -> None:
+    """Continuously tail Suricata eve.json, parse alert events, cluster them.
+
+    Mirrors the Wazuh _tailer_loop pattern: byte-offset tracking, exponential
+    backoff on failure, and severity pre-filtering before feeding the shared
+    AlertClusterer. Uses tail_eve_json() from agent.sources.suricata which
+    handles JSON parsing and skips malformed lines internally.
+
+    Suricata severity integers (1=Critical, 2=High, 3=Medium) are mapped to
+    the Wazuh 0-15 scale so that severity_min_level applies to both sources
+    (DEC-TAILER-001).
+    """
+    eve_file = _settings.suricata_eve_file
+    offset = 0
+    backoff = 2.0
+    backoff_cap = 300.0
+
+    # Seek to end on startup to avoid re-processing historical alerts
+    try:
+        offset = Path(eve_file).stat().st_size
+        log.info("Suricata tailer starting at offset %d for %s", offset, eve_file)
+    except FileNotFoundError:
+        log.warning("Suricata eve.json not found yet: %s — will retry", eve_file)
+
+    while True:
+        try:
+            new_offset, alerts_parsed = await asyncio.to_thread(
+                _read_suricata_lines, eve_file, offset
+            )
+            offset = new_offset
+
+            for fields in alerts_parsed:
+                await _process_suricata_alert(fields)
+
+            # Flush clusters whose window has expired (shared with Wazuh tailer)
+            if _clusterer:
+                expired = _clusterer.flush_expired()
+                for cluster in expired:
+                    await _persist_and_enqueue(cluster)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning(
+                "Suricata tailer error (backoff=%.1fs): %s", backoff, exc, exc_info=True
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, backoff_cap)
+            continue
+
+        await asyncio.sleep(_settings.suricata_poll_seconds)
+
+
+def _read_suricata_lines(eve_file: str, offset: int) -> tuple[int, list[dict]]:
+    """Read new alert lines from eve.json since last offset. Runs in thread pool.
+
+    Calls tail_eve_json which handles FileNotFoundError and malformed JSON
+    gracefully. Returns (new_offset, list_of_parsed_alert_dicts). Non-alert
+    event types are returned as-is; _process_suricata_alert filters them via
+    parse_suricata_alert.
+    """
+    parsed: list[dict] = []
+    new_offset = offset
+    for new_pos, line_dict in tail_eve_json(eve_file, from_position=offset):
+        new_offset = new_pos
+        parsed.append(line_dict)
+    return new_offset, parsed
+
+
+async def _process_suricata_alert(line_dict: dict) -> None:
+    """Parse one eve.json event dict and route to clusterer if it passes filters.
+
+    Filters:
+      1. parse_suricata_alert returns None for non-alert event_types.
+      2. Severity pre-filter: Suricata sev mapped to Wazuh scale, then
+         compared against settings.severity_min_level.
+    """
+    fields = parse_suricata_alert(line_dict)
+    if fields is None:
+        return  # not an alert event (flow, dns, anomaly, etc.)
+
+    # Map Suricata severity (1-3) to Wazuh integer scale for shared filter
+    suricata_sev_str = fields.get("normalized_severity", "Low")
+    sev_str_to_int = {"Critical": 1, "High": 2, "Medium": 3}
+    suricata_int = sev_str_to_int.get(suricata_sev_str, 99)
+    wazuh_scale_sev = _SURICATA_SEVERITY_MAP.get(suricata_int, 0)
+
+    if wazuh_scale_sev < _settings.severity_min_level:
+        return
+
+    src_ip = fields.get("src_ip") or "unknown"
+    try:
+        rule_id = int(fields["rule_id"])
+    except (KeyError, ValueError, TypeError):
+        log.warning("Suricata alert missing valid rule_id: %s", str(fields)[:120])
+        return
+
+    alert = Alert(
+        id=f"suricata:{fields.get('timestamp', '')}:{rule_id}:{src_ip}",
+        rule_id=rule_id,
+        src_ip=str(src_ip),
+        severity=wazuh_scale_sev,
+        raw=line_dict,
+        source="suricata",
+    )
+
+    closed = _clusterer.add(alert)
+    insert_alert(_db, alert.id, alert.rule_id, alert.src_ip, alert.severity, alert.raw)
+
+    for cluster in closed:
+        await _persist_and_enqueue(cluster)
 
 
 def _read_new_lines(alerts_file: str, offset: int) -> dict:

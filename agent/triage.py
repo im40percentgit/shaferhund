@@ -173,9 +173,77 @@ async def call_claude(
 ) -> TriageResult:
     """Call Claude API for a single cluster. Raises on API error.
 
+    Backwards-compat shim: attempts the orchestrator tool-use loop first
+    (agent.orchestrator.run_triage_loop). If the orchestrator raises
+    NotImplementedError (stubs not yet wired in Wave B), falls back to the
+    original single-shot JSON extraction path.
+
     The worker wraps this in its retry loop — this function itself does
     not retry; it just raises so the caller can apply backoff.
+
+    @decision DEC-TRIAGE-002
+    @title call_claude shim: orchestrator-first with single-shot fallback
+    @status accepted
+    @rationale The orchestrator tool-use loop (Phase 2) is a drop-in
+               replacement for single-shot triage but its tool handlers
+               are stubs until Wave B (issues #8/#9). The shim lets the
+               TriageQueue worker call call_claude unchanged while the
+               orchestrator gradually becomes real. NotImplementedError
+               from any stub causes graceful fallback so no cluster is
+               silently lost during the transition period.
     """
+    # Attempt the orchestrator tool-use loop (Phase 2 path).
+    # run_triage_loop is synchronous and expects a sync anthropic client;
+    # we run it in a thread to avoid blocking the event loop.
+    #
+    # Two fallback conditions:
+    #   1. NotImplementedError — orchestrator stubs not yet wired (Wave B).
+    #   2. TypeError/ValueError building the sync client — happens when
+    #      client.api_key is not a plain string (e.g. in unit tests that
+    #      pass a MagicMock). Treat as "orchestrator unavailable".
+    try:
+        import anthropic as _anthropic
+
+        api_key = client.api_key
+        if not isinstance(api_key, str):
+            raise TypeError(f"api_key must be str for orchestrator path, got {type(api_key)}")
+
+        sync_client = _anthropic.Anthropic(api_key=api_key)
+
+        from .orchestrator import run_triage_loop
+
+        # Build a minimal config-like object from the model string.
+        class _OrchestratorConfig:
+            claude_model = model
+            orch_max_tool_calls = 5
+            orch_wall_timeout_seconds = 10.0
+
+        cluster_dict = {
+            "cluster_id": cluster.id,
+            "src_ip": cluster.src_ip,
+            "rule_id": cluster.rule_id,
+            "alert_count": cluster.alert_count,
+            "window_start": cluster.window_start.isoformat(),
+            "window_end": cluster.window_end.isoformat(),
+            "sample_alerts": [a.raw for a in cluster.alerts[:10]],
+        }
+
+        result = await asyncio.to_thread(
+            run_triage_loop, cluster_dict, sync_client, _OrchestratorConfig()
+        )
+        # Ensure cluster_id is set correctly (run_triage_loop uses dict key)
+        result.cluster_id = cluster.id
+        return result
+
+    except (NotImplementedError, TypeError, ValueError) as exc:
+        # Orchestrator stubs not yet implemented, or client not usable — fall back.
+        log.debug(
+            "Orchestrator path unavailable for cluster %s (%s); falling back to single-shot triage",
+            cluster.id,
+            exc,
+        )
+
+    # Original single-shot JSON extraction path (Phase 1 fallback).
     summary = _build_cluster_summary(cluster)
     prompt = TRIAGE_PROMPT.format(cluster_summary=summary)
 
