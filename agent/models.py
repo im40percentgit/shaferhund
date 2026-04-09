@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS clusters (
     alert_count INTEGER,
     ai_severity TEXT,
     ai_analysis TEXT,
+    source TEXT NOT NULL DEFAULT 'wazuh',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -97,6 +98,13 @@ _ALERTS_PHASE2_COLUMNS: list[tuple[str, str]] = [
     ("dest_ip",            "TEXT"),
     ("protocol",           "TEXT"),
     ("normalized_severity","TEXT"),
+]
+
+# Idempotent additions to the clusters table.  Fresh DBs get the column via
+# SCHEMA_SQL above; Phase 1/Wave-A DBs that predate DEC-CLUSTER-002 get it
+# via the conditional ALTER TABLE in init_db.
+_CLUSTERS_PHASE2_COLUMNS: list[tuple[str, str]] = [
+    ("source", "TEXT NOT NULL DEFAULT 'wazuh'"),
 ]
 
 # deploy_events tracks every auto-deploy and manual-deploy with enough context
@@ -134,16 +142,28 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn.executescript(SCHEMA_SQL)
 
     # Idempotent Phase 2 column additions — safe for Phase 1 DBs and fresh DBs.
-    existing_cols = {
+    existing_alert_cols = {
         row[1]
         for row in conn.execute("PRAGMA table_info(alerts)").fetchall()
     }
     for col_name, col_def in _ALERTS_PHASE2_COLUMNS:
-        if col_name not in existing_cols:
+        if col_name not in existing_alert_cols:
             conn.execute(
                 f"ALTER TABLE alerts ADD COLUMN {col_name} {col_def}"
             )
             log.info("alerts table: added column %s", col_name)
+
+    # Idempotent clusters column additions (DEC-CLUSTER-002).
+    existing_cluster_cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(clusters)").fetchall()
+    }
+    for col_name, col_def in _CLUSTERS_PHASE2_COLUMNS:
+        if col_name not in existing_cluster_cols:
+            conn.execute(
+                f"ALTER TABLE clusters ADD COLUMN {col_name} {col_def}"
+            )
+            log.info("clusters table: added column %s", col_name)
 
     # deploy_events — idempotent by virtue of CREATE TABLE IF NOT EXISTS.
     conn.executescript(_DEPLOY_EVENTS_SQL)
@@ -218,18 +238,24 @@ def upsert_cluster(
     window_start: str,
     window_end: str,
     alert_count: int,
+    source: str = "wazuh",
 ) -> None:
-    """Insert or update a cluster record (without AI fields)."""
+    """Insert or update a cluster record (without AI fields).
+
+    The source column was added to the clusters table in Wave A (Phase 2
+    skeleton). It identifies which sensor produced the cluster's alerts
+    so the dashboard and triage prompt can surface the right context.
+    """
     with get_cursor(conn) as cur:
         cur.execute(
             """
-            INSERT INTO clusters (id, src_ip, rule_id, window_start, window_end, alert_count)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO clusters (id, src_ip, rule_id, window_start, window_end, alert_count, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 window_end   = excluded.window_end,
                 alert_count  = excluded.alert_count
             """,
-            (cluster_id, src_ip, rule_id, window_start, window_end, alert_count),
+            (cluster_id, src_ip, rule_id, window_start, window_end, alert_count, source),
         )
 
 

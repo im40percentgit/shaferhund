@@ -364,6 +364,7 @@ async def _persist_and_enqueue(cluster: Cluster) -> None:
         window_start=cluster.window_start.isoformat(),
         window_end=cluster.window_end.isoformat(),
         alert_count=cluster.alert_count,
+        source=cluster.source,
     )
     # Update alert rows with cluster assignment
     from .models import update_alert_cluster

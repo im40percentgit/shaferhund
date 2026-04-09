@@ -1,7 +1,7 @@
 """
 Alert clustering for Shaferhund.
 
-Groups incoming alerts into 5-minute windows keyed on (src_ip, rule_id).
+Groups incoming alerts into 5-minute windows keyed on (source, src_ip, rule_id).
 When a cluster exceeds max_alerts (50), it is split into a new cluster.
 
 Design:
@@ -19,6 +19,15 @@ Design:
 @rationale Hot path stays in memory; SQLite write happens only on cluster
            close. Keeps latency low for the 60s poll cycle. At target
            scale (<100 endpoints) a single dict is plenty.
+
+@decision DEC-CLUSTER-002
+@title Cluster key includes source to prevent cross-source alert merging
+@status accepted
+@rationale Wazuh and Suricata can both fire on the same src_ip + rule_id
+           combination. Merging those into one cluster would produce
+           nonsensical AI triage output. Including source in the key
+           (source:src_ip:rule_id) guarantees clusters are always
+           single-source, preserving semantic meaning for downstream triage.
 """
 
 import hashlib
@@ -42,6 +51,7 @@ class Alert:
     severity: int
     raw: dict
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    source: str = "wazuh"
 
 
 @dataclass
@@ -52,6 +62,7 @@ class Cluster:
     src_ip: str
     rule_id: int
     window_start: datetime
+    source: str = "wazuh"
     alerts: list[Alert] = field(default_factory=list)
 
     @property
@@ -63,9 +74,13 @@ class Cluster:
         return len(self.alerts)
 
 
-def _cluster_key(src_ip: str, rule_id: int) -> str:
-    """Stable string key for the open-clusters dict."""
-    return f"{src_ip}:{rule_id}"
+def _cluster_key(source: str, src_ip: str, rule_id: int) -> str:
+    """Stable string key for the open-clusters dict.
+
+    Includes source so Wazuh and Suricata alerts sharing the same
+    src_ip + rule_id never merge into the same cluster (DEC-CLUSTER-002).
+    """
+    return f"{source}:{src_ip}:{rule_id}"
 
 
 def _new_cluster_id(src_ip: str, rule_id: int, window_start: datetime) -> str:
@@ -105,7 +120,7 @@ class AlertClusterer:
         In case 2 the full cluster is returned and a new one is opened.
         """
         closed: list[Cluster] = []
-        key = _cluster_key(alert.src_ip, alert.rule_id)
+        key = _cluster_key(alert.source, alert.src_ip, alert.rule_id)
 
         with self._lock:
             existing = self._open.get(key)
@@ -129,6 +144,7 @@ class AlertClusterer:
                     src_ip=alert.src_ip,
                     rule_id=alert.rule_id,
                     window_start=alert.timestamp,
+                    source=alert.source,
                 )
                 self._open[key] = cluster
 
