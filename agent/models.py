@@ -304,6 +304,70 @@ def get_cluster_alerts(
     return cur.fetchall()
 
 
+def get_cluster_with_alerts(
+    conn: sqlite3.Connection, cluster_id: str
+) -> Optional[dict]:
+    """Fetch a cluster row and all its member alerts in one call.
+
+    Combines get_cluster + get_cluster_alerts into a single composite dict
+    suitable for JSON serialisation by the orchestrator tool handler.
+
+    Returns:
+        dict with keys: cluster (all cluster columns as dict) and
+        alerts (list of dicts, each with alert + raw_json fields).
+        Returns None if the cluster does not exist.
+    """
+    cluster_row = get_cluster(conn, cluster_id)
+    if cluster_row is None:
+        return None
+
+    alert_rows = get_cluster_alerts(conn, cluster_id)
+    alerts = []
+    for row in alert_rows:
+        alert = dict(row)
+        # raw_json is stored as a JSON string; parse it so callers get a dict.
+        raw = alert.pop("raw_json", None)
+        if raw:
+            try:
+                alert["raw"] = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                alert["raw"] = raw
+        alerts.append(alert)
+
+    return {
+        "cluster": dict(cluster_row),
+        "alerts": alerts,
+    }
+
+
+def get_alerts_by_src_ip(
+    conn: sqlite3.Connection, src_ip: str, hours: int = 24
+) -> list[dict]:
+    """Return alerts for a given src_ip within a recent time window.
+
+    Args:
+        conn:   Open SQLite connection.
+        src_ip: Source IP address to filter on.
+        hours:  How many hours back from now to include. Defaults to 24.
+
+    Returns:
+        List of dicts with keys: id, rule_id, src_ip, severity, source,
+        cluster_id, ingested_at.  Ordered newest first.
+        Returns an empty list when no alerts match.
+    """
+    rows = conn.execute(
+        """
+        SELECT id, rule_id, src_ip, severity, source, cluster_id, ingested_at
+        FROM alerts
+        WHERE src_ip = ?
+          AND ingested_at >= datetime('now', ? || ' hours')
+        ORDER BY ingested_at DESC
+        """,
+        (src_ip, f"-{hours}"),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 # ---------------------------------------------------------------------------
 # Rules CRUD
 # ---------------------------------------------------------------------------

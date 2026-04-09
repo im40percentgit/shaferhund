@@ -6,13 +6,18 @@ Claude can fetch cluster context, search related alerts, draft YARA/Sigma
 rules, recommend deployment, and finalize triage — all within a single
 reasoning session bounded by hard caps.
 
-The tool handlers in this file are stubs (raise NotImplementedError). Real
-implementations land in Wave B (issues #7 and #8). The control flow, schema
-validation, caps, and failsafe are fully operational here.
+Read tools (get_cluster_context, search_related_alerts) are fully implemented
+here. Write tools (write_yara_rule, write_sigma_rule, recommend_deploy) remain
+stubs pending issue #9.
+
+The read handlers are exposed as standalone functions for direct unit-testing,
+but need a DB connection to operate. run_triage_loop accepts an optional `conn`
+parameter; when provided, it builds a local dispatch dict that injects the
+connection via closures, overriding the module-level stubs for the read tools.
 
 @decision DEC-ORCH-001
 @title Claude tool-use loop with 6 tools, 5-call / 10s caps
-@status planned
+@status accepted
 @rationale Single-shot JSON extraction (Phase 1) can't handle multi-step
            reasoning: fetching extra context, drafting rules, deciding whether
            to deploy — all in one pass. A tool-use loop lets Claude act as an
@@ -20,13 +25,25 @@ validation, caps, and failsafe are fully operational here.
            prevent runaway API spend. The failsafe ensures a verdict always
            lands even if the loop exits abnormally. Wave B fills in real
            implementations behind the same interface.
+
+@decision DEC-ORCH-002
+@title Read handlers are standalone functions; DB connection injected via conn param
+@status accepted
+@rationale Keeping handlers as module-level functions (not a class) preserves
+           the existing dispatch dict pattern and makes each handler independently
+           testable without instantiating an orchestrator object. run_triage_loop
+           receives an optional conn and builds closures locally, so no global
+           state or module-level connection is required. Write tools (#9) follow
+           the same pattern.
 """
 
 import json
 import logging
+import sqlite3
 import time
-from typing import Any
+from typing import Any, Optional
 
+from .models import get_alerts_by_src_ip, get_cluster_with_alerts
 from .triage import TriageResult
 
 log = logging.getLogger(__name__)
@@ -245,27 +262,135 @@ def build_cluster_context_prompt(cluster: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool handler stubs
+# Tool handlers — read tools (issue #8)
 # ---------------------------------------------------------------------------
 
-def _handle_get_cluster_context(tool_input: dict) -> str:
-    """Stub: retrieve full cluster context from the database.
+def _handle_get_cluster_context(tool_input: dict, conn: sqlite3.Connection) -> str:
+    """Return full cluster context as a JSON string.
 
-    Will be implemented in Wave B (issue #7).
+    Fetches the cluster row and all member alerts from the DB, then builds a
+    summary dict with cluster metadata and up to 5 sample alerts. Returns an
+    error JSON if the cluster is not found.
+
+    This is a READ-ONLY handler — it never modifies DB state.
+
+    Args:
+        tool_input: Dict with key ``cluster_id`` (int or str).
+        conn:       Open SQLite connection (injected by run_triage_loop).
+
+    Returns:
+        JSON string — either a cluster summary or ``{"error": "..."}`` if the
+        cluster does not exist.
     """
-    raise NotImplementedError(
-        "get_cluster_context will be implemented in issue #7"
-    )
+    cluster_id = str(tool_input.get("cluster_id", ""))
+    if not cluster_id:
+        return json.dumps({"error": "cluster_id is required"})
+
+    data = get_cluster_with_alerts(conn, cluster_id)
+    if data is None:
+        return json.dumps({"error": f"cluster '{cluster_id}' not found"})
+
+    cluster = data["cluster"]
+    alerts = data["alerts"]
+
+    # Build sample_alerts — first 5, key fields only, to keep the context compact.
+    sample_alerts = []
+    for a in alerts[:5]:
+        sample_alerts.append({
+            "id":          a.get("id"),
+            "rule_id":     a.get("rule_id"),
+            "src_ip":      a.get("src_ip"),
+            "severity":    a.get("severity"),
+            "source":      a.get("source"),
+            "ingested_at": a.get("ingested_at"),
+        })
+
+    summary = {
+        "cluster_id":   cluster.get("id"),
+        "src_ip":       cluster.get("src_ip"),
+        "source":       cluster.get("source"),
+        "rule_id":      cluster.get("rule_id"),
+        "alert_count":  cluster.get("alert_count"),
+        "window_start": cluster.get("window_start"),
+        "window_end":   cluster.get("window_end"),
+        "sample_alerts": sample_alerts,
+    }
+    log.debug("get_cluster_context: cluster=%s alerts=%d", cluster_id, len(alerts))
+    return json.dumps(summary, default=str)
 
 
-def _handle_search_related_alerts(tool_input: dict) -> str:
-    """Stub: search related alerts by src_ip across a time window.
+def _handle_search_related_alerts(tool_input: dict, conn: sqlite3.Connection) -> str:
+    """Search for alerts from a given src_ip across a time window.
 
-    Will be implemented in Wave B (issue #7).
+    Groups results by source (wazuh vs suricata) and returns counts plus a
+    sample of rule IDs seen per source. Returns a JSON object with
+    ``total_count=0`` when no alerts match — never an error for empty results.
+
+    This is a READ-ONLY handler — it never modifies DB state.
+
+    Args:
+        tool_input: Dict with keys ``src_ip`` (str) and
+                    ``time_range_hours`` (int).
+        conn:       Open SQLite connection (injected by run_triage_loop).
+
+    Returns:
+        JSON string with keys: total_count, by_source, time_range_hours.
     """
-    raise NotImplementedError(
-        "search_related_alerts will be implemented in issue #7"
+    src_ip = tool_input.get("src_ip", "")
+    hours = int(tool_input.get("time_range_hours", 24))
+
+    if not src_ip:
+        return json.dumps({"error": "src_ip is required"})
+
+    alerts = get_alerts_by_src_ip(conn, src_ip, hours)
+
+    # Group by source — collect counts and a deduplicated sample of rule_ids.
+    by_source: dict[str, dict] = {}
+    for alert in alerts:
+        source = alert.get("source") or "unknown"
+        if source not in by_source:
+            by_source[source] = {"count": 0, "sample_rule_ids": []}
+        by_source[source]["count"] += 1
+        rule_id = alert.get("rule_id")
+        if rule_id is not None and rule_id not in by_source[source]["sample_rule_ids"]:
+            by_source[source]["sample_rule_ids"].append(rule_id)
+
+    result = {
+        "total_count":      len(alerts),
+        "by_source":        by_source,
+        "time_range_hours": hours,
+    }
+    log.debug(
+        "search_related_alerts: src_ip=%s hours=%d total=%d",
+        src_ip,
+        hours,
+        len(alerts),
     )
+    return json.dumps(result, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Closure factory — injects DB connection into read handlers
+# ---------------------------------------------------------------------------
+
+def make_read_tool_handlers(conn: sqlite3.Connection) -> dict:
+    """Return a partial dispatch dict with DB-bound read tool handlers.
+
+    Used by run_triage_loop to override the module-level stubs for
+    get_cluster_context and search_related_alerts when a real DB connection
+    is available. Write tool stubs are NOT overridden here — they remain
+    as NotImplementedError stubs until issue #9.
+
+    Args:
+        conn: Open SQLite connection to inject into the closures.
+
+    Returns:
+        Dict mapping tool name → callable(tool_input: dict) -> str.
+    """
+    return {
+        "get_cluster_context":    lambda ti: _handle_get_cluster_context(ti, conn),
+        "search_related_alerts":  lambda ti: _handle_search_related_alerts(ti, conn),
+    }
 
 
 def _handle_write_yara_rule(tool_input: dict) -> str:
@@ -315,14 +440,29 @@ def _handle_finalize_triage(tool_input: dict) -> TriageResult:
     )
 
 
+def _no_conn_read_stub(tool_name: str) -> str:
+    """Return an informative JSON error when a read tool is called without a DB connection.
+
+    Used as the fallback in _TOOL_DISPATCH for get_cluster_context and
+    search_related_alerts when run_triage_loop is called without a conn.
+    Claude receives a clear message and can proceed to finalize_triage.
+    """
+    return json.dumps({
+        "error": f"Tool '{tool_name}' requires a database connection (conn=None in run_triage_loop)."
+    })
+
+
 # Map tool names to their handler functions.
+# Read tools (get_cluster_context, search_related_alerts) use no-conn stubs
+# here; they are replaced with real DB-bound closures in run_triage_loop when
+# conn is provided via make_read_tool_handlers().
 _TOOL_DISPATCH: dict[str, Any] = {
-    "get_cluster_context": _handle_get_cluster_context,
-    "search_related_alerts": _handle_search_related_alerts,
-    "write_yara_rule": _handle_write_yara_rule,
-    "write_sigma_rule": _handle_write_sigma_rule,
-    "recommend_deploy": _handle_recommend_deploy,
-    "finalize_triage": _handle_finalize_triage,
+    "get_cluster_context":   lambda ti: _no_conn_read_stub("get_cluster_context"),
+    "search_related_alerts": lambda ti: _no_conn_read_stub("search_related_alerts"),
+    "write_yara_rule":       _handle_write_yara_rule,
+    "write_sigma_rule":      _handle_write_sigma_rule,
+    "recommend_deploy":      _handle_recommend_deploy,
+    "finalize_triage":       _handle_finalize_triage,
 }
 
 # Default verdict returned when the loop exits without finalize_triage.
@@ -340,7 +480,12 @@ _FAILSAFE_RESULT = TriageResult(
 # ---------------------------------------------------------------------------
 
 
-def run_triage_loop(cluster: dict, claude_client: Any, config: Any) -> TriageResult:
+def run_triage_loop(
+    cluster: dict,
+    claude_client: Any,
+    config: Any,
+    conn: Optional[sqlite3.Connection] = None,
+) -> TriageResult:
     """Run the Claude tool-use loop for a single alert cluster.
 
     Drives Claude through up to config.orch_max_tool_calls tool-use iterations
@@ -355,6 +500,10 @@ def run_triage_loop(cluster: dict, claude_client: Any, config: Any) -> TriageRes
                        integration handled by the caller in Wave B).
         config:        Settings instance (must have orch_max_tool_calls and
                        orch_wall_timeout_seconds attributes).
+        conn:          Optional SQLite connection. When provided, the read tool
+                       handlers (get_cluster_context, search_related_alerts)
+                       are wired to the real DB via closures. When None, those
+                       tools return a "not available" message to Claude.
 
     Returns:
         TriageResult with the final verdict (from finalize_triage or failsafe).
@@ -362,6 +511,12 @@ def run_triage_loop(cluster: dict, claude_client: Any, config: Any) -> TriageRes
     max_calls: int = config.orch_max_tool_calls
     wall_timeout: float = config.orch_wall_timeout_seconds
     cluster_id: str = str(cluster.get("cluster_id", "unknown"))
+
+    # Build an effective dispatch dict: start from the module-level stubs and
+    # overlay with DB-bound closures when a connection is available.
+    effective_dispatch: dict[str, Any] = dict(_TOOL_DISPATCH)
+    if conn is not None:
+        effective_dispatch.update(make_read_tool_handlers(conn))
 
     prompt = build_cluster_context_prompt(cluster)
     messages: list[dict] = [{"role": "user", "content": prompt}]
@@ -460,8 +615,8 @@ def run_triage_loop(cluster: dict, claude_client: Any, config: Any) -> TriageRes
             result.cluster_id = cluster_id
             return result
 
-        # Dispatch to the stub handler — catch NotImplementedError gracefully.
-        handler = _TOOL_DISPATCH.get(tool_name)
+        # Dispatch to the handler — catch NotImplementedError gracefully for stubs.
+        handler = effective_dispatch.get(tool_name)
         if handler is None:
             tool_result_content = f"Error: unknown tool '{tool_name}'"
             log.error("Orchestrator: unknown tool %r for cluster %s", tool_name, cluster_id)

@@ -8,38 +8,52 @@ Orchestrator tests — mock-driven, no real Anthropic API calls required.
 # implementations — nothing internal is mocked.
 
 Tests:
-  1. test_tool_schema_valid         — TOOLS list has all required keys + correct structure
-  2. test_loop_finalizes_successfully — 3-call loop ending in finalize_triage returns result
-  3. test_loop_enforces_call_cap    — 6 tool_use responses, loop stops after 5 (cap)
-  4. test_loop_enforces_wall_timeout — mock sleeps, wall timeout fires, failsafe returned
-  5. test_failsafe_on_end_turn_without_finalize — end_turn without finalize → failsafe
-  6. test_stub_handlers_raise_not_implemented — stub handlers raise NotImplementedError
+  1.  test_tool_schema_valid                    — TOOLS list has all required keys + correct structure
+  2.  test_loop_finalizes_successfully          — 3-call loop ending in finalize_triage returns result
+  3.  test_loop_enforces_call_cap               — 6 tool_use responses, loop stops after 5 (cap)
+  4.  test_loop_enforces_wall_timeout           — mock sleeps, wall timeout fires, failsafe returned
+  5.  test_failsafe_on_end_turn_without_finalize — end_turn without finalize → failsafe
+  6.  test_stub_handlers_raise_not_implemented  — write/deploy stubs raise NotImplementedError
+  7.  test_build_cluster_context_prompt_includes_data — prompt contains src_ip, cluster_id
+  8.  test_get_cluster_context_returns_summary  — real DB, handler returns JSON with expected fields
+  9.  test_get_cluster_context_not_found        — bogus cluster_id → error JSON
+  10. test_search_related_alerts_cross_source   — wazuh + suricata alerts same IP → both in response
+  11. test_search_related_alerts_no_results     — unknown IP → total_count=0
 
 All mock clients are synchronous MagicMock instances — run_triage_loop is sync.
+Tests 8-11 use an in-memory SQLite DB via agent.models.init_db(":memory:").
 
 @decision DEC-ORCH-001
 @title Claude tool-use loop with 6 tools, 5-call / 10s caps
-@status planned
+@status accepted
 @rationale Tests cover the control-flow contracts (caps, failsafe, finalize path)
            using a scripted mock client. No real API key required. The mock
            returns pre-scripted response objects in sequence, simulating a
            realistic multi-turn tool-use conversation.
+
+@decision DEC-ORCH-002
+@title Read handlers are standalone functions; DB connection injected via conn param
+@status accepted
+@rationale Tests 8-11 call the handlers through make_read_tool_handlers(conn) to
+           verify they interact correctly with a real SQLite schema.  No mocking
+           of internal functions — the DB is a lightweight in-memory fixture.
 """
 
+import json
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+from agent.models import init_db, insert_alert, upsert_cluster
 from agent.orchestrator import (
     TOOLS,
-    _handle_get_cluster_context,
     _handle_recommend_deploy,
-    _handle_search_related_alerts,
     _handle_write_sigma_rule,
     _handle_write_yara_rule,
     build_cluster_context_prompt,
+    make_read_tool_handlers,
     run_triage_loop,
 )
 from agent.triage import TriageResult
@@ -255,14 +269,16 @@ def test_failsafe_on_end_turn_without_finalize():
 
 
 # ---------------------------------------------------------------------------
-# Test 6: Stub handlers raise NotImplementedError
+# Test 6: Write/deploy stub handlers still raise NotImplementedError
 # ---------------------------------------------------------------------------
 
 def test_stub_handlers_raise_not_implemented():
-    """Each stub tool handler raises NotImplementedError when called directly."""
+    """Write and deploy stub tool handlers raise NotImplementedError when called directly.
+
+    get_cluster_context and search_related_alerts are no longer stubs (issue #8)
+    and are tested separately with a real DB (tests 8-11).
+    """
     stubs = [
-        (_handle_get_cluster_context, {"cluster_id": 1}),
-        (_handle_search_related_alerts, {"src_ip": "10.0.0.1", "time_range_hours": 24}),
         (_handle_write_yara_rule, {"content": "rule x {condition: true}", "description": "x"}),
         (_handle_write_sigma_rule, {"content": "title: x\n", "description": "x"}),
         (_handle_recommend_deploy, {"rule_id": 1, "reason": "high confidence"}),
@@ -285,3 +301,137 @@ def test_build_cluster_context_prompt_includes_data():
     assert "10.0.0.42" in prompt
     assert "cluster-prompt" in prompt
     assert "finalize_triage" in prompt  # instructions mention finalize_triage
+
+
+# ---------------------------------------------------------------------------
+# DB fixture helper
+# ---------------------------------------------------------------------------
+
+def _make_db():
+    """Return an in-memory SQLite connection with the full Phase 2 schema."""
+    return init_db(":memory:")
+
+
+def _seed_cluster(conn, cluster_id: str, src_ip: str = "192.0.2.1",
+                  rule_id: int = 1001, source: str = "wazuh") -> None:
+    """Insert a cluster row and a couple of member alerts into conn."""
+    upsert_cluster(
+        conn,
+        cluster_id=cluster_id,
+        src_ip=src_ip,
+        rule_id=rule_id,
+        window_start="2026-01-01T00:00:00",
+        window_end="2026-01-01T00:05:00",
+        alert_count=2,
+        source=source,
+    )
+    insert_alert(conn, f"{cluster_id}-a1", rule_id, src_ip, 7,
+                 {"id": f"{cluster_id}-a1"}, cluster_id=cluster_id)
+    insert_alert(conn, f"{cluster_id}-a2", rule_id, src_ip, 8,
+                 {"id": f"{cluster_id}-a2"}, cluster_id=cluster_id)
+
+
+# ---------------------------------------------------------------------------
+# Test 8: get_cluster_context — happy path
+# ---------------------------------------------------------------------------
+
+def test_get_cluster_context_returns_summary():
+    """Handler returns JSON with cluster metadata and sample_alerts for a real cluster."""
+    conn = _make_db()
+    _seed_cluster(conn, "cluster-ctx-001", src_ip="10.1.2.3", rule_id=5501)
+
+    handlers = make_read_tool_handlers(conn)
+    result_json = handlers["get_cluster_context"]({"cluster_id": "cluster-ctx-001"})
+    result = json.loads(result_json)
+
+    assert result.get("cluster_id") == "cluster-ctx-001"
+    assert result.get("src_ip") == "10.1.2.3"
+    assert result.get("rule_id") == 5501
+    assert result.get("alert_count") == 2
+    assert "window_start" in result
+    assert "window_end" in result
+    assert isinstance(result.get("sample_alerts"), list)
+    assert len(result["sample_alerts"]) == 2
+
+    # Each sample alert has the key fields Claude needs
+    for alert in result["sample_alerts"]:
+        assert "id" in alert
+        assert "rule_id" in alert
+        assert "severity" in alert
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 9: get_cluster_context — cluster not found
+# ---------------------------------------------------------------------------
+
+def test_get_cluster_context_not_found():
+    """Handler returns an error JSON when the cluster_id does not exist."""
+    conn = _make_db()
+
+    handlers = make_read_tool_handlers(conn)
+    result_json = handlers["get_cluster_context"]({"cluster_id": "bogus-99999"})
+    result = json.loads(result_json)
+
+    assert "error" in result
+    assert "bogus-99999" in result["error"]
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 10: search_related_alerts — cross-source results
+# ---------------------------------------------------------------------------
+
+def test_search_related_alerts_cross_source():
+    """Handler returns both wazuh and suricata results when both exist for an IP."""
+    conn = _make_db()
+    src_ip = "172.16.0.55"
+
+    # Insert a wazuh alert
+    insert_alert(conn, "wz-001", 5501, src_ip, 7, {"id": "wz-001", "source": "wazuh"})
+    # Manually set source column (insert_alert uses default 'wazuh')
+    conn.execute("UPDATE alerts SET source = 'wazuh' WHERE id = 'wz-001'")
+
+    # Insert a suricata alert
+    insert_alert(conn, "sur-001", 2200101, src_ip, 5, {"id": "sur-001", "source": "suricata"})
+    conn.execute("UPDATE alerts SET source = 'suricata' WHERE id = 'sur-001'")
+    conn.commit()
+
+    handlers = make_read_tool_handlers(conn)
+    result_json = handlers["search_related_alerts"](
+        {"src_ip": src_ip, "time_range_hours": 24}
+    )
+    result = json.loads(result_json)
+
+    assert result["total_count"] == 2
+    by_source = result["by_source"]
+    assert "wazuh" in by_source, f"Expected 'wazuh' in by_source, got: {by_source}"
+    assert "suricata" in by_source, f"Expected 'suricata' in by_source, got: {by_source}"
+    assert by_source["wazuh"]["count"] == 1
+    assert by_source["suricata"]["count"] == 1
+    assert result["time_range_hours"] == 24
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 11: search_related_alerts — no results
+# ---------------------------------------------------------------------------
+
+def test_search_related_alerts_no_results():
+    """Handler returns total_count=0 and empty by_source for an IP with no alerts."""
+    conn = _make_db()
+
+    handlers = make_read_tool_handlers(conn)
+    result_json = handlers["search_related_alerts"](
+        {"src_ip": "203.0.113.255", "time_range_hours": 24}
+    )
+    result = json.loads(result_json)
+
+    assert result["total_count"] == 0
+    assert result["by_source"] == {}
+    assert result["time_range_hours"] == 24
+
+    conn.close()
