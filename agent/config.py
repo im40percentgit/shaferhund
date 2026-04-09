@@ -28,12 +28,14 @@ class Settings(BaseSettings):
 
     # File paths
     alerts_file: str = "/var/ossec/logs/alerts/alerts.json"
+    suricata_eve_file: str = "/var/log/suricata/eve.json"
     db_path: str = "/data/shaferhund.db"
     rules_dir: str = "/rules"
 
     # Triage tuning
     triage_hourly_budget: int = 20
     poll_interval_seconds: int = 60
+    suricata_poll_seconds: int = 60
     severity_min_level: int = 7
 
     # Queue limits
