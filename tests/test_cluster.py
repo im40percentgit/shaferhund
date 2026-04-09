@@ -1,10 +1,11 @@
 """
-Clustering tests (3 tests).
+Clustering tests (4 tests).
 
 Tests:
   1. Basic clustering: two alerts with same src_ip+rule_id land in same cluster.
   2. Window split: alert arriving after window_seconds opens a new cluster.
   3. Max-size split: cluster with max_alerts+1 alerts splits into two clusters.
+  4. Multi-source disjoint: same src_ip+rule_id from wazuh and suricata → 2 clusters.
 
 @decision DEC-CLUSTER-001
 @title In-memory clusterer with SQLite persistence
@@ -12,6 +13,13 @@ Tests:
 @rationale Tests verify the three critical cluster boundary conditions:
            same-window grouping, time-based window split, and size-based
            split. No mocks — tests run against the real AlertClusterer.
+
+@decision DEC-CLUSTER-002
+@title Cluster key includes source to prevent cross-source alert merging
+@status accepted
+@rationale test_multi_source_disjoint_clustering verifies that identical
+           src_ip + rule_id from different sources (wazuh vs suricata)
+           always produce distinct clusters, never merged.
 """
 
 from datetime import datetime, timezone, timedelta
@@ -20,7 +28,7 @@ from agent.cluster import Alert, AlertClusterer
 
 
 def _alert(alert_id: str, src_ip: str, rule_id: int, severity: int = 7,
-           ts: datetime = None) -> Alert:
+           ts: datetime = None, source: str = "wazuh") -> Alert:
     if ts is None:
         ts = datetime.now(timezone.utc)
     return Alert(
@@ -30,6 +38,7 @@ def _alert(alert_id: str, src_ip: str, rule_id: int, severity: int = 7,
         severity=severity,
         raw={"id": alert_id, "rule": {"id": str(rule_id), "level": severity}},
         timestamp=ts,
+        source=source,
     )
 
 
@@ -105,3 +114,34 @@ def test_max_size_split():
     assert clusterer.open_count == 1
     remaining = clusterer.flush_all()
     assert remaining[0].alert_count == 1
+
+
+def test_multi_source_disjoint_clustering():
+    """Wazuh and Suricata alerts with identical src_ip+rule_id form 2 clusters.
+
+    This is the acceptance test for DEC-CLUSTER-002: the cluster key
+    (source, src_ip, rule_id) must keep sources disjoint even when the
+    IP and rule are identical.
+    """
+    clusterer = AlertClusterer(window_seconds=300, max_alerts=50)
+
+    t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    wazuh_alert = _alert("w1", "192.168.1.10", 5501, ts=t0, source="wazuh")
+    suricata_alert = _alert("s1", "192.168.1.10", 5501, ts=t0, source="suricata")
+
+    clusterer.add(wazuh_alert)
+    clusterer.add(suricata_alert)
+
+    # Both clusters must be open — no merging across sources
+    assert clusterer.open_count == 2
+
+    all_clusters = clusterer.flush_all()
+    assert len(all_clusters) == 2
+
+    sources = {c.source for c in all_clusters}
+    assert sources == {"wazuh", "suricata"}
+
+    # Each cluster holds exactly one alert from its respective source
+    for cluster in all_clusters:
+        assert cluster.alert_count == 1
+        assert cluster.alerts[0].source == cluster.source
