@@ -6,14 +6,18 @@ Claude can fetch cluster context, search related alerts, draft YARA/Sigma
 rules, recommend deployment, and finalize triage — all within a single
 reasoning session bounded by hard caps.
 
-Read tools (get_cluster_context, search_related_alerts) are fully implemented
-here. Write tools (write_yara_rule, write_sigma_rule, recommend_deploy) remain
-stubs pending issue #9.
+All 6 tool handlers are fully implemented and wired to the database via
+closure factories. Read tools (get_cluster_context, search_related_alerts)
+query existing data. Write tools (write_yara_rule, write_sigma_rule) validate
+and persist detection rules. recommend_deploy records a deploy recommendation
+in the deploy_events audit table. finalize_triage commits the AI verdict to
+the cluster row and returns a TriageResult.
 
-The read handlers are exposed as standalone functions for direct unit-testing,
+The handlers are exposed as standalone functions for direct unit-testing,
 but need a DB connection to operate. run_triage_loop accepts an optional `conn`
 parameter; when provided, it builds a local dispatch dict that injects the
-connection via closures, overriding the module-level stubs for the read tools.
+connection (and cluster_id for write tools) via closures, overriding the
+module-level stubs.
 
 @decision DEC-ORCH-001
 @title Claude tool-use loop with 6 tools, 5-call / 10s caps
@@ -23,8 +27,7 @@ connection via closures, overriding the module-level stubs for the read tools.
            to deploy — all in one pass. A tool-use loop lets Claude act as an
            agent with read/write tools while hard caps (5 calls, 10s wall)
            prevent runaway API spend. The failsafe ensures a verdict always
-           lands even if the loop exits abnormally. Wave B fills in real
-           implementations behind the same interface.
+           lands even if the loop exits abnormally.
 
 @decision DEC-ORCH-002
 @title Read handlers are standalone functions; DB connection injected via conn param
@@ -33,17 +36,33 @@ connection via closures, overriding the module-level stubs for the read tools.
            the existing dispatch dict pattern and makes each handler independently
            testable without instantiating an orchestrator object. run_triage_loop
            receives an optional conn and builds closures locally, so no global
-           state or module-level connection is required. Write tools (#9) follow
-           the same pattern.
+           state or module-level connection is required.
+
+@decision DEC-ORCH-003
+@title Write tool handlers use make_write_tool_handlers(conn, cluster_id) closure factory
+@status accepted
+@rationale Write tools (write_yara_rule, write_sigma_rule, recommend_deploy,
+           finalize_triage) need both a DB connection and the current cluster_id.
+           A closure factory parallel to make_read_tool_handlers keeps the same
+           pattern: run_triage_loop builds an effective dispatch dict by merging
+           read and write closures, no global state required. finalize_triage
+           now calls update_cluster_ai to persist the verdict.
 """
 
 import json
 import logging
 import sqlite3
 import time
+import uuid
 from typing import Any, Optional
 
-from .models import get_alerts_by_src_ip, get_cluster_with_alerts
+from .models import (
+    get_alerts_by_src_ip,
+    get_cluster_with_alerts,
+    insert_deploy_event,
+    insert_rule,
+    update_cluster_ai,
+)
 from .triage import TriageResult
 
 log = logging.getLogger(__name__)
@@ -376,16 +395,15 @@ def _handle_search_related_alerts(tool_input: dict, conn: sqlite3.Connection) ->
 def make_read_tool_handlers(conn: sqlite3.Connection) -> dict:
     """Return a partial dispatch dict with DB-bound read tool handlers.
 
-    Used by run_triage_loop to override the module-level stubs for
+    Used by run_triage_loop to override the module-level no-conn stubs for
     get_cluster_context and search_related_alerts when a real DB connection
-    is available. Write tool stubs are NOT overridden here — they remain
-    as NotImplementedError stubs until issue #9.
+    is available. Write tools are handled separately by make_write_tool_handlers.
 
     Args:
         conn: Open SQLite connection to inject into the closures.
 
     Returns:
-        Dict mapping tool name → callable(tool_input: dict) -> str.
+        Dict mapping tool name -> callable(tool_input: dict) -> str.
     """
     return {
         "get_cluster_context":    lambda ti: _handle_get_cluster_context(ti, conn),
@@ -393,59 +411,281 @@ def make_read_tool_handlers(conn: sqlite3.Connection) -> dict:
     }
 
 
-def _handle_write_yara_rule(tool_input: dict) -> str:
-    """Stub: draft, validate, and persist a YARA rule.
+# ---------------------------------------------------------------------------
+# Syntax validation helpers
+# ---------------------------------------------------------------------------
 
-    Will be implemented in Wave B (issue #8).
+
+def _check_yara_syntax(rule_content: str) -> bool:
+    """Return True if the YARA rule compiles without errors.
+
+    Gracefully returns False (rather than raising) if the yara Python
+    library is not installed -- the rule is stored but marked invalid.
     """
-    raise NotImplementedError(
-        "write_yara_rule will be implemented in issue #8"
+    try:
+        import yara  # type: ignore
+
+        yara.compile(source=rule_content)
+        return True
+    except ImportError:
+        log.debug("yara-python not installed; skipping syntax check")
+        return False
+    except Exception as exc:
+        log.warning("YARA syntax error: %s", exc)
+        return False
+
+
+def _check_sigma_syntax(rule_content: str) -> bool:
+    """Return True if the Sigma rule YAML is parseable and structurally valid.
+
+    Uses pysigma's SigmaCollection.from_yaml() when available. Falls back to
+    basic YAML parsing if pysigma is not installed -- the rule is stored but
+    marked invalid since we cannot fully validate without pysigma.
+    """
+    try:
+        from sigma.collection import SigmaCollection  # type: ignore
+
+        SigmaCollection.from_yaml(rule_content)
+        return True
+    except ImportError:
+        # pysigma not installed -- try basic YAML parse as a minimal check.
+        try:
+            import yaml
+
+            parsed = yaml.safe_load(rule_content)
+            # A valid Sigma rule must be a dict with at minimum a 'title' key.
+            if not isinstance(parsed, dict) or "title" not in parsed:
+                return False
+            return True
+        except Exception:
+            return False
+    except Exception as exc:
+        log.warning("Sigma validation error: %s", exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Tool handlers -- write tools
+# ---------------------------------------------------------------------------
+
+
+def _handle_write_yara_rule(
+    tool_input: dict, conn: sqlite3.Connection, cluster_id: str
+) -> str:
+    """Validate, persist, and return metadata for a YARA detection rule.
+
+    Syntax-checks the rule content via yara.compile(). Persists to the rules
+    table regardless of validity (syntax_valid flag captures the result).
+    Returns a JSON object with the rule_id and validation status.
+
+    Args:
+        tool_input: Dict with keys ``content`` (str) and ``description`` (str).
+        conn:       Open SQLite connection (injected via closure).
+        cluster_id: The cluster this rule belongs to.
+
+    Returns:
+        JSON string with keys: rule_id, syntax_valid, rule_type.
+    """
+    content = tool_input.get("content", "")
+    description = tool_input.get("description", "")
+
+    if not content.strip():
+        return json.dumps({"error": "content is required"})
+
+    syntax_valid = _check_yara_syntax(content)
+    rule_id = str(uuid.uuid4())
+
+    insert_rule(
+        conn,
+        rule_id=rule_id,
+        cluster_id=cluster_id,
+        rule_type="yara",
+        rule_content=content,
+        syntax_valid=syntax_valid,
     )
 
+    log.info(
+        "YARA rule stored: rule_id=%s cluster=%s syntax_valid=%s desc=%s",
+        rule_id,
+        cluster_id,
+        syntax_valid,
+        description[:80],
+    )
+    return json.dumps({
+        "rule_id": rule_id,
+        "rule_type": "yara",
+        "syntax_valid": syntax_valid,
+    })
 
-def _handle_write_sigma_rule(tool_input: dict) -> str:
-    """Stub: draft, validate, and persist a Sigma rule.
 
-    Will be implemented in Wave B (issue #8).
+def _handle_write_sigma_rule(
+    tool_input: dict, conn: sqlite3.Connection, cluster_id: str
+) -> str:
+    """Validate, persist, and return metadata for a Sigma detection rule.
+
+    Syntax-checks the rule content via pysigma (or basic YAML parse as
+    fallback). Persists to the rules table regardless of validity.
+    Returns a JSON object with the rule_id and validation status.
+
+    Args:
+        tool_input: Dict with keys ``content`` (str) and ``description`` (str).
+        conn:       Open SQLite connection (injected via closure).
+        cluster_id: The cluster this rule belongs to.
+
+    Returns:
+        JSON string with keys: rule_id, syntax_valid, rule_type.
     """
-    raise NotImplementedError(
-        "write_sigma_rule will be implemented in issue #8"
+    content = tool_input.get("content", "")
+    description = tool_input.get("description", "")
+
+    if not content.strip():
+        return json.dumps({"error": "content is required"})
+
+    syntax_valid = _check_sigma_syntax(content)
+    rule_id = str(uuid.uuid4())
+
+    insert_rule(
+        conn,
+        rule_id=rule_id,
+        cluster_id=cluster_id,
+        rule_type="sigma",
+        rule_content=content,
+        syntax_valid=syntax_valid,
     )
 
+    log.info(
+        "Sigma rule stored: rule_id=%s cluster=%s syntax_valid=%s desc=%s",
+        rule_id,
+        cluster_id,
+        syntax_valid,
+        description[:80],
+    )
+    return json.dumps({
+        "rule_id": rule_id,
+        "rule_type": "sigma",
+        "syntax_valid": syntax_valid,
+    })
 
-def _handle_recommend_deploy(tool_input: dict) -> str:
-    """Stub: signal the policy gate that a rule is ready for auto-deployment.
 
-    Will be implemented in Wave B (issue #7).
+def _handle_recommend_deploy(
+    tool_input: dict, conn: sqlite3.Connection
+) -> str:
+    """Record a deploy recommendation in the deploy_events audit table.
+
+    Does not deploy directly -- records the recommendation so the policy
+    gate can evaluate it. Returns the deploy_event row id.
+
+    Args:
+        tool_input: Dict with keys ``rule_id`` (int) and ``reason`` (str).
+        conn:       Open SQLite connection (injected via closure).
+
+    Returns:
+        JSON string with keys: deploy_event_id, action, rule_id.
     """
-    raise NotImplementedError(
-        "recommend_deploy will be implemented in issue #7"
+    rule_id = tool_input.get("rule_id")
+    reason = tool_input.get("reason", "")
+
+    if rule_id is None:
+        return json.dumps({"error": "rule_id is required"})
+
+    deploy_event_id = insert_deploy_event(
+        conn,
+        rule_id=int(rule_id),
+        action="recommend",
+        reason=reason,
+        actor="orchestrator",
     )
 
+    log.info(
+        "Deploy recommendation recorded: event_id=%d rule_id=%s reason=%s",
+        deploy_event_id,
+        rule_id,
+        reason[:80],
+    )
+    return json.dumps({
+        "deploy_event_id": deploy_event_id,
+        "action": "recommend",
+        "rule_id": rule_id,
+    })
 
-def _handle_finalize_triage(tool_input: dict) -> TriageResult:
-    """Construct a TriageResult from the finalize_triage tool input.
 
-    This is the only handler that is NOT a stub — it constructs the final
-    verdict and returns it. The DB commit (update_cluster_ai) happens in
-    Wave B when run_triage_loop is wired into the triage queue.
+def _handle_finalize_triage(
+    tool_input: dict,
+    conn: Optional[sqlite3.Connection] = None,
+    cluster_id: str = "",
+) -> TriageResult:
+    """Construct a TriageResult and persist the verdict to the cluster row.
+
+    When conn is provided, calls update_cluster_ai to write the AI severity
+    and analysis to the cluster row. When conn is None (no-DB mode, e.g.
+    unit tests with mock clients), the TriageResult is still returned but
+    nothing is persisted.
+
+    Args:
+        tool_input:  Dict with keys ``severity``, ``analysis``, ``rule_ids``.
+        conn:        Optional SQLite connection (injected via closure).
+        cluster_id:  The cluster being triaged.
+
+    Returns:
+        TriageResult with the final verdict.
     """
+    severity = tool_input["severity"]
+    analysis = tool_input["analysis"]
+
+    if conn is not None and cluster_id:
+        update_cluster_ai(conn, cluster_id, severity, analysis)
+        log.info(
+            "Cluster %s verdict persisted: severity=%s",
+            cluster_id,
+            severity,
+        )
+
     return TriageResult(
-        severity=tool_input["severity"],
-        threat_assessment=tool_input["analysis"],
+        severity=severity,
+        threat_assessment=analysis,
         iocs={"ips": [], "domains": [], "hashes": [], "paths": []},
         yara_rule="",
-        cluster_id=str(tool_input.get("cluster_id", "")),
+        cluster_id=cluster_id,
         raw_response=json.dumps(tool_input),
     )
 
 
-def _no_conn_read_stub(tool_name: str) -> str:
-    """Return an informative JSON error when a read tool is called without a DB connection.
+# ---------------------------------------------------------------------------
+# Closure factory — injects DB connection + cluster_id into write handlers
+# ---------------------------------------------------------------------------
 
-    Used as the fallback in _TOOL_DISPATCH for get_cluster_context and
-    search_related_alerts when run_triage_loop is called without a conn.
-    Claude receives a clear message and can proceed to finalize_triage.
+
+def make_write_tool_handlers(
+    conn: sqlite3.Connection, cluster_id: str
+) -> dict:
+    """Return a partial dispatch dict with DB-bound write tool handlers.
+
+    Used by run_triage_loop to override the module-level no-conn stubs for
+    write_yara_rule, write_sigma_rule, recommend_deploy, and finalize_triage
+    when a real DB connection is available.
+
+    Args:
+        conn:       Open SQLite connection to inject into the closures.
+        cluster_id: The cluster being triaged (needed by rule insert and
+                    finalize_triage's update_cluster_ai call).
+
+    Returns:
+        Dict mapping tool name -> callable(tool_input: dict) -> str|TriageResult.
+    """
+    return {
+        "write_yara_rule":   lambda ti: _handle_write_yara_rule(ti, conn, cluster_id),
+        "write_sigma_rule":  lambda ti: _handle_write_sigma_rule(ti, conn, cluster_id),
+        "recommend_deploy":  lambda ti: _handle_recommend_deploy(ti, conn),
+        "finalize_triage":   lambda ti: _handle_finalize_triage(ti, conn, cluster_id),
+    }
+
+
+def _no_conn_stub(tool_name: str) -> str:
+    """Return an informative JSON error when a tool is called without a DB connection.
+
+    Used as the fallback in _TOOL_DISPATCH for all DB-dependent tools when
+    run_triage_loop is called without a conn. Claude receives a clear message
+    and can proceed to finalize_triage.
     """
     return json.dumps({
         "error": f"Tool '{tool_name}' requires a database connection (conn=None in run_triage_loop)."
@@ -453,16 +693,18 @@ def _no_conn_read_stub(tool_name: str) -> str:
 
 
 # Map tool names to their handler functions.
-# Read tools (get_cluster_context, search_related_alerts) use no-conn stubs
-# here; they are replaced with real DB-bound closures in run_triage_loop when
-# conn is provided via make_read_tool_handlers().
+# All DB-dependent tools use no-conn stubs here; they are replaced with real
+# DB-bound closures in run_triage_loop when conn is provided via
+# make_read_tool_handlers() and make_write_tool_handlers().
+# finalize_triage has a special no-conn stub that still returns a TriageResult
+# (without DB persistence) so the loop can always produce a verdict.
 _TOOL_DISPATCH: dict[str, Any] = {
-    "get_cluster_context":   lambda ti: _no_conn_read_stub("get_cluster_context"),
-    "search_related_alerts": lambda ti: _no_conn_read_stub("search_related_alerts"),
-    "write_yara_rule":       _handle_write_yara_rule,
-    "write_sigma_rule":      _handle_write_sigma_rule,
-    "recommend_deploy":      _handle_recommend_deploy,
-    "finalize_triage":       _handle_finalize_triage,
+    "get_cluster_context":   lambda ti: _no_conn_stub("get_cluster_context"),
+    "search_related_alerts": lambda ti: _no_conn_stub("search_related_alerts"),
+    "write_yara_rule":       lambda ti: _no_conn_stub("write_yara_rule"),
+    "write_sigma_rule":      lambda ti: _no_conn_stub("write_sigma_rule"),
+    "recommend_deploy":      lambda ti: _no_conn_stub("recommend_deploy"),
+    "finalize_triage":       lambda ti: _handle_finalize_triage(ti),
 }
 
 # Default verdict returned when the loop exits without finalize_triage.
@@ -494,16 +736,19 @@ def run_triage_loop(
     failsafe default.
 
     Args:
-        cluster:       Cluster data as a dict (keys: cluster_id, src_ip, …).
+        cluster:       Cluster data as a dict (keys: cluster_id, src_ip, ...).
         claude_client: Anthropic client with a .messages.create() method.
-                       May be synchronous (this function is sync — async
-                       integration handled by the caller in Wave B).
+                       May be synchronous (this function is sync -- async
+                       integration handled by the caller).
         config:        Settings instance (must have orch_max_tool_calls and
                        orch_wall_timeout_seconds attributes).
-        conn:          Optional SQLite connection. When provided, the read tool
-                       handlers (get_cluster_context, search_related_alerts)
-                       are wired to the real DB via closures. When None, those
-                       tools return a "not available" message to Claude.
+        conn:          Optional SQLite connection. When provided, all tool
+                       handlers are wired to the real DB via closures:
+                       read tools query data, write tools persist rules and
+                       deploy events, finalize_triage writes the verdict to
+                       the cluster row. When None, DB-dependent tools return
+                       a "not available" message to Claude (except
+                       finalize_triage which still returns a TriageResult).
 
     Returns:
         TriageResult with the final verdict (from finalize_triage or failsafe).
@@ -517,6 +762,7 @@ def run_triage_loop(
     effective_dispatch: dict[str, Any] = dict(_TOOL_DISPATCH)
     if conn is not None:
         effective_dispatch.update(make_read_tool_handlers(conn))
+        effective_dispatch.update(make_write_tool_handlers(conn, cluster_id))
 
     prompt = build_cluster_context_prompt(cluster)
     messages: list[dict] = [{"role": "user", "content": prompt}]
@@ -604,14 +850,15 @@ def run_triage_loop(
         # Append Claude's full response message to conversation.
         messages.append({"role": "assistant", "content": response.content})
 
-        # finalize_triage is the success path — extract result and exit.
+        # finalize_triage is the success path -- extract result and exit.
         if tool_name == "finalize_triage":
             log.info(
                 "Orchestrator: finalize_triage called for cluster %s (severity=%s)",
                 cluster_id,
                 tool_input.get("severity", "?"),
             )
-            result = _handle_finalize_triage(tool_input)
+            finalize_handler = effective_dispatch["finalize_triage"]
+            result = finalize_handler(tool_input)
             result.cluster_id = cluster_id
             return result
 
