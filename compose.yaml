@@ -58,13 +58,17 @@ services:
       - wazuh_var_multigroups:/var/ossec/var/multigroups
 
   suricata:
-    image: jasonish/suricata:7.0-latest
+    # Build from docker/Dockerfile.suricata which extends jasonish/suricata:7.0
+    # and bakes ET Open rules in at image build time via `suricata-update --no-test`.
+    # @decision DEC-SURICATA-002 — see docker/Dockerfile.suricata for full rationale.
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.suricata
     container_name: shaferhund-suricata
     restart: unless-stopped
     # pcap-read mode (-r): processes the specified pcap file and writes
     # alerts to /var/log/suricata/eve.json.  No live NIC is tapped.
-    # The -l flag sets the log directory. ET Open rules are baked into the
-    # jasonish/suricata image at build time via suricata-update.
+    # The -l flag sets the log directory.
     command: >
       -r /pcaps/${TCPREPLAY_PCAP:-malicious.pcap}
       -l /var/log/suricata/
