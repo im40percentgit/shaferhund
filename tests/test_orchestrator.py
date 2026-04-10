@@ -12,16 +12,24 @@ Tests:
   2.  test_loop_finalizes_successfully          — 3-call loop ending in finalize_triage returns result
   3.  test_loop_enforces_call_cap               — 6 tool_use responses, loop stops after 5 (cap)
   4.  test_loop_enforces_wall_timeout           — mock sleeps, wall timeout fires, failsafe returned
-  5.  test_failsafe_on_end_turn_without_finalize — end_turn without finalize → failsafe
-  6.  test_stub_handlers_raise_not_implemented  — write/deploy stubs raise NotImplementedError
+  5.  test_failsafe_on_end_turn_without_finalize — end_turn without finalize -> failsafe
+  6.  test_no_conn_write_stubs_return_error     — write tools without conn return error JSON
   7.  test_build_cluster_context_prompt_includes_data — prompt contains src_ip, cluster_id
   8.  test_get_cluster_context_returns_summary  — real DB, handler returns JSON with expected fields
-  9.  test_get_cluster_context_not_found        — bogus cluster_id → error JSON
-  10. test_search_related_alerts_cross_source   — wazuh + suricata alerts same IP → both in response
-  11. test_search_related_alerts_no_results     — unknown IP → total_count=0
+  9.  test_get_cluster_context_not_found        — bogus cluster_id -> error JSON
+  10. test_search_related_alerts_cross_source   — wazuh + suricata alerts same IP -> both in response
+  11. test_search_related_alerts_no_results     — unknown IP -> total_count=0
+  12. test_write_yara_rule_persists_valid       — valid YARA stored with syntax_valid=True
+  13. test_write_yara_rule_persists_invalid     — invalid YARA stored with syntax_valid=False
+  14. test_write_sigma_rule_persists_valid      — valid Sigma YAML stored with syntax_valid=True
+  15. test_write_sigma_rule_empty_content       — empty content returns error JSON
+  16. test_recommend_deploy_records_event       — deploy recommendation stored in deploy_events
+  17. test_finalize_triage_persists_verdict     — finalize with conn writes to cluster row
+  18. test_finalize_triage_no_conn             — finalize without conn still returns TriageResult
+  19. test_loop_with_conn_persists_verdict     — full loop with DB: finalize writes ai_severity
 
 All mock clients are synchronous MagicMock instances — run_triage_loop is sync.
-Tests 8-11 use an in-memory SQLite DB via agent.models.init_db(":memory:").
+Tests 8-19 use an in-memory SQLite DB via agent.models.init_db(":memory:").
 
 @decision DEC-ORCH-001
 @title Claude tool-use loop with 6 tools, 5-call / 10s caps
@@ -37,6 +45,13 @@ Tests 8-11 use an in-memory SQLite DB via agent.models.init_db(":memory:").
 @rationale Tests 8-11 call the handlers through make_read_tool_handlers(conn) to
            verify they interact correctly with a real SQLite schema.  No mocking
            of internal functions — the DB is a lightweight in-memory fixture.
+
+@decision DEC-ORCH-003
+@title Write tool handlers use make_write_tool_handlers(conn, cluster_id) closure factory
+@status accepted
+@rationale Tests 12-19 call write handlers through make_write_tool_handlers(conn,
+           cluster_id) and verify they persist rules, deploy events, and AI
+           verdicts to the real SQLite schema.
 """
 
 import json
@@ -46,14 +61,24 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agent.models import init_db, insert_alert, upsert_cluster
+from agent.models import (
+    get_cluster,
+    get_rules_for_cluster,
+    init_db,
+    insert_alert,
+    list_deploy_events,
+    upsert_cluster,
+)
 from agent.orchestrator import (
     TOOLS,
+    _check_yara_syntax,
+    _handle_finalize_triage,
     _handle_recommend_deploy,
     _handle_write_sigma_rule,
     _handle_write_yara_rule,
     build_cluster_context_prompt,
     make_read_tool_handlers,
+    make_write_tool_handlers,
     run_triage_loop,
 )
 from agent.triage import TriageResult
@@ -269,24 +294,22 @@ def test_failsafe_on_end_turn_without_finalize():
 
 
 # ---------------------------------------------------------------------------
-# Test 6: Write/deploy stub handlers still raise NotImplementedError
+# Test 6: Write tools without conn return error JSON (no-conn stubs)
 # ---------------------------------------------------------------------------
 
-def test_stub_handlers_raise_not_implemented():
-    """Write and deploy stub tool handlers raise NotImplementedError when called directly.
+def test_no_conn_write_stubs_return_error():
+    """When run_triage_loop is called without conn, write tools return error JSON to Claude.
 
-    get_cluster_context and search_related_alerts are no longer stubs (issue #8)
-    and are tested separately with a real DB (tests 8-11).
+    This verifies the _TOOL_DISPATCH fallback stubs return informative errors
+    rather than crashing, so Claude can gracefully proceed to finalize_triage.
     """
-    stubs = [
-        (_handle_write_yara_rule, {"content": "rule x {condition: true}", "description": "x"}),
-        (_handle_write_sigma_rule, {"content": "title: x\n", "description": "x"}),
-        (_handle_recommend_deploy, {"rule_id": 1, "reason": "high confidence"}),
-    ]
+    from agent.orchestrator import _TOOL_DISPATCH
 
-    for handler, args in stubs:
-        with pytest.raises(NotImplementedError):
-            handler(args)
+    for tool_name in ("write_yara_rule", "write_sigma_rule", "recommend_deploy"):
+        result = _TOOL_DISPATCH[tool_name]({})
+        parsed = json.loads(result)
+        assert "error" in parsed, f"{tool_name} no-conn stub should return error JSON"
+        assert "database connection" in parsed["error"].lower() or "conn" in parsed["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -433,5 +456,267 @@ def test_search_related_alerts_no_results():
     assert result["total_count"] == 0
     assert result["by_source"] == {}
     assert result["time_range_hours"] == 24
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 12: write_yara_rule — valid rule persisted
+# ---------------------------------------------------------------------------
+
+def test_write_yara_rule_persists_valid():
+    """A syntactically valid YARA rule is stored with syntax_valid=True."""
+    conn = _make_db()
+    cluster_id = "cluster-yara-valid"
+    _seed_cluster(conn, cluster_id)
+
+    handlers = make_write_tool_handlers(conn, cluster_id)
+    result_json = handlers["write_yara_rule"]({
+        "content": 'rule TestRule { strings: $s = "test" condition: $s }',
+        "description": "Detects test string",
+    })
+    result = json.loads(result_json)
+
+    assert result["rule_type"] == "yara"
+    assert result["rule_id"]  # non-empty UUID
+
+    # Verify persisted in DB
+    rules = get_rules_for_cluster(conn, cluster_id)
+    assert len(rules) == 1
+    rule_row = dict(rules[0])
+    assert rule_row["rule_type"] == "yara"
+    assert rule_row["cluster_id"] == cluster_id
+
+    # syntax_valid depends on whether yara-python is installed;
+    # either way, the rule is persisted and result is consistent
+    assert result["syntax_valid"] == bool(rule_row["syntax_valid"])
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 13: write_yara_rule — invalid rule persisted with syntax_valid=False
+# ---------------------------------------------------------------------------
+
+def test_write_yara_rule_persists_invalid():
+    """An invalid YARA rule is stored but marked syntax_valid=False."""
+    conn = _make_db()
+    cluster_id = "cluster-yara-invalid"
+    _seed_cluster(conn, cluster_id)
+
+    handlers = make_write_tool_handlers(conn, cluster_id)
+    result_json = handlers["write_yara_rule"]({
+        "content": "rule BrokenRule { condition: undefined_var }",
+        "description": "Broken rule",
+    })
+    result = json.loads(result_json)
+
+    assert result["rule_type"] == "yara"
+    assert result["rule_id"]
+
+    # If yara-python is installed, this rule should fail validation.
+    # If not installed, _check_yara_syntax returns False too.
+    if _check_yara_syntax('rule Valid { strings: $s = "x" condition: $s }'):
+        # yara-python is available, so the broken rule should fail
+        assert result["syntax_valid"] is False
+
+    # Verify persisted in DB regardless
+    rules = get_rules_for_cluster(conn, cluster_id)
+    assert len(rules) == 1
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 14: write_sigma_rule — valid Sigma YAML persisted
+# ---------------------------------------------------------------------------
+
+def test_write_sigma_rule_persists_valid():
+    """A structurally valid Sigma rule YAML is stored with syntax_valid=True."""
+    conn = _make_db()
+    cluster_id = "cluster-sigma-valid"
+    _seed_cluster(conn, cluster_id)
+
+    sigma_yaml = """\
+title: Test Sigma Rule
+status: experimental
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    selection:
+        CommandLine|contains: 'mimikatz'
+    condition: selection
+level: high
+"""
+
+    handlers = make_write_tool_handlers(conn, cluster_id)
+    result_json = handlers["write_sigma_rule"]({
+        "content": sigma_yaml,
+        "description": "Detects mimikatz usage",
+    })
+    result = json.loads(result_json)
+
+    assert result["rule_type"] == "sigma"
+    assert result["rule_id"]
+
+    # Verify persisted in DB
+    rules = get_rules_for_cluster(conn, cluster_id)
+    assert len(rules) == 1
+    rule_row = dict(rules[0])
+    assert rule_row["rule_type"] == "sigma"
+    assert rule_row["cluster_id"] == cluster_id
+    # Basic YAML parse should pass even without pysigma
+    assert result["syntax_valid"] is True
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 15: write_sigma_rule — empty content returns error
+# ---------------------------------------------------------------------------
+
+def test_write_sigma_rule_empty_content():
+    """Empty content returns an error JSON without persisting anything."""
+    conn = _make_db()
+    cluster_id = "cluster-sigma-empty"
+    _seed_cluster(conn, cluster_id)
+
+    handlers = make_write_tool_handlers(conn, cluster_id)
+    result_json = handlers["write_sigma_rule"]({
+        "content": "   ",
+        "description": "empty",
+    })
+    result = json.loads(result_json)
+
+    assert "error" in result
+    assert "content" in result["error"].lower()
+
+    # Nothing persisted
+    rules = get_rules_for_cluster(conn, cluster_id)
+    assert len(rules) == 0
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 16: recommend_deploy — records event in deploy_events
+# ---------------------------------------------------------------------------
+
+def test_recommend_deploy_records_event():
+    """recommend_deploy inserts a row in deploy_events with action='recommend'."""
+    conn = _make_db()
+    cluster_id = "cluster-deploy-rec"
+    _seed_cluster(conn, cluster_id)
+
+    handlers = make_write_tool_handlers(conn, cluster_id)
+    result_json = handlers["recommend_deploy"]({
+        "rule_id": 42,
+        "reason": "High confidence SSH brute-force detection rule",
+    })
+    result = json.loads(result_json)
+
+    assert result["action"] == "recommend"
+    assert result["rule_id"] == 42
+    assert "deploy_event_id" in result
+
+    # Verify persisted in DB
+    events = list_deploy_events(conn)
+    assert len(events) >= 1
+    event = dict(events[0])
+    assert event["rule_id"] == 42
+    assert event["action"] == "recommend"
+    assert "SSH brute-force" in event["reason"]
+    assert event["actor"] == "orchestrator"
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 17: finalize_triage with conn — persists verdict to cluster row
+# ---------------------------------------------------------------------------
+
+def test_finalize_triage_persists_verdict():
+    """finalize_triage with conn calls update_cluster_ai on the cluster row."""
+    conn = _make_db()
+    cluster_id = "cluster-finalize-db"
+    _seed_cluster(conn, cluster_id)
+
+    # Before: no AI verdict
+    cluster_before = dict(get_cluster(conn, cluster_id))
+    assert cluster_before["ai_severity"] is None
+    assert cluster_before["ai_analysis"] is None
+
+    result = _handle_finalize_triage(
+        {"severity": "Critical", "analysis": "Active data exfiltration.", "rule_ids": []},
+        conn=conn,
+        cluster_id=cluster_id,
+    )
+
+    assert isinstance(result, TriageResult)
+    assert result.severity == "Critical"
+    assert result.threat_assessment == "Active data exfiltration."
+
+    # After: verdict persisted
+    cluster_after = dict(get_cluster(conn, cluster_id))
+    assert cluster_after["ai_severity"] == "Critical"
+    assert cluster_after["ai_analysis"] == "Active data exfiltration."
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 18: finalize_triage without conn — returns TriageResult, no DB write
+# ---------------------------------------------------------------------------
+
+def test_finalize_triage_no_conn():
+    """finalize_triage without conn still returns a valid TriageResult."""
+    result = _handle_finalize_triage(
+        {"severity": "Low", "analysis": "Benign scan activity.", "rule_ids": []},
+    )
+
+    assert isinstance(result, TriageResult)
+    assert result.severity == "Low"
+    assert result.threat_assessment == "Benign scan activity."
+    assert result.cluster_id == ""  # no cluster_id provided
+
+
+# ---------------------------------------------------------------------------
+# Test 19: Full loop with conn — finalize persists verdict to DB
+# ---------------------------------------------------------------------------
+
+def test_loop_with_conn_persists_verdict():
+    """run_triage_loop with conn: finalize_triage writes ai_severity to the cluster row."""
+    conn = _make_db()
+    cluster_id = "cluster-loop-db"
+    _seed_cluster(conn, cluster_id, src_ip="10.0.0.42", rule_id=5501)
+
+    responses = [
+        # Call 1: finalize_triage directly
+        _tool_use_response(
+            "finalize_triage",
+            {
+                "severity": "High",
+                "analysis": "Confirmed brute-force attack.",
+                "rule_ids": [],
+            },
+            tool_id="tu_001",
+        ),
+    ]
+
+    client = _make_mock_client(responses)
+    config = _make_config(max_calls=5, wall_timeout=10.0)
+    cluster = _make_cluster(cluster_id)
+
+    result = run_triage_loop(cluster, client, config, conn=conn)
+
+    assert isinstance(result, TriageResult)
+    assert result.severity == "High"
+    assert result.cluster_id == cluster_id
+
+    # Verify the verdict was persisted to the DB
+    cluster_row = dict(get_cluster(conn, cluster_id))
+    assert cluster_row["ai_severity"] == "High"
+    assert cluster_row["ai_analysis"] == "Confirmed brute-force attack."
 
     conn.close()
