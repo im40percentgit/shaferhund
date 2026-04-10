@@ -1,0 +1,33 @@
+# Suricata 7 image with ET Open rules baked in at build time.
+#
+# @decision DEC-SURICATA-002
+# @title ET Open rules loaded via build-time suricata-update (Option B)
+# @status accepted
+# @rationale Build-time bake (Option B) is chosen over:
+#   - Option A (entrypoint script): adds 2-5 min of network download on every
+#     container restart — unacceptable latency for dev iteration cycles.
+#   - Option C (volume-mount download): requires a separate out-of-band
+#     download step before `compose up`, adding friction and a missing-rules
+#     failure mode.
+#   Build-time bake freezes rules at image build, making alert output
+#   deterministic for CI and pcap-replay testing. Rule freshness is
+#   intentionally deferred — solo-dev tooling, not a production NIDS.
+#   `--no-test` skips the suricata-update rule-validation pass (saves ~30s);
+#   Suricata itself validates rules on startup.
+#
+# Usage:
+#   podman compose build suricata
+#   podman compose up suricata
+#
+# Network required at build time (pulls ET Open rules from rules.emergingthreats.net).
+# Offline builds will fail — expected behaviour for a rules-baked image.
+
+FROM docker.io/jasonish/suricata:7.0
+
+# suricata-update is bundled in jasonish/suricata images.
+# Fetch ET Open (free/open, no licence required) and write rules to the
+# default location Suricata reads: /var/lib/suricata/rules/suricata.rules
+RUN suricata-update --no-test
+
+# Suricata binary and default entrypoint are inherited from the base image.
+# No CMD override needed — compose.yaml passes `-r /pcaps/...` directly.
