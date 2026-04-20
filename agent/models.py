@@ -103,8 +103,11 @@ _ALERTS_PHASE2_COLUMNS: list[tuple[str, str]] = [
 # Idempotent additions to the clusters table.  Fresh DBs get the column via
 # SCHEMA_SQL above; Phase 1/Wave-A DBs that predate DEC-CLUSTER-002 get it
 # via the conditional ALTER TABLE in init_db.
+# ai_confidence (Wave C): the orchestrator's confidence score returned by
+# finalize_triage, stored for the policy gate's threshold check.
 _CLUSTERS_PHASE2_COLUMNS: list[tuple[str, str]] = [
-    ("source", "TEXT NOT NULL DEFAULT 'wazuh'"),
+    ("source",        "TEXT NOT NULL DEFAULT 'wazuh'"),
+    ("ai_confidence", "REAL"),
 ]
 
 # deploy_events tracks every auto-deploy and manual-deploy with enough context
@@ -121,6 +124,23 @@ CREATE TABLE IF NOT EXISTS deploy_events (
     reverted_at TEXT
 );
 """
+
+# Phase 2 Wave C — auto-deploy integration (REQ-P0-P2-006, REQ-P0-P2-007).
+# These columns are added to deploy_events idempotently so the dedup query
+# in get_recent_deploys can project the fields that should_auto_deploy expects
+# without a multi-table join that would be fragile against schema drift.
+#
+# rule_uuid: the generated rule's TEXT UUID (rules.id) — the existing rule_id
+#            column is INTEGER for the legacy recommend_deploy tool path; the
+#            auto-deploy path stores the UUID here instead.
+# rule_type: 'yara' or 'sigma' — stored at event time so the dedup query
+#            doesn't need to chase the rules row (which could be deleted).
+# src_ip:    the cluster's source IP — same rationale: stored at event time.
+_DEPLOY_EVENTS_WAVE_C_COLUMNS: list[tuple[str, str]] = [
+    ("rule_uuid", "TEXT"),
+    ("rule_type", "TEXT"),
+    ("src_ip",    "TEXT"),
+]
 
 
 def init_db(db_path: str) -> sqlite3.Connection:
@@ -167,6 +187,18 @@ def init_db(db_path: str) -> sqlite3.Connection:
 
     # deploy_events — idempotent by virtue of CREATE TABLE IF NOT EXISTS.
     conn.executescript(_DEPLOY_EVENTS_SQL)
+
+    # Idempotent Wave C column additions to deploy_events (REQ-P0-P2-006).
+    existing_deploy_cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(deploy_events)").fetchall()
+    }
+    for col_name, col_def in _DEPLOY_EVENTS_WAVE_C_COLUMNS:
+        if col_name not in existing_deploy_cols:
+            conn.execute(
+                f"ALTER TABLE deploy_events ADD COLUMN {col_name} {col_def}"
+            )
+            log.info("deploy_events table: added column %s", col_name)
 
     conn.commit()
     log.info("Database initialised at %s", db_path)
@@ -264,12 +296,22 @@ def update_cluster_ai(
     cluster_id: str,
     ai_severity: str,
     ai_analysis: str,
+    ai_confidence: Optional[float] = None,
 ) -> None:
-    """Write AI triage results back to the cluster row."""
+    """Write AI triage results back to the cluster row.
+
+    ai_confidence is optional for backward compatibility with existing callers
+    that do not supply it.  When provided it is persisted for the auto-deploy
+    policy gate's confidence threshold check (REQ-P0-P2-006).
+    """
     with get_cursor(conn) as cur:
         cur.execute(
-            "UPDATE clusters SET ai_severity = ?, ai_analysis = ? WHERE id = ?",
-            (ai_severity, ai_analysis, cluster_id),
+            """
+            UPDATE clusters
+               SET ai_severity = ?, ai_analysis = ?, ai_confidence = ?
+             WHERE id = ?
+            """,
+            (ai_severity, ai_analysis, ai_confidence, cluster_id),
         )
 
 
@@ -510,3 +552,94 @@ def mark_deploy_reverted(conn: sqlite3.Connection, deploy_event_id: int) -> None
             "UPDATE deploy_events SET reverted_at = ? WHERE id = ?",
             (reverted_at, deploy_event_id),
         )
+
+
+def record_deploy_event(
+    conn: sqlite3.Connection,
+    rule_id: str,
+    action: str,
+    reason: Optional[str] = None,
+    actor: str = "orchestrator",
+    rule_type: Optional[str] = None,
+    src_ip: Optional[str] = None,
+) -> int:
+    """Record an auto-deploy or skip event and return the new row id.
+
+    Extends insert_deploy_event with the Wave C columns (rule_uuid, rule_type,
+    src_ip) needed by get_recent_deploys to serve the dedup projection that
+    should_auto_deploy expects.  The existing rule_id INTEGER column is set to
+    0 for auto-deploy events (the generated rule's identity is in rule_uuid).
+
+    Args:
+        rule_id:   The generated rule's TEXT UUID (rules.id).
+        action:    'auto-deploy' or 'skipped'.
+        reason:    Human-readable explanation — the string returned by
+                   should_auto_deploy (e.g. 'ok', 'auto-deploy disabled').
+        actor:     Who triggered the event; defaults to 'orchestrator'.
+        rule_type: Rule type stored alongside the event for dedup queries.
+        src_ip:    Cluster src_ip stored alongside the event for dedup queries.
+
+    Returns:
+        The newly inserted row id (INTEGER PRIMARY KEY).
+    """
+    deployed_at = datetime.now(timezone.utc).isoformat()
+    with get_cursor(conn) as cur:
+        cur.execute(
+            """
+            INSERT INTO deploy_events
+                (rule_id, action, reason, actor, deployed_at, rule_uuid, rule_type, src_ip)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (0, action, reason, actor, deployed_at, rule_id, rule_type, src_ip),
+        )
+        return cur.lastrowid
+
+
+def get_recent_deploys(conn: sqlite3.Connection, window_seconds: int) -> list[dict]:
+    """Return successful auto-deploy events within the last window_seconds.
+
+    Projects the fields that should_auto_deploy's dedup check expects:
+      rule_type (str), src_ip (str), rule_id (int), deployed_at_ts (float).
+
+    The rule_id in each dict is the cluster's Wazuh rule_id integer, obtained
+    by joining deploy_events -> rules -> clusters.  src_ip and rule_type are
+    stored directly on deploy_events (Wave C columns) to avoid fragile joins
+    if the rules row is later deleted.
+
+    Only events with action='auto-deploy' are returned — skipped events are
+    not relevant for dedup.
+
+    Args:
+        conn:           Open SQLite connection.
+        window_seconds: How many seconds back from now to include.
+
+    Returns:
+        List of dicts with keys: rule_type, src_ip, rule_id, deployed_at_ts.
+        Empty list when no matching events exist.
+    """
+    rows = conn.execute(
+        """
+        SELECT
+            de.rule_type,
+            de.src_ip,
+            COALESCE(cl.rule_id, 0)             AS rule_id,
+            strftime('%s', de.deployed_at)       AS deployed_at_epoch
+        FROM deploy_events de
+        LEFT JOIN rules    r  ON r.id          = de.rule_uuid
+        LEFT JOIN clusters cl ON cl.id         = r.cluster_id
+        WHERE de.action      = 'auto-deploy'
+          AND de.deployed_at >= datetime('now', ? || ' seconds')
+        ORDER BY de.deployed_at DESC
+        """,
+        (f"-{window_seconds}",),
+    ).fetchall()
+
+    result = []
+    for row in rows:
+        result.append({
+            "rule_type":      row["rule_type"],
+            "src_ip":         row["src_ip"],
+            "rule_id":        row["rule_id"],
+            "deployed_at_ts": float(row["deployed_at_epoch"] or 0),
+        })
+    return result
