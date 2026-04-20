@@ -45,6 +45,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -60,6 +61,8 @@ from .cluster import Alert, AlertClusterer, Cluster, parse_wazuh_alert
 from .config import Settings, get_settings
 from .sources.suricata import parse_suricata_alert, tail_eve_json
 from .models import (
+    count_deploy_events_since,
+    count_reverted_since,
     get_cluster,
     get_cluster_alerts,
     get_latest_deploy_event,
@@ -76,6 +79,7 @@ from .models import (
     update_cluster_ai,
     upsert_cluster,
 )
+from .orchestrator import get_orchestrator_stats
 from .triage import TriageResult, TriageQueue
 
 log = logging.getLogger(__name__)
@@ -179,13 +183,29 @@ def _require_auth(
 
 @app.get("/health")
 async def health() -> JSONResponse:
-    """Poller status, queue depth, and last triage timestamp.
+    """Poller status, queue depth, last triage timestamp, orchestrator stats, auto-deploy counts.
 
     Always returns 200 — even if the tailer is degraded — so container
     health checks don't cycle the service on transient read errors.
+
+    New fields (Phase 2, REQ-P1-P2-004):
+      orchestrator — in-memory counters from the Claude tool-use loop.
+      auto_deploy  — 24h deploy/skip/revert counts from deploy_events.
     """
     stats = get_stats(_db) if _db else {}
+
+    # 24-hour window anchor — consistent UTC epoch throughout this request.
+    since_24h = time.time() - 86400
+
+    if _db is not None:
+        deployed_24h = count_deploy_events_since(_db, since_24h, action="auto-deploy")
+        skipped_24h = count_deploy_events_since(_db, since_24h, action="skipped")
+        reverted_24h = count_reverted_since(_db, since_24h)
+    else:
+        deployed_24h = skipped_24h = reverted_24h = 0
+
     return JSONResponse({
+        # Phase 1 fields — unchanged
         "status": "ok",
         "poller_healthy": _poller_healthy,
         "queue_depth": _triage_queue.depth if _triage_queue else 0,
@@ -196,6 +216,15 @@ async def health() -> JSONResponse:
         "total_alerts": stats.get("total_alerts", 0),
         "total_clusters": stats.get("total_clusters", 0),
         "pending_triage": stats.get("pending_triage", 0),
+        # Phase 2 — orchestrator in-memory stats
+        "orchestrator": get_orchestrator_stats(),
+        # Phase 2 — auto-deploy 24h window counts
+        "auto_deploy": {
+            "enabled": bool(_settings.AUTO_DEPLOY_ENABLED) if _settings else False,
+            "deployed_last_24h": deployed_24h,
+            "skipped_last_24h": skipped_24h,
+            "reverted_last_24h": reverted_24h,
+        },
     })
 
 
