@@ -32,6 +32,13 @@
     .deploy-btn { margin-top: 1rem; background: #238636; color: #fff; border: none; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; font-size: 0.875rem; }
     .deploy-btn:hover { background: #2ea043; }
     .deployed-badge { display: inline-block; background: #0d2a0d; color: #56d364; border-radius: 4px; padding: 0.2rem 0.6rem; font-size: 0.75rem; margin-top: 0.5rem; }
+    .reverted-badge { display: inline-block; background: #2d1a00; color: #ffa657; border-radius: 4px; padding: 0.2rem 0.6rem; font-size: 0.75rem; margin-top: 0.5rem; }
+    .rules-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    @media (max-width: 900px) { .rules-grid { grid-template-columns: 1fr; } }
+    .rule-type-badge { font-size: 0.7rem; font-weight: 600; padding: 0.15rem 0.5rem; border-radius: 4px; }
+    .rule-type-yara  { background: #1f3a5c; color: #58a6ff; }
+    .rule-type-sigma { background: #2a1a4a; color: #c792ea; }
+    .deploy-status-none { color: #8b949e; font-size: 0.75rem; font-style: italic; }
     table { width: 100%; border-collapse: collapse; }
     th { background: #21262d; color: #8b949e; font-size: 0.7rem; text-transform: uppercase; padding: 0.6rem 0.75rem; text-align: left; }
     td { padding: 0.6rem 0.75rem; border-top: 1px solid #21262d; font-size: 0.8rem; font-family: monospace; vertical-align: top; max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -84,34 +91,101 @@
       </div>
     </section>
 
-    <!-- IOCs (parsed from ai_analysis JSON if present) -->
+    <!-- Detection Rules: YARA and Sigma side-by-side -->
     {% if rules %}
+    {% set yara_rules  = rules | selectattr("rule_type", "equalto", "yara")  | list %}
+    {% set sigma_rules = rules | selectattr("rule_type", "equalto", "sigma") | list %}
     <section>
-      <h2>YARA Rules</h2>
-      {% for rule in rules %}
-      <div class="card" style="margin-bottom:1rem">
-        <div style="display:flex;align-items:center;gap:1rem;margin-bottom:0.75rem">
-          <span style="font-size:0.8rem;color:#8b949e">{{ rule.id[:8] }}</span>
-          {% if rule.syntax_valid %}
-            <span style="color:#56d364;font-size:0.75rem">syntax valid</span>
+      <h2>Detection Rules</h2>
+      <div class="rules-grid">
+
+        <!-- YARA column -->
+        <div>
+          <h2 style="margin-bottom:0.75rem">YARA</h2>
+          {% if yara_rules %}
+            {% for rule in yara_rules %}
+            <div class="card" style="margin-bottom:1rem">
+              <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap;margin-bottom:0.75rem">
+                <span class="rule-type-badge rule-type-yara">yara</span>
+                <span style="font-size:0.8rem;color:#8b949e;font-family:monospace">{{ rule.id[:8] }}</span>
+                {% if rule.syntax_valid %}
+                  <span style="color:#56d364;font-size:0.75rem">syntax valid</span>
+                {% else %}
+                  <span style="color:#ff7b72;font-size:0.75rem">syntax error</span>
+                {% endif %}
+                {% if rule.deployed %}
+                  <span class="deployed-badge">deployed</span>
+                {% endif %}
+                <!-- Deploy event status -->
+                {% set evt = rule.latest_deploy_event %}
+                {% if evt %}
+                  {% if evt.reverted_at %}
+                    <span class="reverted-badge">reverted {{ evt.reverted_at[:10] }}</span>
+                  {% elif evt.action == 'auto-deploy' %}
+                    <span style="color:#56d364;font-size:0.75rem">auto-deployed {{ evt.deployed_at[:10] }}</span>
+                  {% elif evt.action == 'skipped' %}
+                    <span style="color:#8b949e;font-size:0.75rem">skipped: {{ evt.reason }}</span>
+                  {% endif %}
+                {% else %}
+                  <span class="deploy-status-none">not auto-deployed</span>
+                {% endif %}
+              </div>
+              <pre>{{ rule.rule_content }}</pre>
+              {% if rule.syntax_valid and not rule.deployed %}
+              <button class="deploy-btn"
+                      hx-post="/rules/{{ rule.id }}/deploy"
+                      hx-swap="outerHTML"
+                      hx-target="this">
+                Deploy to /rules/
+              </button>
+              {% endif %}
+            </div>
+            {% endfor %}
           {% else %}
-            <span style="color:#ff7b72;font-size:0.75rem">syntax error</span>
-          {% endif %}
-          {% if rule.deployed %}
-            <span class="deployed-badge">deployed</span>
+            <div class="card"><span style="color:#8b949e;font-size:0.875rem">No YARA rules generated yet.</span></div>
           {% endif %}
         </div>
-        <pre>{{ rule.rule_content }}</pre>
-        {% if rule.syntax_valid and not rule.deployed %}
-        <button class="deploy-btn"
-                hx-post="/rules/{{ rule.id }}/deploy"
-                hx-swap="outerHTML"
-                hx-target="this">
-          Deploy to /rules/
-        </button>
-        {% endif %}
-      </div>
-      {% endfor %}
+
+        <!-- Sigma column -->
+        <div>
+          <h2 style="margin-bottom:0.75rem">Sigma</h2>
+          {% if sigma_rules %}
+            {% for rule in sigma_rules %}
+            <div class="card" style="margin-bottom:1rem">
+              <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap;margin-bottom:0.75rem">
+                <span class="rule-type-badge rule-type-sigma">sigma</span>
+                <span style="font-size:0.8rem;color:#8b949e;font-family:monospace">{{ rule.id[:8] }}</span>
+                {% if rule.syntax_valid %}
+                  <span style="color:#56d364;font-size:0.75rem">syntax valid</span>
+                {% else %}
+                  <span style="color:#ff7b72;font-size:0.75rem">syntax error</span>
+                {% endif %}
+                {% if rule.deployed %}
+                  <span class="deployed-badge">deployed</span>
+                {% endif %}
+                <!-- Deploy event status -->
+                {% set evt = rule.latest_deploy_event %}
+                {% if evt %}
+                  {% if evt.reverted_at %}
+                    <span class="reverted-badge">reverted {{ evt.reverted_at[:10] }}</span>
+                  {% elif evt.action == 'auto-deploy' %}
+                    <span style="color:#56d364;font-size:0.75rem">auto-deployed {{ evt.deployed_at[:10] }}</span>
+                  {% elif evt.action == 'skipped' %}
+                    <span style="color:#8b949e;font-size:0.75rem">skipped: {{ evt.reason }}</span>
+                  {% endif %}
+                {% else %}
+                  <span class="deploy-status-none">not auto-deployed</span>
+                {% endif %}
+              </div>
+              <pre>{{ rule.rule_content }}</pre>
+            </div>
+            {% endfor %}
+          {% else %}
+            <div class="card"><span style="color:#8b949e;font-size:0.875rem">No Sigma rules generated yet.</span></div>
+          {% endif %}
+        </div>
+
+      </div><!-- .rules-grid -->
     </section>
     {% endif %}
 

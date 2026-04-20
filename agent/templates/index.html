@@ -12,9 +12,15 @@
     header h1 { font-size: 1.25rem; font-weight: 600; }
     header .badge { font-size: 0.75rem; background: #1f6feb; color: #fff; padding: 0.2rem 0.6rem; border-radius: 12px; }
     main { padding: 2rem; max-width: 1200px; margin: 0 auto; }
-    .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; }
+    .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
     .toolbar h2 { font-size: 1rem; color: #8b949e; }
     .refresh-note { font-size: 0.75rem; color: #8b949e; }
+    .filter-chips { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; align-items: center; }
+    .chip { font-size: 0.8rem; padding: 0.3rem 0.8rem; border-radius: 20px; border: 1px solid #30363d; color: #8b949e; text-decoration: none; background: #161b22; }
+    .chip:hover { border-color: #58a6ff; color: #58a6ff; text-decoration: none; }
+    .chip.active { background: #1f3a5c; border-color: #58a6ff; color: #58a6ff; font-weight: 600; }
+    .nav-link { font-size: 0.8rem; color: #8b949e; text-decoration: none; margin-left: auto; }
+    .nav-link:hover { color: #58a6ff; text-decoration: none; }
     table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
     th { background: #21262d; color: #8b949e; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; padding: 0.75rem 1rem; text-align: left; }
     td { padding: 0.75rem 1rem; border-top: 1px solid #21262d; font-size: 0.875rem; vertical-align: middle; }
@@ -42,8 +48,15 @@
       <span class="refresh-note">Auto-refreshes every 10s</span>
     </div>
 
+    <div class="filter-chips">
+      <a href="/?source=all"      class="chip {% if active_source == 'all' %}active{% endif %}">All</a>
+      <a href="/?source=wazuh"    class="chip {% if active_source == 'wazuh' %}active{% endif %}">Wazuh</a>
+      <a href="/?source=suricata" class="chip {% if active_source == 'suricata' %}active{% endif %}">Suricata</a>
+      <a href="/deploy-events" class="nav-link">Deploy Events →</a>
+    </div>
+
     <div id="cluster-table"
-         hx-get="/"
+         hx-get="/?source={{ active_source }}"
          hx-trigger="every 10s"
          hx-target="#cluster-table"
          hx-swap="outerHTML">

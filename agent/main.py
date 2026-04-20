@@ -62,12 +62,16 @@ from .sources.suricata import parse_suricata_alert, tail_eve_json
 from .models import (
     get_cluster,
     get_cluster_alerts,
+    get_latest_deploy_event,
     get_rules_for_cluster,
     get_stats,
     init_db,
     insert_alert,
     insert_rule,
     list_clusters,
+    list_clusters_by_source,
+    list_deploy_events_paginated,
+    mark_deploy_reverted_by_rule,
     mark_rule_deployed,
     update_cluster_ai,
     upsert_cluster,
@@ -196,13 +200,53 @@ async def health() -> JSONResponse:
 
 
 @app.get("/", response_class=HTMLResponse, dependencies=[Depends(_require_auth)])
-async def index(request: Request):
-    """Dashboard: cluster list with HTMX auto-refresh every 10 seconds."""
-    rows = list_clusters(_db, limit=100) if _db else []
+async def index(request: Request, source: Optional[str] = None):
+    """Dashboard: cluster list with HTMX auto-refresh every 10 seconds.
+
+    Accepts an optional ?source= query param ('wazuh', 'suricata', 'all').
+    The active filter is forwarded to the template so the filter chips can
+    highlight the active selection and HTMX polling preserves the param.
+    """
+    if _db is not None:
+        rows = list_clusters_by_source(_db, source=source, limit=100)
+    else:
+        rows = []
     clusters = [dict(r) for r in rows]
+    active_source = source or "all"
     return templates.TemplateResponse(
         "index.html",
-        {"request": request, "clusters": clusters},
+        {"request": request, "clusters": clusters, "active_source": active_source},
+    )
+
+
+@app.get(
+    "/deploy-events",
+    response_class=HTMLResponse,
+    dependencies=[Depends(_require_auth)],
+)
+async def deploy_events_page(request: Request, offset: int = 0):
+    """Audit log page: paginated deploy events, 50 rows per page.
+
+    @decision DEC-DASHBOARD-001
+    @title Paginated deploy-events audit log at /deploy-events
+    @status accepted
+    @rationale A dedicated page keeps the index clean while providing full
+               visibility into the auto-deploy/undo history for operators.
+               50-row pages balance readability with query cost.
+    """
+    rows = list_deploy_events_paginated(_db, limit=50, offset=offset) if _db else []
+    events = [dict(r) for r in rows]
+    next_offset = offset + 50 if len(events) == 50 else None
+    prev_offset = max(0, offset - 50) if offset > 0 else None
+    return templates.TemplateResponse(
+        "deploy_events.html",
+        {
+            "request": request,
+            "events": events,
+            "offset": offset,
+            "next_offset": next_offset,
+            "prev_offset": prev_offset,
+        },
     )
 
 
@@ -212,19 +256,29 @@ async def index(request: Request):
     dependencies=[Depends(_require_auth)],
 )
 async def cluster_detail(request: Request, cluster_id: str):
-    """Cluster detail: alert list, AI analysis, YARA rule."""
+    """Cluster detail: alert list, AI analysis, YARA and Sigma rules with deploy status."""
     cluster = get_cluster(_db, cluster_id) if _db else None
     if cluster is None:
         raise HTTPException(status_code=404, detail="Cluster not found")
     alerts = get_cluster_alerts(_db, cluster_id) if _db else []
-    rules = get_rules_for_cluster(_db, cluster_id) if _db else []
+    rule_rows = get_rules_for_cluster(_db, cluster_id) if _db else []
+
+    # Enrich each rule with its most recent deploy event so the template can
+    # render deploy status without a separate per-rule HTMX call.
+    rules = []
+    for r in rule_rows:
+        rule = dict(r)
+        evt = get_latest_deploy_event(_db, rule["id"]) if _db else None
+        rule["latest_deploy_event"] = dict(evt) if evt else None
+        rules.append(rule)
+
     return templates.TemplateResponse(
         "cluster_detail.html",
         {
             "request": request,
             "cluster": dict(cluster),
             "alerts": [dict(a) for a in alerts],
-            "rules": [dict(r) for r in rules],
+            "rules": rules,
         },
     )
 
@@ -248,7 +302,6 @@ async def deploy_rule(rule_id: str):
     if _db is None or _settings is None:
         raise HTTPException(status_code=503, detail="Database not ready")
 
-    from .models import get_rules_for_cluster
     cur = _db.execute("SELECT * FROM rules WHERE id = ?", (rule_id,))
     row = cur.fetchone()
     if row is None:
@@ -265,6 +318,60 @@ async def deploy_rule(rule_id: str):
     mark_rule_deployed(_db, rule_id)
     log.info("Deployed rule %s to %s", rule_id, rule_file)
     return {"deployed": True, "path": str(rule_file)}
+
+
+@app.post(
+    "/rules/{rule_id}/undo-deploy",
+    dependencies=[Depends(_require_auth)],
+)
+async def undo_deploy_rule(rule_id: str):
+    """Delete a deployed rule file and mark its audit row as reverted.
+
+    Auth: same SHAFERHUND_TOKEN bearer/query-param scheme as /deploy.
+
+    Behaviour:
+      - 404  if the .yar file does not exist on disk (DB is NOT updated —
+             idempotent safety; a missing file implies the rule was never
+             written or was already cleaned up externally).
+      - 200  {"reverted": true, "path": "..."}  on success.
+      - 409  if no un-reverted auto-deploy event found for this rule UUID
+             (already reverted — idempotent guard).
+
+    @decision DEC-UNDO-001
+    @title Undo returns 404 when file absent, 409 when already reverted
+    @status accepted
+    @rationale 404 on missing file avoids silently corrupting audit state
+               when the file was removed externally.  409 on already-reverted
+               is more informative than a silent 200 and makes retry logic
+               explicit for callers.
+    """
+    if _db is None or _settings is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+
+    rules_dir = Path(_settings.rules_dir)
+    rule_file = rules_dir / f"{rule_id}.yar"
+
+    if not rule_file.exists():
+        raise HTTPException(status_code=404, detail="Rule file not found on disk")
+
+    # Delete the file first; only update DB if deletion succeeds.
+    rule_file.unlink()
+    log.info("Deleted rule file %s", rule_file)
+
+    reverted = mark_deploy_reverted_by_rule(_db, rule_id)
+    if not reverted:
+        # File was present but no un-reverted auto-deploy event — already reverted
+        # or was deployed via the manual endpoint (no rule_uuid on deploy_events).
+        log.warning(
+            "undo-deploy: file deleted but no un-reverted auto-deploy event for rule %s",
+            rule_id,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Rule file deleted but no un-reverted deploy event found",
+        )
+
+    return {"reverted": True, "path": str(rule_file)}
 
 
 # ---------------------------------------------------------------------------
