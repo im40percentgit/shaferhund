@@ -13,6 +13,11 @@ and persist detection rules. recommend_deploy records a deploy recommendation
 in the deploy_events audit table. finalize_triage commits the AI verdict to
 the cluster row and returns a TriageResult.
 
+After finalize_triage completes, _run_auto_deploy iterates all rules
+persisted for the cluster and calls should_auto_deploy() for each.
+Passing rules are written to the RULES_DIR filesystem path; every
+decision (deploy or skip) is recorded in deploy_events for auditing.
+
 The handlers are exposed as standalone functions for direct unit-testing,
 but need a DB connection to operate. run_triage_loop accepts an optional `conn`
 parameter; when provided, it builds a local dispatch dict that injects the
@@ -47,6 +52,21 @@ module-level stubs.
            pattern: run_triage_loop builds an effective dispatch dict by merging
            read and write closures, no global state required. finalize_triage
            now calls update_cluster_ai to persist the verdict.
+
+@decision DEC-AUTODEPLOY-INTEG-001
+@title Auto-deploy runs after finalize_triage inside run_triage_loop, after the loop exits
+@status accepted
+@rationale The integration point is the earliest moment all three conditions are
+           true: (a) the triage verdict is committed to the cluster row, (b) all
+           rules for the cluster are persisted in the rules table, and (c) we
+           have the cluster's ai_severity and ai_confidence to pass to the policy
+           gate.  Placing _run_auto_deploy immediately after finalize_triage
+           returns — still inside the loop, before returning to the caller —
+           satisfies all three.  An exception in _run_auto_deploy is caught and
+           logged but does NOT corrupt the TriageResult or the rules row: the
+           triage verdict is already committed by update_cluster_ai, so the
+           caller always receives a valid result even if file-write or DB-insert
+           fails in the deploy step.
 """
 
 import json
@@ -54,15 +74,23 @@ import logging
 import sqlite3
 import time
 import uuid
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 from .models import (
     get_alerts_by_src_ip,
+    get_cluster,
     get_cluster_with_alerts,
+    get_recent_deploys,
+    get_rules_for_cluster,
     insert_deploy_event,
     insert_rule,
+    mark_rule_deployed,
+    record_deploy_event,
     update_cluster_ai,
 )
+from .policy import should_auto_deploy
 from .triage import TriageResult
 
 log = logging.getLogger(__name__)
@@ -860,6 +888,22 @@ def run_triage_loop(
             finalize_handler = effective_dispatch["finalize_triage"]
             result = finalize_handler(tool_input)
             result.cluster_id = cluster_id
+
+            # Auto-deploy integration (REQ-P0-P2-006, DEC-AUTODEPLOY-INTEG-001).
+            # Run AFTER finalize so the triage verdict is committed and all rules
+            # are in the DB.  Exceptions here are caught so a file-write failure
+            # never corrupts the TriageResult or rules row already committed above.
+            if conn is not None:
+                try:
+                    _run_auto_deploy(conn, cluster_id, config)
+                except Exception as exc:
+                    log.error(
+                        "Auto-deploy step failed for cluster %s (non-fatal): %s",
+                        cluster_id,
+                        exc,
+                        exc_info=True,
+                    )
+
             return result
 
         # Dispatch to the handler — catch NotImplementedError gracefully for stubs.
@@ -909,6 +953,111 @@ def run_triage_loop(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _run_auto_deploy(
+    conn: sqlite3.Connection,
+    cluster_id: str,
+    config: Any,
+) -> None:
+    """Evaluate and execute auto-deploy for all rules persisted for a cluster.
+
+    Called by run_triage_loop immediately after finalize_triage commits the
+    triage verdict.  Iterates every rule row associated with cluster_id,
+    calls should_auto_deploy() for each, and:
+
+      - On (True, 'ok'): writes the rule content to RULES_DIR/<rule_id>.yar
+        and inserts a deploy_events row with action='auto-deploy'.
+      - On (False, reason): inserts a deploy_events row with action='skipped'
+        and the rejection reason.  No file is written.
+
+    The cluster row must already have ai_severity set (written by
+    finalize_triage → update_cluster_ai) before this function runs.
+
+    Args:
+        conn:       Open SQLite connection.
+        cluster_id: The cluster whose rules are being evaluated.
+        config:     Settings object with AUTO_DEPLOY_* fields and rules_dir.
+
+    Raises:
+        Nothing — callers catch all exceptions so a deploy failure never
+        corrupts the triage result.  Individual rule errors are logged and
+        the loop continues to the next rule.
+    """
+    cluster_row = get_cluster(conn, cluster_id)
+    if cluster_row is None:
+        log.warning("_run_auto_deploy: cluster %s not found, skipping", cluster_id)
+        return
+
+    rules = get_rules_for_cluster(conn, cluster_id)
+    if not rules:
+        log.debug("_run_auto_deploy: no rules for cluster %s", cluster_id)
+        return
+
+    recent = get_recent_deploys(conn, config.AUTO_DEPLOY_DEDUP_WINDOW_SECONDS)
+    rules_dir = Path(getattr(config, "rules_dir", "/rules"))
+
+    # should_auto_deploy uses attribute access (rule.rule_type, cluster.ai_confidence).
+    # sqlite3.Row supports only key/index access, so convert both rows to
+    # SimpleNamespace so the policy function works without modification.
+    cluster_ns = SimpleNamespace(**dict(cluster_row))
+
+    for rule_row in rules:
+        rule_id = rule_row["id"]
+        rule_dict = dict(rule_row)
+        # SQLite stores BOOLEAN as integer 0/1.  should_auto_deploy uses `is not True`
+        # (identity check) so we must convert to a proper Python bool before passing.
+        rule_dict["syntax_valid"] = bool(rule_dict.get("syntax_valid"))
+        rule_ns = SimpleNamespace(**rule_dict)
+        try:
+            deploy_ok, reason = should_auto_deploy(rule_ns, cluster_ns, recent, config)
+
+            if deploy_ok:
+                # Write rule file — mkdir is a no-op when dir already exists.
+                rules_dir.mkdir(parents=True, exist_ok=True)
+                rule_path = rules_dir / f"{rule_id}.yar"
+                rule_path.write_text(rule_row["rule_content"] or "", encoding="utf-8")
+
+                mark_rule_deployed(conn, rule_id)
+                record_deploy_event(
+                    conn,
+                    rule_id=rule_id,
+                    action="auto-deploy",
+                    reason=reason,
+                    actor="orchestrator",
+                    rule_type=rule_row["rule_type"],
+                    src_ip=cluster_row["src_ip"],
+                )
+                log.info(
+                    "Auto-deployed rule %s for cluster %s -> %s",
+                    rule_id,
+                    cluster_id,
+                    rule_path,
+                )
+            else:
+                record_deploy_event(
+                    conn,
+                    rule_id=rule_id,
+                    action="skipped",
+                    reason=reason,
+                    actor="orchestrator",
+                    rule_type=rule_row["rule_type"],
+                    src_ip=cluster_row["src_ip"],
+                )
+                log.info(
+                    "Auto-deploy skipped for rule %s (cluster %s): %s",
+                    rule_id,
+                    cluster_id,
+                    reason,
+                )
+        except Exception as exc:
+            log.error(
+                "Auto-deploy error for rule %s in cluster %s: %s",
+                rule_id,
+                cluster_id,
+                exc,
+                exc_info=True,
+            )
 
 
 def _make_failsafe(cluster_id: str) -> TriageResult:
