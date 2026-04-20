@@ -595,6 +595,132 @@ def record_deploy_event(
         return cur.lastrowid
 
 
+# ---------------------------------------------------------------------------
+# Wave D helpers  (Phase 2 — REQ-P0-P2-007 dashboard additions, issue #12)
+# ---------------------------------------------------------------------------
+
+def list_clusters_by_source(
+    conn: sqlite3.Connection,
+    source: Optional[str] = None,
+    limit: int = 50,
+) -> list[sqlite3.Row]:
+    """Return clusters filtered by source, ordered newest first.
+
+    Args:
+        conn:   Open SQLite connection.
+        source: 'wazuh', 'suricata', 'all', or None.  'all' and None both
+                return clusters from every source (pass-through).
+        limit:  Maximum rows to return.
+
+    Returns:
+        List of sqlite3.Row objects ordered by created_at DESC.
+    """
+    if source and source != "all":
+        rows = conn.execute(
+            "SELECT * FROM clusters WHERE source = ? ORDER BY created_at DESC LIMIT ?",
+            (source, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM clusters ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return rows
+
+
+def get_latest_deploy_event(
+    conn: sqlite3.Connection,
+    rule_id: str,
+) -> Optional[sqlite3.Row]:
+    """Return the most recent deploy_events row for a given rule UUID, or None.
+
+    Matches against rule_uuid (the TEXT UUID stored by record_deploy_event /
+    auto-deploy path).  Used by cluster_detail to surface per-rule deploy status.
+
+    Args:
+        conn:    Open SQLite connection.
+        rule_id: The TEXT UUID from rules.id.
+
+    Returns:
+        The most recent sqlite3.Row from deploy_events, or None if no events.
+    """
+    row = conn.execute(
+        """
+        SELECT * FROM deploy_events
+        WHERE rule_uuid = ?
+        ORDER BY deployed_at DESC
+        LIMIT 1
+        """,
+        (rule_id,),
+    ).fetchone()
+    return row
+
+
+def mark_deploy_reverted_by_rule(
+    conn: sqlite3.Connection,
+    rule_id: str,
+    reverted_at: Optional[str] = None,
+) -> bool:
+    """Mark the most recent auto-deploy event for rule_uuid as reverted.
+
+    This is the undo-deploy path: find the latest 'auto-deploy' row for the
+    given rule UUID and stamp reverted_at.  Returns True if a row was updated,
+    False if no un-reverted auto-deploy event was found (idempotent / 404 path).
+
+    The existing mark_deploy_reverted(conn, deploy_event_id) is preserved for
+    the orchestrator tool path which works by event-id.  This helper works by
+    rule UUID so the HTTP undo endpoint doesn't need to do a two-step lookup.
+
+    Args:
+        conn:        Open SQLite connection.
+        rule_id:     The TEXT UUID from rules.id (deploy_events.rule_uuid).
+        reverted_at: ISO8601 timestamp; defaults to now(UTC).
+
+    Returns:
+        True if a row was updated, False otherwise.
+    """
+    ts = reverted_at or datetime.now(timezone.utc).isoformat()
+    with get_cursor(conn) as cur:
+        cur.execute(
+            """
+            UPDATE deploy_events
+               SET reverted_at = ?
+             WHERE id = (
+                 SELECT id FROM deploy_events
+                  WHERE rule_uuid = ?
+                    AND action    = 'auto-deploy'
+                    AND reverted_at IS NULL
+                  ORDER BY deployed_at DESC
+                  LIMIT 1
+             )
+            """,
+            (ts, rule_id),
+        )
+        return cur.rowcount > 0
+
+
+def list_deploy_events_paginated(
+    conn: sqlite3.Connection,
+    limit: int = 50,
+    offset: int = 0,
+) -> list[sqlite3.Row]:
+    """Return deploy events for the audit log page, newest first with pagination.
+
+    Args:
+        conn:   Open SQLite connection.
+        limit:  Page size (default 50).
+        offset: Row offset for pagination.
+
+    Returns:
+        List of sqlite3.Row objects ordered by deployed_at DESC.
+    """
+    rows = conn.execute(
+        "SELECT * FROM deploy_events ORDER BY deployed_at DESC LIMIT ? OFFSET ?",
+        (limit, offset),
+    ).fetchall()
+    return rows
+
+
 def get_recent_deploys(conn: sqlite3.Connection, window_seconds: int) -> list[dict]:
     """Return successful auto-deploy events within the last window_seconds.
 

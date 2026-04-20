@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Deploy Events — Shaferhund</title>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, sans-serif; background: #0d1117; color: #e6edf3; min-height: 100vh; }
+    header { background: #161b22; border-bottom: 1px solid #30363d; padding: 1rem 2rem; display: flex; align-items: center; gap: 1rem; }
+    header h1 { font-size: 1.25rem; font-weight: 600; }
+    a.back { color: #58a6ff; font-size: 0.875rem; text-decoration: none; }
+    a.back:hover { text-decoration: underline; }
+    main { padding: 2rem; max-width: 1400px; margin: 0 auto; }
+    .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; }
+    .toolbar h2 { font-size: 1rem; color: #8b949e; }
+    table { width: 100%; border-collapse: collapse; background: #161b22; border-radius: 8px; overflow: hidden; }
+    th { background: #21262d; color: #8b949e; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; padding: 0.75rem 1rem; text-align: left; }
+    td { padding: 0.75rem 1rem; border-top: 1px solid #21262d; font-size: 0.8rem; vertical-align: middle; font-family: monospace; }
+    tr:hover td { background: #1c2128; }
+    .action-auto   { background: #0d2a0d; color: #56d364; border-radius: 4px; padding: 0.15rem 0.5rem; font-size: 0.7rem; font-weight: 600; }
+    .action-manual { background: #1f3a5c; color: #58a6ff; border-radius: 4px; padding: 0.15rem 0.5rem; font-size: 0.7rem; font-weight: 600; }
+    .action-skip   { background: #21262d; color: #8b949e; border-radius: 4px; padding: 0.15rem 0.5rem; font-size: 0.7rem; font-weight: 600; }
+    .action-rev    { background: #2d1a00; color: #ffa657; border-radius: 4px; padding: 0.15rem 0.5rem; font-size: 0.7rem; font-weight: 600; }
+    .empty { text-align: center; padding: 3rem; color: #8b949e; }
+    .pagination { display: flex; gap: 1rem; margin-top: 1.5rem; align-items: center; }
+    .pagination a { color: #58a6ff; font-size: 0.875rem; text-decoration: none; padding: 0.4rem 0.8rem; border: 1px solid #30363d; border-radius: 6px; }
+    .pagination a:hover { background: #21262d; }
+    .pagination span { color: #8b949e; font-size: 0.8rem; }
+    .mono { font-family: monospace; font-size: 0.75rem; color: #8b949e; }
+  </style>
+</head>
+<body>
+  <header>
+    <a class="back" href="/">← Back</a>
+    <h1>Deploy Events</h1>
+  </header>
+  <main>
+    <div class="toolbar">
+      <h2>Audit Log</h2>
+      <span class="mono">offset={{ offset }}</span>
+    </div>
+
+    {% if events %}
+    <table>
+      <thead>
+        <tr>
+          <th>Deployed At</th>
+          <th>Rule ID</th>
+          <th>Type</th>
+          <th>Action</th>
+          <th>Reason</th>
+          <th>Actor</th>
+          <th>Reverted At</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in events %}
+        <tr>
+          <td>{{ e.deployed_at }}</td>
+          <td class="mono">
+            {% if e.rule_uuid %}{{ e.rule_uuid[:8] }}{% else %}{{ e.rule_id }}{% endif %}
+          </td>
+          <td>{{ e.rule_type or '—' }}</td>
+          <td>
+            {% if e.action == 'auto-deploy' %}
+              <span class="action-auto">auto-deploy</span>
+            {% elif e.action == 'manual' or e.action == 'manual-deploy' %}
+              <span class="action-manual">manual</span>
+            {% elif e.action == 'skipped' %}
+              <span class="action-skip">skipped</span>
+            {% elif e.action == 'reverted' or e.action == 'undo-deploy' %}
+              <span class="action-rev">reverted</span>
+            {% else %}
+              {{ e.action }}
+            {% endif %}
+          </td>
+          <td>{{ e.reason or '—' }}</td>
+          <td>{{ e.actor }}</td>
+          <td>{{ e.reverted_at or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <div class="pagination">
+      {% if prev_offset is not none %}
+        <a href="/deploy-events?offset={{ prev_offset }}">← Newer</a>
+      {% endif %}
+      <span>Showing rows {{ offset + 1 }}–{{ offset + events|length }}</span>
+      {% if next_offset is not none %}
+        <a href="/deploy-events?offset={{ next_offset }}">Older →</a>
+      {% endif %}
+    </div>
+
+    {% else %}
+    <div class="empty">No deploy events recorded yet.</div>
+    {% endif %}
+  </main>
+</body>
+</html>
