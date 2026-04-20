@@ -721,6 +721,63 @@ def list_deploy_events_paginated(
     return rows
 
 
+def count_deploy_events_since(
+    conn: sqlite3.Connection,
+    since_ts: float,
+    action: Optional[str] = None,
+) -> int:
+    """Count deploy_events rows with deployed_at >= since_ts, optionally by action.
+
+    Used by the /health endpoint to report 24h deploy/skip/revert counts in O(1)
+    without pulling full rows into Python. Timestamps stored as ISO8601 strings
+    compare lexicographically correctly because they share the same UTC format.
+
+    Args:
+        conn:     Open SQLite connection.
+        since_ts: Unix epoch float (e.g. time.time() - 86400). Converted to an
+                  ISO8601 string for comparison against the deployed_at TEXT column.
+        action:   If given, restrict to rows where action = this value.
+                  Pass None to count all actions since since_ts.
+
+    Returns:
+        Integer count, 0 when no matching rows exist.
+    """
+    since_iso = datetime.fromtimestamp(since_ts, tz=timezone.utc).isoformat()
+
+    if action is not None:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM deploy_events WHERE deployed_at >= ? AND action = ?",
+            (since_iso, action),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM deploy_events WHERE deployed_at >= ?",
+            (since_iso,),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def count_reverted_since(conn: sqlite3.Connection, since_ts: float) -> int:
+    """Count deploy_events rows where reverted_at >= since_ts.
+
+    Separate from count_deploy_events_since because reverted_at is a different
+    column — set by the undo endpoint, not at deploy time.
+
+    Args:
+        conn:     Open SQLite connection.
+        since_ts: Unix epoch float.
+
+    Returns:
+        Integer count, 0 when no matching rows exist.
+    """
+    since_iso = datetime.fromtimestamp(since_ts, tz=timezone.utc).isoformat()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM deploy_events WHERE reverted_at >= ?",
+        (since_iso,),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
 def get_recent_deploys(conn: sqlite3.Connection, window_seconds: int) -> list[dict]:
     """Return successful auto-deploy events within the last window_seconds.
 

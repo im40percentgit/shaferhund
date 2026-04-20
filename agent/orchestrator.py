@@ -96,6 +96,48 @@ from .triage import TriageResult
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# In-memory orchestrator run statistics (REQ-P1-P2-004)
+#
+# @decision DEC-HEALTH-001
+# @title Single-dict in-memory counters, no lock required
+# @status accepted
+# @rationale run_triage_loop is dispatched by TriageQueue which processes one
+#            cluster at a time in a single asyncio task worker (see triage.py).
+#            There is exactly one writer — the worker task — so concurrent
+#            modification is impossible and a threading.Lock would be dead code.
+#            Counters reset on restart; this is documented, expected, and fine
+#            for the operational dashboard use-case (short-horizon monitoring).
+# ---------------------------------------------------------------------------
+
+_STATS: dict = {
+    "total_runs": 0,
+    "tool_calls": 0,
+    "timeouts": 0,
+    "failsafe_finalizations": 0,
+}
+
+
+def get_orchestrator_stats() -> dict:
+    """Return a shallow copy of orchestrator run statistics for the /health endpoint.
+
+    Computed field ``avg_tool_calls_per_run`` is included in the returned dict.
+    Divide-by-zero is guarded: returns 0.0 when no runs have completed yet.
+
+    Returns:
+        Dict with keys: total_runs (int), avg_tool_calls_per_run (float),
+        timeouts (int), failsafe_finalizations (int).
+    """
+    total = _STATS["total_runs"]
+    avg = _STATS["tool_calls"] / max(total, 1) if total > 0 else 0.0
+    return {
+        "total_runs": _STATS["total_runs"],
+        "avg_tool_calls_per_run": avg,
+        "timeouts": _STATS["timeouts"],
+        "failsafe_finalizations": _STATS["failsafe_finalizations"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tool schema — 6 tools for the orchestrator loop
 # Each entry is a valid Anthropic tool definition dict.
 # ---------------------------------------------------------------------------
@@ -795,6 +837,9 @@ def run_triage_loop(
     prompt = build_cluster_context_prompt(cluster)
     messages: list[dict] = [{"role": "user", "content": prompt}]
 
+    # Increment total_runs at the start of each invocation (REQ-P1-P2-004).
+    _STATS["total_runs"] += 1
+
     wall_start = time.monotonic()
     calls_made = 0
 
@@ -816,6 +861,8 @@ def run_triage_loop(
                 cluster_id,
                 calls_made,
             )
+            _STATS["timeouts"] += 1
+            _STATS["failsafe_finalizations"] += 1
             return _make_failsafe(cluster_id)
 
         # Call Claude.
@@ -851,6 +898,7 @@ def run_triage_loop(
                 "Orchestrator: end_turn without finalize_triage for cluster %s",
                 cluster_id,
             )
+            _STATS["failsafe_finalizations"] += 1
             return _make_failsafe(cluster_id)
 
         if stop_reason != "tool_use":
@@ -860,6 +908,7 @@ def run_triage_loop(
                 stop_reason,
                 cluster_id,
             )
+            _STATS["failsafe_finalizations"] += 1
             return _make_failsafe(cluster_id)
 
         # Extract tool use blocks from the response.
@@ -869,6 +918,7 @@ def run_triage_loop(
                 "Orchestrator: stop_reason=tool_use but no tool_use block for cluster %s",
                 cluster_id,
             )
+            _STATS["failsafe_finalizations"] += 1
             return _make_failsafe(cluster_id)
 
         tool_name = tool_use_block.get("name", "")
@@ -907,6 +957,8 @@ def run_triage_loop(
             return result
 
         # Dispatch to the handler — catch NotImplementedError gracefully for stubs.
+        # Increment tool_calls each time a handler is invoked (REQ-P1-P2-004).
+        _STATS["tool_calls"] += 1
         handler = effective_dispatch.get(tool_name)
         if handler is None:
             tool_result_content = f"Error: unknown tool '{tool_name}'"
@@ -947,6 +999,7 @@ def run_triage_loop(
         max_calls,
         cluster_id,
     )
+    _STATS["failsafe_finalizations"] += 1
     return _make_failsafe(cluster_id)
 
 
