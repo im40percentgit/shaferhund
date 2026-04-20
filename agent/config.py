@@ -14,6 +14,8 @@ fail fast rather than silently degrading.
            localhost only (see main.py host selection).
 """
 
+import json
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import field_validator
 
@@ -52,6 +54,26 @@ class Settings(BaseSettings):
     # Orchestrator caps (Phase 2)
     orch_max_tool_calls: int = 5
     orch_wall_timeout_seconds: float = 10.0
+
+    # Auto-deploy policy gate (Phase 2, REQ-P0-P2-006, DEC-AUTODEPLOY-001)
+    # Default OFF — operator must explicitly enable via env var.
+    AUTO_DEPLOY_ENABLED: bool = False
+    AUTO_DEPLOY_CONF_THRESHOLD: float = 0.85
+    AUTO_DEPLOY_DEDUP_WINDOW_SECONDS: int = 3600
+    # JSON-encoded list in env: AUTO_DEPLOY_SEVERITIES='["Critical","High"]'
+    # Falls back to the default list when the env var is absent.
+    AUTO_DEPLOY_SEVERITIES: list[str] = ["Critical", "High"]
+
+    @field_validator("AUTO_DEPLOY_SEVERITIES", mode="before")
+    @classmethod
+    def parse_severities(cls, v: object) -> list[str]:
+        """Accept a JSON-encoded string (env var) or a plain list."""
+        if isinstance(v, str):
+            parsed = json.loads(v)
+            if not isinstance(parsed, list):
+                raise ValueError("AUTO_DEPLOY_SEVERITIES must be a JSON list of strings")
+            return parsed
+        return v  # type: ignore[return-value]
 
     @field_validator("triage_hourly_budget")
     @classmethod
