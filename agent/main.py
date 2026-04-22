@@ -55,6 +55,7 @@ from typing import Optional
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .cluster import Alert, AlertClusterer, Cluster, parse_wazuh_alert
@@ -145,6 +146,25 @@ app = FastAPI(title="Shaferhund", version="0.1.0", lifespan=lifespan)
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+
+# ---------------------------------------------------------------------------
+# Static assets — htmx vendored locally (CSO Finding F3)
+#
+# @decision DEC-SUPPLY-001
+# @title Vendor htmx into agent/static/ and serve at /static/; remove CDN dependency
+# @status accepted
+# @rationale Loading htmx from unpkg.com introduced a CDN supply-chain risk: a
+#            compromised or man-in-the-middle CDN response could inject arbitrary
+#            JS into the dashboard. Vendoring eliminates the runtime external
+#            dependency entirely. The trade-off is manual version bumps — update
+#            agent/static/htmx-<ver>.min.js and the script tags in all three
+#            templates whenever htmx is upgraded. At 48 KB the file is negligible
+#            bloat. /static/* is intentionally NOT behind _require_auth: static
+#            assets carry no secrets and gating them would break the login page
+#            itself if one were ever added.
+# ---------------------------------------------------------------------------
+STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 # ---------------------------------------------------------------------------
