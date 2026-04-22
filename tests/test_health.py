@@ -1,13 +1,22 @@
 """
-/health endpoint tests — Phase 2, REQ-P1-P2-004.
+/health and /metrics endpoint tests — CSO F5 split.
 
-Verifies that:
-  1. Phase 1 fields are still present and correct (no regression).
-  2. New ``orchestrator`` block exists with the four expected keys/types.
-  3. New ``auto_deploy`` block exists with the four expected keys/types.
-  4. auto_deploy counts reflect seeded deploy_events data (24h window filter).
-  5. orchestrator counters increment correctly after a mock run_triage_loop call.
-  6. Zero-state: fresh DB + no runs → all counts 0, avg=0.0 (no divide-by-zero).
+/health (unauthenticated liveness probe):
+  1. Returns exactly {status, poller_healthy} — no extra keys.
+  2. Always returns 200 regardless of token configuration.
+  3. Rich recon fields (queue_depth, total_alerts, orchestrator, …)
+     are NOT present in /health.
+
+/metrics (authenticated operational stats):
+  4. When SHAFERHUND_TOKEN is unset → 200 with full stats payload.
+  5. When SHAFERHUND_TOKEN is set and no auth header → 401.
+  6. When SHAFERHUND_TOKEN is set and correct bearer → 200 with full stats.
+  7. Wrong bearer → 401.
+  8. orchestrator block present with correct types, no nulls.
+  9. auto_deploy block present with correct types.
+  10. auto_deploy counts reflect seeded deploy_events data (24h window filter).
+  11. orchestrator counters increment after a mock run_triage_loop call.
+  12. Zero-state: fresh DB + no runs → all counts 0, avg=0.0 (no divide-by-zero).
 
 # @mock-exempt: claude_client is the Anthropic HTTP API — an external boundary.
 # run_triage_loop is tested against its real implementation; only the HTTP
@@ -64,7 +73,7 @@ def _make_client(tmp_path, token: str = ""):
 
     main_module._db = conn
     main_module._settings = settings
-    main_module._triage_queue = None  # not needed for /health
+    main_module._triage_queue = None  # not needed for /health or /metrics
     main_module._poller_healthy = False
     main_module._last_poll_at = None
 
@@ -119,12 +128,12 @@ def _make_config(max_calls: int = 5, wall_timeout: float = 10.0) -> SimpleNamesp
 
 
 # ---------------------------------------------------------------------------
-# Case 1 — Phase 1 fields still present
+# /health tests — unauthenticated liveness probe
 # ---------------------------------------------------------------------------
 
 
-def test_health_phase1_fields_present(tmp_path):
-    """GET /health → Phase 1 contract fields must all be present."""
+def test_health_returns_only_liveness_fields(tmp_path):
+    """GET /health → exactly {status, poller_healthy}, nothing else."""
     _reset_orchestrator_stats()
     client, conn = _make_client(tmp_path)
 
@@ -132,29 +141,144 @@ def test_health_phase1_fields_present(tmp_path):
     assert resp.status_code == 200
 
     data = resp.json()
-    for key in ("status", "poller_healthy", "queue_depth", "last_triage_at"):
-        assert key in data, f"Phase 1 field {key!r} missing from /health"
-
+    assert set(data.keys()) == {"status", "poller_healthy"}, (
+        f"Expected exactly {{status, poller_healthy}}, got keys: {set(data.keys())}"
+    )
     assert data["status"] == "ok"
+    assert isinstance(data["poller_healthy"], bool)
+
+    conn.close()
+
+
+def test_health_no_recon_fields(tmp_path):
+    """GET /health must NOT contain operational/recon fields."""
+    _reset_orchestrator_stats()
+    client, conn = _make_client(tmp_path)
+
+    resp = client.get("/health")
+    assert resp.status_code == 200
+
+    data = resp.json()
+    recon_fields = {
+        "queue_depth", "calls_this_hour", "hourly_budget",
+        "last_poll_at", "last_triage_at",
+        "total_alerts", "total_clusters", "pending_triage",
+        "orchestrator", "auto_deploy",
+    }
+    present = recon_fields & set(data.keys())
+    assert not present, f"Recon fields must not appear in /health: {present}"
+
+    conn.close()
+
+
+def test_health_unauthenticated_no_token_set(tmp_path):
+    """GET /health returns 200 even when no token is configured."""
+    _reset_orchestrator_stats()
+    client, conn = _make_client(tmp_path, token="")
+
+    resp = client.get("/health")
+    assert resp.status_code == 200
+
+    conn.close()
+
+
+def test_health_unauthenticated_token_set_no_header(tmp_path):
+    """GET /health returns 200 even when token is set and no auth header is sent."""
+    _reset_orchestrator_stats()
+    client, conn = _make_client(tmp_path, token="secret123")
+
+    resp = client.get("/health")
+    assert resp.status_code == 200, (
+        f"/health must remain unauthenticated even with token set, got {resp.status_code}"
+    )
 
     conn.close()
 
 
 # ---------------------------------------------------------------------------
-# Case 2 — orchestrator block present with correct types
+# /metrics tests — authenticated operational stats
 # ---------------------------------------------------------------------------
 
 
-def test_health_orchestrator_block_present(tmp_path):
-    """GET /health → orchestrator block has 4 keys, correct types, no nulls."""
+def test_metrics_no_token_returns_200_with_full_payload(tmp_path):
+    """GET /metrics with no token configured → 200 with full operational stats."""
     _reset_orchestrator_stats()
-    client, conn = _make_client(tmp_path)
+    client, conn = _make_client(tmp_path, token="")
 
-    resp = client.get("/health")
+    resp = client.get("/metrics")
     assert resp.status_code == 200
 
     data = resp.json()
-    assert "orchestrator" in data, "'orchestrator' key missing from /health"
+    for key in (
+        "queue_depth", "calls_this_hour", "hourly_budget",
+        "last_poll_at", "last_triage_at",
+        "total_alerts", "total_clusters", "pending_triage",
+        "orchestrator", "auto_deploy",
+    ):
+        assert key in data, f"Expected field {key!r} missing from /metrics"
+
+    conn.close()
+
+
+def test_metrics_token_set_no_auth_returns_401(tmp_path):
+    """GET /metrics with token set and no auth header → 401."""
+    _reset_orchestrator_stats()
+    client, conn = _make_client(tmp_path, token="secret123")
+
+    resp = client.get("/metrics")
+    assert resp.status_code == 401, (
+        f"Expected 401 for unauthenticated /metrics, got {resp.status_code}"
+    )
+
+    conn.close()
+
+
+def test_metrics_token_set_correct_bearer_returns_200(tmp_path):
+    """GET /metrics with correct bearer token → 200 with full stats."""
+    _reset_orchestrator_stats()
+    client, conn = _make_client(tmp_path, token="secret123")
+
+    resp = client.get("/metrics", headers={"Authorization": "Bearer secret123"})
+    assert resp.status_code == 200
+
+    data = resp.json()
+    for key in (
+        "queue_depth", "calls_this_hour", "hourly_budget",
+        "last_poll_at", "last_triage_at",
+        "total_alerts", "total_clusters", "pending_triage",
+        "orchestrator", "auto_deploy",
+    ):
+        assert key in data, f"Expected field {key!r} missing from /metrics"
+
+    conn.close()
+
+
+def test_metrics_wrong_bearer_returns_401(tmp_path):
+    """GET /metrics with wrong bearer token → 401."""
+    _reset_orchestrator_stats()
+    client, conn = _make_client(tmp_path, token="secret123")
+
+    resp = client.get("/metrics", headers={"Authorization": "Bearer wrongtoken"})
+    assert resp.status_code == 401
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# /metrics — orchestrator block correct types
+# ---------------------------------------------------------------------------
+
+
+def test_metrics_orchestrator_block_present(tmp_path):
+    """/metrics → orchestrator block has 4 keys, correct types, no nulls."""
+    _reset_orchestrator_stats()
+    client, conn = _make_client(tmp_path)
+
+    resp = client.get("/metrics")
+    assert resp.status_code == 200
+
+    data = resp.json()
+    assert "orchestrator" in data, "'orchestrator' key missing from /metrics"
 
     orch = data["orchestrator"]
     assert isinstance(orch["total_runs"], int), "total_runs must be int"
@@ -170,20 +294,20 @@ def test_health_orchestrator_block_present(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Case 3 — auto_deploy block present with correct types
+# /metrics — auto_deploy block correct types
 # ---------------------------------------------------------------------------
 
 
-def test_health_auto_deploy_block_present(tmp_path):
-    """GET /health → auto_deploy block has 4 keys, correct types."""
+def test_metrics_auto_deploy_block_present(tmp_path):
+    """/metrics → auto_deploy block has 4 keys, correct types."""
     _reset_orchestrator_stats()
     client, conn = _make_client(tmp_path)
 
-    resp = client.get("/health")
+    resp = client.get("/metrics")
     assert resp.status_code == 200
 
     data = resp.json()
-    assert "auto_deploy" in data, "'auto_deploy' key missing from /health"
+    assert "auto_deploy" in data, "'auto_deploy' key missing from /metrics"
 
     ad = data["auto_deploy"]
     assert isinstance(ad["enabled"], bool), "enabled must be bool"
@@ -195,12 +319,12 @@ def test_health_auto_deploy_block_present(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Case 4 — counts reflect data, 24h window filter works
+# /metrics — counts reflect data, 24h window filter works
 # ---------------------------------------------------------------------------
 
 
-def test_health_auto_deploy_counts_reflect_data(tmp_path):
-    """Seed deploy events and verify 24h window counts.
+def test_metrics_auto_deploy_counts_reflect_data(tmp_path):
+    """Seed deploy events and verify 24h window counts via /metrics.
 
     Seeding:
       - 1 auto-deploy outside 24h window (should NOT appear in deployed_last_24h)
@@ -251,7 +375,7 @@ def test_health_auto_deploy_counts_reflect_data(tmp_path):
             (0, "auto-deploy", "ok", "orchestrator", recent_ts, recent_ts),
         )
 
-    resp = client.get("/health")
+    resp = client.get("/metrics")
     assert resp.status_code == 200
 
     ad = resp.json()["auto_deploy"]
@@ -264,11 +388,11 @@ def test_health_auto_deploy_counts_reflect_data(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Case 5 — orchestrator counters increment after a mock loop run
+# /metrics — orchestrator counters increment after a mock loop run
 # ---------------------------------------------------------------------------
 
 
-def test_health_orchestrator_counters_increment(tmp_path):
+def test_metrics_orchestrator_counters_increment(tmp_path):
     """run_triage_loop with 2 tool calls + finalize → total_runs=1, avg reflects 2 calls."""
     _reset_orchestrator_stats()
 
@@ -318,16 +442,16 @@ def test_health_orchestrator_counters_increment(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Case 6 — zero state: fresh counters, no divide-by-zero
+# /metrics — zero state: fresh counters, no divide-by-zero
 # ---------------------------------------------------------------------------
 
 
-def test_health_zero_state_no_divide_by_zero(tmp_path):
+def test_metrics_zero_state_no_divide_by_zero(tmp_path):
     """Fresh DB + no runs → all counts 0, avg_tool_calls_per_run == 0.0."""
     _reset_orchestrator_stats()
     client, conn = _make_client(tmp_path)
 
-    resp = client.get("/health")
+    resp = client.get("/metrics")
     assert resp.status_code == 200
 
     data = resp.json()

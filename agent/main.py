@@ -183,14 +183,47 @@ def _require_auth(
 
 @app.get("/health")
 async def health() -> JSONResponse:
-    """Poller status, queue depth, last triage timestamp, orchestrator stats, auto-deploy counts.
+    """Minimal liveness probe — status and poller health only.
 
     Always returns 200 — even if the tailer is degraded — so container
     health checks don't cycle the service on transient read errors.
 
-    New fields (Phase 2, REQ-P1-P2-004):
-      orchestrator — in-memory counters from the Claude tool-use loop.
-      auto_deploy  — 24h deploy/skip/revert counts from deploy_events.
+    Minimal — by design — so unauthenticated container probes can't be used
+    for reconnaissance. See ``/metrics`` for full operational stats.
+
+    @decision DEC-HEALTH-002
+    @title Split /health (public liveness) and /metrics (authenticated stats) per CSO F5
+    @status accepted
+    @rationale Public /health was returning queue depth, alert counts, timestamps,
+               and orchestrator counters — enough for an attacker to map the
+               deployment's workload and timing. Moving stats behind auth (when
+               SHAFERHUND_TOKEN is set) limits exposure without breaking container
+               probes, which only need {status, poller_healthy} to decide liveness.
+    """
+    return JSONResponse({
+        "status": "ok",
+        "poller_healthy": _poller_healthy,
+    })
+
+
+@app.get("/metrics", dependencies=[Depends(_require_auth)])
+async def metrics() -> JSONResponse:
+    """Authenticated operational stats. Migration from /health per CSO F5.
+
+    Requires ``Authorization: Bearer <token>`` (or ``?token=<token>``) when
+    ``SHAFERHUND_TOKEN`` is set. Returns 401 if auth fails; 200 with full
+    payload otherwise. When ``SHAFERHUND_TOKEN`` is unset the endpoint is
+    open, consistent with the localhost-only binding that replaces auth in
+    that mode.
+
+    Fields:
+      queue_depth, calls_this_hour, hourly_budget — triage queue state.
+      last_poll_at, last_triage_at               — activity timestamps.
+      total_alerts, total_clusters, pending_triage — DB aggregate counts.
+      orchestrator                               — in-memory counters from
+                                                   the Claude tool-use loop.
+      auto_deploy                                — 24h deploy/skip/revert
+                                                   counts from deploy_events.
     """
     stats = get_stats(_db) if _db else {}
 
@@ -205,9 +238,6 @@ async def health() -> JSONResponse:
         deployed_24h = skipped_24h = reverted_24h = 0
 
     return JSONResponse({
-        # Phase 1 fields — unchanged
-        "status": "ok",
-        "poller_healthy": _poller_healthy,
         "queue_depth": _triage_queue.depth if _triage_queue else 0,
         "calls_this_hour": _triage_queue.calls_this_hour if _triage_queue else 0,
         "hourly_budget": _settings.triage_hourly_budget if _settings else 0,
@@ -216,9 +246,9 @@ async def health() -> JSONResponse:
         "total_alerts": stats.get("total_alerts", 0),
         "total_clusters": stats.get("total_clusters", 0),
         "pending_triage": stats.get("pending_triage", 0),
-        # Phase 2 — orchestrator in-memory stats
+        # Orchestrator in-memory stats (Phase 2, REQ-P1-P2-004)
         "orchestrator": get_orchestrator_stats(),
-        # Phase 2 — auto-deploy 24h window counts
+        # Auto-deploy 24h window counts (Phase 2, REQ-P1-P2-004)
         "auto_deploy": {
             "enabled": bool(_settings.AUTO_DEPLOY_ENABLED) if _settings else False,
             "deployed_last_24h": deployed_24h,
