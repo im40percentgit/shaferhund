@@ -116,7 +116,9 @@ shaferhund/
 
 ## Phase 2: Unified Defense Agent (Weeks 2-4)
 
-**Status:** planned
+**Status:** completed
+**Landed:** 2026-04-09 through 2026-04-14 across waves b/c/d, 11 merge commits (first: `a269990` cluster-key-refactor #6; last: `7ac1d9e` docs-and-env #14). Issues #6–#15 all closed with `phase-2` labels.
+**Verified:** no dedicated end-to-end tester trace recorded; each feature branch landed via PR-gated merge with per-branch test suite green.
 
 ### Intent
 
@@ -302,13 +304,13 @@ shaferhund/
 
 | ID | Title | Status |
 |----|-------|--------|
-| DEC-SURICATA-001 | Suricata 7 container + pcap-replay via tcpreplay | planned |
-| DEC-SIGMA-001 | Generate Sigma YAML only, validate with pysigma, defer sigmac | planned |
-| DEC-ORCH-001 | Claude tool-use loop with 6 tools, 5-call / 10s caps | planned |
-| DEC-AUTODEPLOY-001 | Policy-gated auto-deploy, conservative defaults, default OFF | planned |
-| DEC-SCHEMA-002 | Extend alerts table via idempotent ALTER TABLE, no migration framework | planned |
-| DEC-CLUSTER-002 | Cluster key becomes (source, src_ip, rule_id) | planned |
-| DEC-TEST-001 | ≥1 new unit test per new capability; Phase 1 tests pass unchanged | planned |
+| DEC-SURICATA-001 | Suricata 7 container + pcap-replay via tcpreplay | accepted |
+| DEC-SIGMA-001 | Generate Sigma YAML only, validate with pysigma, defer sigmac | accepted |
+| DEC-ORCH-001 | Claude tool-use loop with 6 tools, 5-call / 10s caps | accepted |
+| DEC-AUTODEPLOY-001 | Policy-gated auto-deploy, conservative defaults, default OFF | accepted |
+| DEC-SCHEMA-002 | Extend alerts table via idempotent ALTER TABLE, no migration framework | accepted |
+| DEC-CLUSTER-002 | Cluster key becomes (source, src_ip, rule_id) | accepted |
+| DEC-TEST-001 | ≥1 new unit test per new capability; Phase 1 tests pass unchanged | accepted |
 
 ## Phase 2.5: Sigma Deploy Path (3–4 days)
 
