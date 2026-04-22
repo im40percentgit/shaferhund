@@ -7,8 +7,9 @@ Shaferhund is a self-hosted alert triage agent for the solo security engineer pr
 ```
 1. cp .env.example .env
 2. Fill in ANTHROPIC_API_KEY (and SHAFERHUND_TOKEN if binding to non-localhost)
-3. podman compose up   (or: docker compose up)
-4. Open http://localhost:8000
+3. Set WAZUH_API_PASSWORD to a strong unique value — the placeholder must be replaced before first start.
+4. podman compose up   (or: docker compose up)
+5. Open http://localhost:8000
 ```
 
 Wazuh Manager starts first. Once its healthcheck passes, the shaferhund agent comes up alongside Suricata. The first cluster should appear on the dashboard within a few minutes of the Wazuh manager generating alerts.
