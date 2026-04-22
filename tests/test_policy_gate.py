@@ -204,6 +204,28 @@ def test_dedup_expired_entry_allows_deploy():
 
 
 # ---------------------------------------------------------------------------
+# F4 / DEC-AUTODEPLOY-002: ai_confidence=None must not raise TypeError
+# ---------------------------------------------------------------------------
+
+def test_none_confidence_returns_false_not_raise():
+    """cluster.ai_confidence=None returns (False, 'confidence not set'), not TypeError.
+
+    Pre-F4 this raised TypeError: '<' not supported between instances of
+    'NoneType' and 'float'. The explicit None guard in Check 4 fixes this.
+    """
+    settings = _make_settings(enabled=True)
+    cluster = FakeCluster(ai_confidence=None)
+
+    # Must not raise
+    decision, reason = should_auto_deploy(FakeRule(), cluster, [], settings)
+
+    assert decision is False
+    assert reason == "confidence not set", (
+        f"Expected 'confidence not set', got {reason!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Purity check: function raises no exceptions on empty/minimal inputs
 # ---------------------------------------------------------------------------
 
