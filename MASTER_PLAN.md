@@ -132,7 +132,7 @@ Phase 1 shipped a *triage agent*. Phase 2 turns it into a *unified agentic defen
 - Maintain Phase 1 test coverage and add ≥1 test per new capability (REQ-P0-P2-008, REQ-P0-P2-009)
 
 ### Non-Goals
-- REQ-NOGO-P2-001: Cloud log ingestion (AWS CloudTrail, GCP Audit) — deferred to Phase 2.5
+- REQ-NOGO-P2-001: Cloud log ingestion (AWS CloudTrail, GCP Audit) — deferred to Phase 4 (re-routed from Phase 2.5 per DEC-CLOUDLOG-001)
 - REQ-NOGO-P2-002: OpenSearch or any non-SQLite storage — deferred to Phase 2.5/3
 - REQ-NOGO-P2-003: Real-time posture scoring dashboard — deferred to Phase 3 after definition is locked
 - REQ-NOGO-P2-004: Sigma → Wazuh/EDR rule conversion via `sigmac` — deferred to Phase 3 (needs manager rule reload)
@@ -168,7 +168,7 @@ Phase 1 shipped a *triage agent*. Phase 2 turns it into a *unified agentic defen
 
 **Future Consideration (P2)**
 - REQ-P2-P2-001: Posture scoring — definition TBD, candidates: running threat-level, per-source trust score, CIS-style pass rate.
-- REQ-P2-P2-002: Cloud log source (CloudTrail, GCP Audit) — Phase 2.5.
+- REQ-P2-P2-002: Cloud log source (CloudTrail, GCP Audit) — Phase 4 (re-routed from Phase 2.5 per DEC-CLOUDLOG-001).
 - REQ-P2-P2-003: Sigma → Wazuh rule conversion via `sigmac` — Phase 3.
 - REQ-P2-P2-004: Auto-deploy for Sigma rules (requires sigmac conversion first) — Phase 3.
 
@@ -310,28 +310,26 @@ shaferhund/
 | DEC-CLUSTER-002 | Cluster key becomes (source, src_ip, rule_id) | planned |
 | DEC-TEST-001 | ≥1 new unit test per new capability; Phase 1 tests pass unchanged | planned |
 
-## Phase 2.5: Deferred Cleanup (Week 1 of "Month 2")
+## Phase 2.5: Sigma Deploy Path (3–4 days)
 
 **Status:** planned
-**Timebox:** 1 week
+**Timebox:** 3–4 days
 
 ### Intent
 
-Phase 2 shipped with explicit deferrals: Sigma rules generate but cannot auto-deploy (blocked by `DEC-AUTODEPLOY-001` pending a sigmac conversion path); cloud log sources were pushed to Phase 2.5 (`REQ-NOGO-P2-001`); rule fleet distribution was punted (`REQ-NOGO-P2-007`). Phase 2.5 closes the first two in a single focused week so Phase 3's immune-system work doesn't carry half-shipped Sigma or a Wazuh+Suricata-only data plane. Rule fleet distribution stays in Phase 4 — it's out of character with solo-dev scale and earns its own design pass.
+Phase 2 shipped Sigma rule generation wired up but auto-deploy explicitly blocked at `agent/policy.py:19` (DEC-AUTODEPLOY-001) — Sigma YAML can't become a Wazuh-native rule without sigmac conversion. Phase 2.5 closes that gap only. Cloud log ingestion (originally `REQ-NOGO-P2-001`) moves to Phase 4 where it belongs alongside multi-cloud and CSPM — ingesting CloudTrail in a homelab without a real AWS footprint would be fixture theatre (violating backlog item #5, "fixture-only testing is insufficient"), and the "source-agnostic" architecture is already proven by Wazuh + Suricata. Rule fleet distribution also stays in Phase 4.
 
 ### Goals
 - Sigma rules auto-deploy through the same policy gate as YARA, via upstream sigmac conversion (REQ-P0-P25-001, REQ-P0-P25-002)
-- One cloud log source (AWS CloudTrail *or* GCP Audit) ingests through the existing pipeline with source tagging (REQ-P0-P25-003)
-- Graceful degradation if sigmac is absent — disable Sigma auto-deploy, don't crash (REQ-P0-P25-004)
-- Zero regressions in Phase 1 or Phase 2 tests (REQ-P0-P25-005)
+- Graceful degradation if sigmac is absent — disable Sigma auto-deploy, don't crash (REQ-P0-P25-003)
+- Zero regressions in Phase 1 or Phase 2 tests (REQ-P0-P25-004)
 
 ### Non-Goals
-- REQ-NOGO-P25-001: Multi-cloud (AWS + GCP + Azure) — one provider suffices
+- REQ-NOGO-P25-001: Cloud log source ingestion — moved to Phase 4 (needs real footprint to test meaningfully)
 - REQ-NOGO-P25-002: Custom Wazuh rule templates or sigmac patching — upstream sigmac defaults only
 - REQ-NOGO-P25-003: Rule fleet distribution to remote agents — Phase 4
-- REQ-NOGO-P25-004: Real-time cloud log streaming (Kinesis, Pub/Sub) — bucket polling is sufficient
-- REQ-NOGO-P25-005: Cloud posture / IAM analysis / CSPM checks — just ingest logs, don't score them
-- REQ-NOGO-P25-006: Wazuh API reload — retain file-drop pattern from DEC-YARA-001
+- REQ-NOGO-P25-004: Wazuh API reload — retain file-drop pattern from DEC-YARA-001
+- REQ-NOGO-P25-005: Sigma rule format customisation beyond sigma-cli's Wazuh backend defaults
 
 ### Requirements
 
@@ -340,39 +338,25 @@ Phase 2 shipped with explicit deferrals: Sigma rules generate but cannot auto-de
   - Acceptance: a stored Sigma rule with `syntax_valid=1` produces a well-formed XML file under `/rules/`; `xmllint --noout` passes on the output.
 - REQ-P0-P25-002: `should_auto_deploy()` in `agent/policy.py` accepts `rule_type ∈ {'yara', 'sigma'}` and additionally requires `settings.sigmac_available=True` before allowing Sigma deploys. `_run_auto_deploy` in `agent/orchestrator.py` routes Sigma rules through `agent/sigmac.py` before file drop.
   - Acceptance: a Critical Sigma rule with `ai_confidence≥0.85` auto-deploys (XML file + `deploy_events` row with `rule_type='sigma'`); a conf=0.6 Sigma rule stays pending.
-- REQ-P0-P25-003: `agent/sources/cloudtrail.py` (or `gcp_audit.py`) — periodic poller reads from the configured S3/GCS bucket, normalises events to the shared schema, enqueues alerts with `source='cloudtrail'` (or `'gcp_audit'`).
-  - Acceptance: a known-suspicious event (e.g. `ConsoleLogin` without MFA from a new geography) produces a row in `alerts` with correct source tagging and triages normally.
-- REQ-P0-P25-004: Startup probes `sigma-cli --version`; if missing, log one WARNING line and set `settings.sigmac_available=False`. Sigma rules continue to generate and persist, but `should_auto_deploy()` returns False for them.
+- REQ-P0-P25-003: Startup probes `sigma-cli --version`; if missing, log one WARNING line and set `settings.sigmac_available=False`. Sigma rules continue to generate and persist, but `should_auto_deploy()` returns False for them.
   - Acceptance: container booted without sigma-cli installed starts cleanly and serves `/health`; Sigma rules are stored with `syntax_valid=1`, `deployed=0`.
-- REQ-P0-P25-005: All Phase 1 and Phase 2 tests pass unchanged.
+- REQ-P0-P25-004: All Phase 1 and Phase 2 tests pass unchanged.
 
 **Nice-to-Have (P1)**
-- REQ-P1-P25-001: Cloud log poller respects the existing hourly Claude budget (shared queue), so a flood of CloudTrail events cannot evict Wazuh/Suricata triage.
-- REQ-P1-P25-002: Dashboard source filter chip extended with `cloudtrail` (or `gcp_audit`) alongside `wazuh`/`suricata`.
-- REQ-P1-P25-003: `/health` exposes `cloudlog.last_poll_at`, `cloudlog.events_ingested_total`, `sigmac.available` (bool).
+- REQ-P1-P25-001: `/health` exposes `sigmac.available` (bool) and `sigmac.version` (string, nullable).
+- REQ-P1-P25-002: Dashboard cluster-detail view shows converted XML preview alongside raw Sigma YAML for rules that deployed.
 
 **Future Consideration (P2)**
 - REQ-P2-P25-001: Rule fleet distribution — Phase 4.
-- REQ-P2-P25-002: Multi-cloud source coverage — Phase 4.
-- REQ-P2-P25-003: Cloud posture scoring (separate from log ingestion) — Phase 4+.
+- REQ-P2-P25-002: Cloud log source ingestion (first provider) + multi-cloud coverage — Phase 4.
 
 ### Architecture Delta vs Phase 2
 
 ```
-[Cloud Log Bucket: S3/GCS]
-    |
-    └── agent/sources/cloudtrail.py poller (60s interval)
-              |
-              v
-        [Alert(source='cloudtrail')]
-              |
-              v
-        [existing Clusterer]  (no change)
-
 [Orchestrator finalize_triage]
          |
          v
-    [Policy Gate]  (accepts rule_type='sigma' when sigmac_available)
+    [Policy Gate]  (now accepts rule_type='sigma' when sigmac_available)
          |
          +--- rule_type='yara' ---> [/rules/{id}.yar]              (Phase 2 path, unchanged)
          |
@@ -387,46 +371,37 @@ Phase 2 shipped with explicit deferrals: Sigma rules generate but cannot auto-de
 
 ### Stack Delta
 - **New CLI:** `sigma-cli` installed via `pip install sigma-cli pysigma-backend-wazuh`
-- **New lib:** `boto3` (AWS) or `google-cloud-storage` (GCP) for cloud log polling
-- **New env vars:** `SIGMAC_PATH` (default `sigma`), `CLOUD_LOG_SOURCE` (aws|gcp|none), `CLOUD_LOG_BUCKET`, `CLOUD_LOG_POLL_INTERVAL_SECONDS` (default 60), `AWS_REGION` / `GCP_PROJECT_ID` as applicable
+- **New env vars:** `SIGMAC_PATH` (default `sigma`)
 
 ### Eng Review Decisions
 1. sigmac invocation: subprocess (`sigma convert`), not the Python API — sigma-cli's import surface is unstable across minor versions.
-2. One cloud provider in 2.5 (user picks AWS or GCP at plan-approval time); multi-cloud is Phase 4.
-3. Sigma auto-deploy reuses the existing policy gate with an allowlist change plus an availability check; no parallel gate.
-4. Graceful degradation if sigmac is missing — log a warning, keep Sigma rules as pending. No hard dependency.
-5. Cloud log poller is a new tailer loop, duplicating the pattern. `SourceBase` abstraction still deferred (Phase 2's ≤3 sources threshold holds through 2.5).
-6. Wazuh manager reload: retain file-drop pattern from DEC-YARA-001; rely on existing rule-directory monitoring. Document any manual restart requirement in README.
+2. Sigma auto-deploy reuses the existing policy gate with an allowlist change plus an availability check; no parallel gate.
+3. Graceful degradation if sigmac is missing — log a warning, keep Sigma rules as pending. No hard dependency.
+4. Wazuh manager reload: retain file-drop pattern from DEC-YARA-001; rely on existing rule-directory monitoring. Document any manual restart requirement in README.
+5. Cloud log source explicitly moved to Phase 4 — homelab lacks a real cloud footprint to test against, so an interim implementation would be fixture-only and violate the "fixture-only testing is insufficient" rule.
 
 ### Files to Create / Update
 ```
 shaferhund/
-  Dockerfile                          # (UPDATE) install sigma-cli + cloud SDK
-  compose.yaml                        # (UPDATE) wire cloud creds (env or secret)
-  requirements.txt                    # (UPDATE) add sigma-cli, pysigma-backend-wazuh, boto3 OR google-cloud-storage
-  .env.example                        # (UPDATE) document Phase 2.5 env vars
+  Dockerfile                          # (UPDATE) install sigma-cli
+  requirements.txt                    # (UPDATE) add sigma-cli, pysigma-backend-wazuh
+  .env.example                        # (UPDATE) document SIGMAC_PATH
   agent/
     policy.py                         # (UPDATE) rule_type allowlist + sigmac_available gate
     orchestrator.py                   # (UPDATE) route Sigma rules through sigmac in _run_auto_deploy
     sigmac.py                         # (NEW) subprocess wrapper + availability probe
-    config.py                         # (UPDATE) pydantic fields for Phase 2.5 env vars
-    sources/
-      cloudtrail.py                   # (NEW, if AWS) S3 poller + parser
-      gcp_audit.py                    # (NEW, if GCP) GCS poller + parser
-    main.py                           # (UPDATE) start cloud poller Task; /health additions (P1)
+    config.py                         # (UPDATE) sigmac_path field + sigmac_available runtime flag
+    main.py                           # (UPDATE) /health additions (P1)
   tests/
     test_sigmac.py                    # (NEW) mock subprocess, validate XML output shape
     test_policy_gate_sigma.py         # (NEW) Sigma across conf/severity/sigmac-available matrix
-    test_cloudtrail_parser.py         # (NEW) S3 event → Alert normalisation
     fixtures/
       sigma_wazuh_expected.xml        # (NEW) golden XML for a known-good Sigma input
-      cloudtrail_sample.json          # (NEW) known-suspicious CloudTrail event
 ```
 
 ### Success Criteria
 - `podman compose up` brings up Wazuh + Suricata + Shaferhund; container reports `sigmac.available=true` on `/health`
 - A simulated high-confidence Critical Sigma rule lands in `/rules/sigma_<id>.xml` with a matching `deploy_events` row
-- A CloudTrail (or GCP audit) sample ingested from the bucket clusters and triages normally with `source='cloudtrail'`
 - Container started without sigma-cli installed serves `/health` cleanly, logs WARNING, and stores Sigma rules as pending
 - Phase 1 and Phase 2 tests pass unchanged; new Phase 2.5 tests pass
 
@@ -436,9 +411,8 @@ shaferhund/
 |----|-------|--------|
 | DEC-SIGMA-002 | sigmac invoked via subprocess (sigma-cli), not Python API | planned |
 | DEC-AUTODEPLOY-002 | Sigma auto-deploy via extended policy gate + sigmac_available check | planned |
-| DEC-CLOUDLOG-001 | Single cloud provider in 2.5; multi-cloud is Phase 4 | planned |
-| DEC-CLOUDLOG-002 | Bucket polling (60s default); real-time streaming deferred | planned |
 | DEC-SIGMA-003 | Graceful degradation when sigmac missing — warn and disable, don't crash | planned |
+| DEC-CLOUDLOG-001 | Cloud log source ingestion deferred to Phase 4 — needs real footprint to test, not fixtures | planned |
 
 ## Phase 3: Immune System (2–3 weeks after Phase 2.5)
 
@@ -447,7 +421,7 @@ shaferhund/
 
 ### Intent
 
-Phase 2 gave the agent eyes (unified Wazuh + Suricata ingestion), a brain (Claude tool-use orchestrator), and hands (policy-gated auto-deploy). Phase 2.5 tidied the hands (Sigma auto-deploys too, one cloud source ingests). **Phase 3 gives it an immune system.** The agent attacks its own infrastructure on a schedule via Atomic Red Team, measures whether its deployed rules detect those attacks, and uses the resulting pass rate as a **single posture score**. An auto-spawnable canary network (DNS and HTTP tokens) traps opportunistic probing and feeds the same pipeline. A light-touch threat-intel feed (Abuse.ch URLhaus) adds indicator context to the orchestrator's reasoning. The platform becomes self-evaluating — when the posture score drops, the agent knows before the operator does.
+Phase 2 gave the agent eyes (unified Wazuh + Suricata ingestion), a brain (Claude tool-use orchestrator), and hands (policy-gated auto-deploy). Phase 2.5 finished the hands — Sigma rules auto-deploy too, via sigmac conversion. **Phase 3 gives it an immune system.** The agent attacks its own infrastructure on a schedule via Atomic Red Team, measures whether its deployed rules detect those attacks, and uses the resulting pass rate as a **single posture score**. An auto-spawnable canary network (DNS and HTTP tokens) traps opportunistic probing and feeds the same pipeline. A light-touch threat-intel feed (Abuse.ch URLhaus) adds indicator context to the orchestrator's reasoning. The platform becomes self-evaluating — when the posture score drops, the agent knows before the operator does.
 
 This is deliberately **not** an agent-driven red team (Claude deciding when to attack) — that is Phase 4. Phase 3 is a scheduled, deterministic, measurable loop.
 
@@ -618,4 +592,4 @@ shaferhund/
 
 ## TODOs
 - [ ] Convert `hund` to `ROADMAP.md` (map 25 domains to phases)
-- [ ] Phase 4 scoping: agent-driven red team, containerised honeypots, threat-intel federation, rule fleet distribution, multi-cloud source coverage, dynamic orchestrator tool registration, posture SLO with paging
+- [ ] Phase 4 scoping: agent-driven red team, containerised honeypots, threat-intel federation, rule fleet distribution, cloud log source ingestion (first provider) + multi-cloud coverage, dynamic orchestrator tool registration, posture SLO with paging
