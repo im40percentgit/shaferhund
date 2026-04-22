@@ -13,7 +13,7 @@ Background task lifecycle:
 
 Auth:
   - If SHAFERHUND_TOKEN is set, every non-health request requires
-    Authorization: Bearer <token> or the ?token=<token> query param.
+    Authorization: Bearer <token>.
   - If SHAFERHUND_TOKEN is unset, the server binds to 127.0.0.1 only
     (set via the uvicorn --host flag in __main__ / compose entrypoint).
 
@@ -23,6 +23,18 @@ Auth:
 @rationale Simple token is sufficient for a single-user local deployment.
            Unset token = localhost-only is safer than unset token = open.
            No session management needed at this scale.
+
+@decision DEC-AUTH-002
+@title Query-param token fallback removed
+@status accepted
+@rationale The former ?token=<token> query-param fallback was removed 2026-04-22
+           after CSO Finding 2. Query-string tokens leak into: uvicorn access
+           logs, reverse-proxy logs, browser history, browser URL bar, and the
+           Referer header on outbound navigation. Bearer-only keeps the secret
+           in the Authorization header, which is not logged by default and is
+           not sent as a Referer. If a shareable-link workflow is ever needed,
+           implement a one-time /login?token=... handler that sets a signed
+           cookie and immediately redirects, stripping the query string.
 
 @decision DEC-TAILER-001
 @title Dual independent tailer tasks feeding a single shared AlertClusterer
@@ -155,10 +167,14 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def _require_auth(
-    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
 ) -> None:
-    """FastAPI dependency: enforce token auth when SHAFERHUND_TOKEN is set."""
+    """FastAPI dependency: enforce bearer token auth when SHAFERHUND_TOKEN is set.
+
+    Accepts only the Authorization: Bearer <token> header.
+    The former ?token=<query-param> fallback was removed (DEC-AUTH-002) because
+    query-string tokens leak into access logs, browser history, and Referer headers.
+    """
     token = _settings.shaferhund_token if _settings else ""
     if not token:
         return  # No token configured — localhost-only binding is the guard
@@ -166,8 +182,6 @@ def _require_auth(
     provided = None
     if credentials and credentials.scheme.lower() == "bearer":
         provided = credentials.credentials
-    if not provided:
-        provided = request.query_params.get("token")
 
     if provided != token:
         raise HTTPException(
