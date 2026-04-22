@@ -12,13 +12,17 @@ Test cases:
      file but returns 409 (no un-reverted event to stamp). Documented choice:
      409 signals "file was present and deleted but no audit row to update" so
      callers know the state is partially inconsistent and can investigate.
+  5. Query-param token rejected — ?token=<correct> with no Authorization header
+     → 401 (DEC-AUTH-002: query-param fallback removed to prevent token leakage
+     via logs, browser history, and Referer headers).
 
 @decision DEC-UNDO-002
-@title test_deploy_undo covers happy path, auth, missing-file, already-reverted
+@title test_deploy_undo covers happy path, auth, missing-file, already-reverted, query-param-rejected
 @status accepted
 @rationale Real DB (in-memory), real file I/O via tmp_path, no internal mocks.
            External boundary (auth dependency) exercised via HTTP headers.
-           Four cases cover the four observable states of the undo endpoint.
+           Five cases cover the four observable states of the undo endpoint plus
+           regression coverage for the removed ?token= query-param fallback.
 """
 
 from pathlib import Path
@@ -282,6 +286,52 @@ def test_undo_deploy_already_reverted(tmp_path):
     assert resp.status_code == 409, f"Expected 409, got {resp.status_code}: {resp.text}"
     # File should be gone (we delete before checking the audit row)
     assert not rule_file.exists(), "File should still be deleted in the 409 path"
+
+    main_module._db = orig_db
+    main_module._settings = orig_settings
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Case 5: Query-param token rejected — ?token=<correct> → 401 (DEC-AUTH-002)
+# ---------------------------------------------------------------------------
+
+
+def test_query_param_token_rejected(tmp_path):
+    """?token=<correct-token> with no Authorization header must return 401.
+
+    The former query-param fallback was removed (DEC-AUTH-002) to prevent token
+    leakage via uvicorn access logs, browser history, and Referer headers.
+    Only Authorization: Bearer <token> is accepted.
+    """
+    db_path = str(tmp_path / "test.db")
+    rules_dir = tmp_path / "rules"
+    rules_dir.mkdir()
+    token = "secret-token"
+    rule_id = "rule-qp-reject-001"
+
+    client, conn, _settings, (orig_db, orig_settings, main_module) = _make_app(
+        db_path, str(rules_dir), token=token
+    )
+
+    _seed_cluster(conn)
+    _seed_rule(conn, rule_id)
+    _seed_deploy_event(conn, rule_id)
+
+    rule_file = rules_dir / f"{rule_id}.yar"
+    rule_file.write_text("content")
+
+    # Correct token supplied only as a query param — must be rejected
+    resp = client.post(
+        f"/rules/{rule_id}/undo-deploy",
+        params={"token": token},
+    )
+
+    assert resp.status_code == 401, (
+        f"Expected 401 when token is in query param only, got {resp.status_code}: {resp.text}"
+    )
+    # No state change — file must still exist
+    assert rule_file.exists(), "Rule file must not be deleted when auth via query-param is rejected"
 
     main_module._db = orig_db
     main_module._settings = orig_settings
