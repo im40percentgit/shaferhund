@@ -310,13 +310,312 @@ shaferhund/
 | DEC-CLUSTER-002 | Cluster key becomes (source, src_ip, rule_id) | planned |
 | DEC-TEST-001 | ≥1 new unit test per new capability; Phase 1 tests pass unchanged | planned |
 
-## Phase 3: Immune System (Month 2+)
+## Phase 2.5: Deferred Cleanup (Week 1 of "Month 2")
 
 **Status:** planned
-- Atomic Red Team integration for continuous self-testing
-- Offensive-defensive loop
-- Auto-generated honeypots and canary tokens
-- Threat intel mesh (requires separate design)
+**Timebox:** 1 week
+
+### Intent
+
+Phase 2 shipped with explicit deferrals: Sigma rules generate but cannot auto-deploy (blocked by `DEC-AUTODEPLOY-001` pending a sigmac conversion path); cloud log sources were pushed to Phase 2.5 (`REQ-NOGO-P2-001`); rule fleet distribution was punted (`REQ-NOGO-P2-007`). Phase 2.5 closes the first two in a single focused week so Phase 3's immune-system work doesn't carry half-shipped Sigma or a Wazuh+Suricata-only data plane. Rule fleet distribution stays in Phase 4 — it's out of character with solo-dev scale and earns its own design pass.
+
+### Goals
+- Sigma rules auto-deploy through the same policy gate as YARA, via upstream sigmac conversion (REQ-P0-P25-001, REQ-P0-P25-002)
+- One cloud log source (AWS CloudTrail *or* GCP Audit) ingests through the existing pipeline with source tagging (REQ-P0-P25-003)
+- Graceful degradation if sigmac is absent — disable Sigma auto-deploy, don't crash (REQ-P0-P25-004)
+- Zero regressions in Phase 1 or Phase 2 tests (REQ-P0-P25-005)
+
+### Non-Goals
+- REQ-NOGO-P25-001: Multi-cloud (AWS + GCP + Azure) — one provider suffices
+- REQ-NOGO-P25-002: Custom Wazuh rule templates or sigmac patching — upstream sigmac defaults only
+- REQ-NOGO-P25-003: Rule fleet distribution to remote agents — Phase 4
+- REQ-NOGO-P25-004: Real-time cloud log streaming (Kinesis, Pub/Sub) — bucket polling is sufficient
+- REQ-NOGO-P25-005: Cloud posture / IAM analysis / CSPM checks — just ingest logs, don't score them
+- REQ-NOGO-P25-006: Wazuh API reload — retain file-drop pattern from DEC-YARA-001
+
+### Requirements
+
+**Must-Have (P0)**
+- REQ-P0-P25-001: `sigma-cli` (upstream `pysigma` + `pysigma-backend-wazuh`) installed in the container image; `agent/sigmac.py` wraps `sigma convert` as a subprocess call producing Wazuh XML at `/rules/sigma_{rule_id}.xml`.
+  - Acceptance: a stored Sigma rule with `syntax_valid=1` produces a well-formed XML file under `/rules/`; `xmllint --noout` passes on the output.
+- REQ-P0-P25-002: `should_auto_deploy()` in `agent/policy.py` accepts `rule_type ∈ {'yara', 'sigma'}` and additionally requires `settings.sigmac_available=True` before allowing Sigma deploys. `_run_auto_deploy` in `agent/orchestrator.py` routes Sigma rules through `agent/sigmac.py` before file drop.
+  - Acceptance: a Critical Sigma rule with `ai_confidence≥0.85` auto-deploys (XML file + `deploy_events` row with `rule_type='sigma'`); a conf=0.6 Sigma rule stays pending.
+- REQ-P0-P25-003: `agent/sources/cloudtrail.py` (or `gcp_audit.py`) — periodic poller reads from the configured S3/GCS bucket, normalises events to the shared schema, enqueues alerts with `source='cloudtrail'` (or `'gcp_audit'`).
+  - Acceptance: a known-suspicious event (e.g. `ConsoleLogin` without MFA from a new geography) produces a row in `alerts` with correct source tagging and triages normally.
+- REQ-P0-P25-004: Startup probes `sigma-cli --version`; if missing, log one WARNING line and set `settings.sigmac_available=False`. Sigma rules continue to generate and persist, but `should_auto_deploy()` returns False for them.
+  - Acceptance: container booted without sigma-cli installed starts cleanly and serves `/health`; Sigma rules are stored with `syntax_valid=1`, `deployed=0`.
+- REQ-P0-P25-005: All Phase 1 and Phase 2 tests pass unchanged.
+
+**Nice-to-Have (P1)**
+- REQ-P1-P25-001: Cloud log poller respects the existing hourly Claude budget (shared queue), so a flood of CloudTrail events cannot evict Wazuh/Suricata triage.
+- REQ-P1-P25-002: Dashboard source filter chip extended with `cloudtrail` (or `gcp_audit`) alongside `wazuh`/`suricata`.
+- REQ-P1-P25-003: `/health` exposes `cloudlog.last_poll_at`, `cloudlog.events_ingested_total`, `sigmac.available` (bool).
+
+**Future Consideration (P2)**
+- REQ-P2-P25-001: Rule fleet distribution — Phase 4.
+- REQ-P2-P25-002: Multi-cloud source coverage — Phase 4.
+- REQ-P2-P25-003: Cloud posture scoring (separate from log ingestion) — Phase 4+.
+
+### Architecture Delta vs Phase 2
+
+```
+[Cloud Log Bucket: S3/GCS]
+    |
+    └── agent/sources/cloudtrail.py poller (60s interval)
+              |
+              v
+        [Alert(source='cloudtrail')]
+              |
+              v
+        [existing Clusterer]  (no change)
+
+[Orchestrator finalize_triage]
+         |
+         v
+    [Policy Gate]  (accepts rule_type='sigma' when sigmac_available)
+         |
+         +--- rule_type='yara' ---> [/rules/{id}.yar]              (Phase 2 path, unchanged)
+         |
+         +--- rule_type='sigma' --> [agent/sigmac.py convert]
+                                          |
+                                          v
+                                  [/rules/sigma_{id}.xml]
+                                          |
+                                          v
+                                  [deploy_events audit row with rule_type='sigma']
+```
+
+### Stack Delta
+- **New CLI:** `sigma-cli` installed via `pip install sigma-cli pysigma-backend-wazuh`
+- **New lib:** `boto3` (AWS) or `google-cloud-storage` (GCP) for cloud log polling
+- **New env vars:** `SIGMAC_PATH` (default `sigma`), `CLOUD_LOG_SOURCE` (aws|gcp|none), `CLOUD_LOG_BUCKET`, `CLOUD_LOG_POLL_INTERVAL_SECONDS` (default 60), `AWS_REGION` / `GCP_PROJECT_ID` as applicable
+
+### Eng Review Decisions
+1. sigmac invocation: subprocess (`sigma convert`), not the Python API — sigma-cli's import surface is unstable across minor versions.
+2. One cloud provider in 2.5 (user picks AWS or GCP at plan-approval time); multi-cloud is Phase 4.
+3. Sigma auto-deploy reuses the existing policy gate with an allowlist change plus an availability check; no parallel gate.
+4. Graceful degradation if sigmac is missing — log a warning, keep Sigma rules as pending. No hard dependency.
+5. Cloud log poller is a new tailer loop, duplicating the pattern. `SourceBase` abstraction still deferred (Phase 2's ≤3 sources threshold holds through 2.5).
+6. Wazuh manager reload: retain file-drop pattern from DEC-YARA-001; rely on existing rule-directory monitoring. Document any manual restart requirement in README.
+
+### Files to Create / Update
+```
+shaferhund/
+  Dockerfile                          # (UPDATE) install sigma-cli + cloud SDK
+  compose.yaml                        # (UPDATE) wire cloud creds (env or secret)
+  requirements.txt                    # (UPDATE) add sigma-cli, pysigma-backend-wazuh, boto3 OR google-cloud-storage
+  .env.example                        # (UPDATE) document Phase 2.5 env vars
+  agent/
+    policy.py                         # (UPDATE) rule_type allowlist + sigmac_available gate
+    orchestrator.py                   # (UPDATE) route Sigma rules through sigmac in _run_auto_deploy
+    sigmac.py                         # (NEW) subprocess wrapper + availability probe
+    config.py                         # (UPDATE) pydantic fields for Phase 2.5 env vars
+    sources/
+      cloudtrail.py                   # (NEW, if AWS) S3 poller + parser
+      gcp_audit.py                    # (NEW, if GCP) GCS poller + parser
+    main.py                           # (UPDATE) start cloud poller Task; /health additions (P1)
+  tests/
+    test_sigmac.py                    # (NEW) mock subprocess, validate XML output shape
+    test_policy_gate_sigma.py         # (NEW) Sigma across conf/severity/sigmac-available matrix
+    test_cloudtrail_parser.py         # (NEW) S3 event → Alert normalisation
+    fixtures/
+      sigma_wazuh_expected.xml        # (NEW) golden XML for a known-good Sigma input
+      cloudtrail_sample.json          # (NEW) known-suspicious CloudTrail event
+```
+
+### Success Criteria
+- `podman compose up` brings up Wazuh + Suricata + Shaferhund; container reports `sigmac.available=true` on `/health`
+- A simulated high-confidence Critical Sigma rule lands in `/rules/sigma_<id>.xml` with a matching `deploy_events` row
+- A CloudTrail (or GCP audit) sample ingested from the bucket clusters and triages normally with `source='cloudtrail'`
+- Container started without sigma-cli installed serves `/health` cleanly, logs WARNING, and stores Sigma rules as pending
+- Phase 1 and Phase 2 tests pass unchanged; new Phase 2.5 tests pass
+
+### Decision Log
+
+| ID | Title | Status |
+|----|-------|--------|
+| DEC-SIGMA-002 | sigmac invoked via subprocess (sigma-cli), not Python API | planned |
+| DEC-AUTODEPLOY-002 | Sigma auto-deploy via extended policy gate + sigmac_available check | planned |
+| DEC-CLOUDLOG-001 | Single cloud provider in 2.5; multi-cloud is Phase 4 | planned |
+| DEC-CLOUDLOG-002 | Bucket polling (60s default); real-time streaming deferred | planned |
+| DEC-SIGMA-003 | Graceful degradation when sigmac missing — warn and disable, don't crash | planned |
+
+## Phase 3: Immune System (2–3 weeks after Phase 2.5)
+
+**Status:** planned
+**Timebox:** 2–3 weeks
+
+### Intent
+
+Phase 2 gave the agent eyes (unified Wazuh + Suricata ingestion), a brain (Claude tool-use orchestrator), and hands (policy-gated auto-deploy). Phase 2.5 tidied the hands (Sigma auto-deploys too, one cloud source ingests). **Phase 3 gives it an immune system.** The agent attacks its own infrastructure on a schedule via Atomic Red Team, measures whether its deployed rules detect those attacks, and uses the resulting pass rate as a **single posture score**. An auto-spawnable canary network (DNS and HTTP tokens) traps opportunistic probing and feeds the same pipeline. A light-touch threat-intel feed (Abuse.ch URLhaus) adds indicator context to the orchestrator's reasoning. The platform becomes self-evaluating — when the posture score drops, the agent knows before the operator does.
+
+This is deliberately **not** an agent-driven red team (Claude deciding when to attack) — that is Phase 4. Phase 3 is a scheduled, deterministic, measurable loop.
+
+### Goals
+- Atomic Red Team harness runs scheduled technique tests against a dedicated target container (REQ-P0-P3-001)
+- ART-generated events propagate through the existing Wazuh pipeline unchanged (REQ-P0-P3-002)
+- `posture_runs` table and `/posture` dashboard expose a single score: (ART tests that produced a triaged cluster with a deployed rule) / (total ART tests in the run) (REQ-P0-P3-003)
+- Canary tokens (DNS + HTTP) spawn on demand; triggers land in the alerts pipeline with `source='canary'` (REQ-P0-P3-004)
+- URLhaus indicators (URL + payload MD5) ingested hourly; orchestrator has a `check_threat_intel` tool (REQ-P0-P3-005)
+- `/health` surfaces posture score + canary trigger count + threat-intel record count (REQ-P0-P3-006)
+- All Phase 1, Phase 2, Phase 2.5 tests pass unchanged (REQ-P0-P3-007)
+
+### Non-Goals
+- REQ-NOGO-P3-001: Agent-driven red team (Claude decides when/what to attack) — Phase 4
+- REQ-NOGO-P3-002: Full MITRE ATT&CK matrix coverage dashboard — only techniques actually executed by the declared ART test list
+- REQ-NOGO-P3-003: Containerised service honeypots (SSH, MySQL, etc.) — DNS/HTTP canary tokens only
+- REQ-NOGO-P3-004: STIX/TAXII threat-intel federation — URLhaus only
+- REQ-NOGO-P3-005: Adversarial rule-effectiveness scoring (evasion variants, mutation) — Phase 4
+- REQ-NOGO-P3-006: Alerting / paging when posture drops — log only in Phase 3
+- REQ-NOGO-P3-007: Multi-tenant posture (per-team scores) — solo-dev still
+- REQ-NOGO-P3-008: Dynamic orchestrator tool registration (refactor of `DEC-ORCH-003`) — Phase 4; Phase 3 patches `TOOLS` directly
+
+### Requirements
+
+**Must-Have (P0)**
+- REQ-P0-P3-001: `redteam-runner` container executes a declarative list of ART tests (`atomic_tests.yaml`) on a schedule (cron inside the container or external orchestration). Each run writes a `posture_runs` row: `(id, started_at, finished_at, technique_ids JSON, total_tests, status)`. Endpoint `POST /posture/run` triggers an ad-hoc run.
+  - Acceptance: hitting `POST /posture/run` spawns a run, emits visible Wazuh alert activity within 60s for at least one T1059 (PowerShell) test, and appends a row to `posture_runs` with `status='complete'`.
+- REQ-P0-P3-002: ART tests execute inside a dedicated `redteam-target` container (minimal Ubuntu + Wazuh agent). Events flow through the existing Wazuh tailer — no new tailer code, no special parsing.
+  - Acceptance: a T1059 PowerShell ART test produces at least one Wazuh alert matching a known rule_id; the alert is indistinguishable at the clusterer boundary from a production alert of the same technique.
+- REQ-P0-P3-003: `posture_runs` joined with `clusters` and `rules` to compute per-run pass rate. A "pass" = test timestamp falls inside a cluster window AND cluster is linked to a rule with `deployed=1`. Overall score per run = `passes / total_tests`.
+  - Acceptance: synthetic scenario (ART test fires → cluster triaged → rule deploys) yields pass > 0; ART test fires with no matching cluster → pass 0; ART test fires with matching cluster but no deployed rule → pass 0.
+- REQ-P0-P3-004: `POST /canary/spawn` accepts `{type: 'dns'|'http', name}` and returns a trap URL or hostname. A lightweight receiver route (`GET /canary/hit/{token}`) and a DNS catch-all (via existing Wazuh DNS monitoring or a tiny dnslib responder in `redteam-target`) record hits as alerts with `source='canary'`.
+  - Acceptance: spawn an HTTP canary, curl the trap URL, observe a `canary`-source row in `alerts` within 30s that triages through the normal pipeline.
+- REQ-P0-P3-005: `threat_intel` table holds `(id, indicator, indicator_type, first_seen, last_seen, source, context_json)`. Hourly poller fetches URLhaus (online URLs + payload MD5s). New orchestrator tool `check_threat_intel(value)` returns `{matches: [...], context: ...}`.
+  - Acceptance: a mocked URLhaus fixture yields ≥1 row in `threat_intel`; an orchestrator test drives a tool-use loop that includes `check_threat_intel` in its transcript and uses the response in the final verdict.
+- REQ-P0-P3-006: `/health` JSON adds `posture.last_score` (float 0–1, null if no runs), `posture.last_run_at`, `canary.trigger_count_24h`, `threat_intel.record_count`.
+  - Acceptance: hit `/health` after a completed posture run; `last_score` matches DB calculation; before any runs, `last_score` is null.
+- REQ-P0-P3-007: All prior phases' tests pass unchanged; ≥1 new test per P0 capability.
+
+**Nice-to-Have (P1)**
+- REQ-P1-P3-001: `/posture` HTML dashboard — current score, 30-day sparkline, per-technique pass rate, failed-test drill-down.
+- REQ-P1-P3-002: `/canary` dashboard page — active tokens, trigger counts, last-triggered timestamp, revoke action.
+- REQ-P1-P3-003: Per-source pass-rate breakdown on posture dashboard (ART vs canary) so operators can see which half of the immune system is weaker.
+- REQ-P1-P3-004: Orchestrator prefers Sigma output for process-execution ART techniques (T1059, T1053, etc.) since YARA isn't well-suited there — leverages Phase 2.5 Sigma auto-deploy path.
+- REQ-P1-P3-005: Source filter chip on `/` extended with `canary`.
+
+**Future Consideration (P2)**
+- REQ-P2-P3-001: Agent-driven red team — Phase 4
+- REQ-P2-P3-002: Containerised service honeypots — Phase 4
+- REQ-P2-P3-003: Threat-intel federation (multiple feeds, STIX/TAXII) — Phase 4
+- REQ-P2-P3-004: Posture SLO with paging — Phase 4
+- REQ-P2-P3-005: Dynamic orchestrator tool registration — Phase 4 refactor
+
+### Architecture
+
+```
+[redteam-runner container]     [Canary Receiver]         [URLhaus Poller]
+(scheduled ART + on-demand)    (/canary/hit, DNS)        (hourly cron Task)
+       |                              |                         |
+       v                              v                         v
+[redteam-target container]     [alerts: source='canary']  [threat_intel table]
+(ART techniques execute here)         |                         ^
+       |                              |                         |
+       v                              v                         |
+ [Wazuh + Suricata                    |                         |
+  existing tailers]                   |                         |
+       |                              |                         |
+       v                              v                         |
+[alerts: source='wazuh'/'suricata'/'canary']                    |
+       |                              |                         |
+       +--------+---------+-------[Clusterer] (unchanged)       |
+                          |                                     |
+                          v                                     |
+                   [Triage Queue] (unchanged)                   |
+                          |                                     |
+                          v                                     |
+              [Orchestrator Tool Loop]                          |
+                existing 6 tools +                              |
+                + check_threat_intel  ------------------------->+
+                (patched into TOOLS list per DEC-ORCH-003)
+                          |
+                          v
+              [Policy Gate] (YARA + Sigma via Phase 2.5)
+                          |
+                          v
+              [/rules/ + deploy_events]
+                          |
+                          v
+              [posture_runs join]
+                ART test cross-check → pass/fail
+                          |
+                          v
+              [/posture, /health]
+```
+
+### Stack
+- Existing Phase 1/2/2.5 stack
+- **New container:** `redteam-runner` — Atomic Red Team test invoker (upstream `redcanary/atomic-red-team` via `Invoke-AtomicTest` pwsh, OR a Python shim that clones the ART repo and runs technique scripts directly)
+- **New container:** `redteam-target` — minimal Ubuntu + Wazuh agent, mounted into Wazuh manager's monitoring scope
+- **New lib (optional):** `dnslib` for DNS canary responder if a standalone responder is needed; otherwise piggyback Wazuh DNS monitoring
+- **New env vars:** `POSTURE_RUN_SCHEDULE` (cron expr), `URLHAUS_FEED_URL`, `URLHAUS_FETCH_INTERVAL_SECONDS` (default 3600), `CANARY_BASE_URL` (public hostname/port for HTTP traps), `ART_TESTS_FILE` (default `atomic_tests.yaml`), `RED_TEAM_TARGET_CONTAINER` (default `redteam-target`)
+
+### Eng Review Decisions
+1. ART harness runs external to the orchestrator (scheduled, not Claude-driven). Agent-driven red team is Phase 4. Keeps Phase 3 tight and deterministic.
+2. Posture score = (ART tests with matching triaged cluster + deployed rule) / (total ART tests in the run). Simple, honest, matches the "immune system" intent and gives a single north-star number.
+3. Canary tokens: DNS + HTTP only. Service honeypots (SSH/MySQL) are Phase 4 — they double attack surface and need separate isolation analysis.
+4. Threat intel: URLhaus only (URL feed + payload MD5 feed). STIX/TAXII deferred. Matches the 2–3 week timebox.
+5. `check_threat_intel` becomes the 7th orchestrator tool — added by direct patch to `TOOLS` + `_TOOL_DISPATCH` (per DEC-ORCH-003). No dynamic-registration refactor in this phase.
+6. ART test list is declarative in `atomic_tests.yaml` — no auto-discovery of the full ART technique catalogue. Explicit beats clever.
+7. ART events flow through the existing Wazuh tailer; `redteam-target` is just another monitored endpoint. Zero new tailer code.
+8. Canary receiver is a new FastAPI route, not a new tailer. Hits persist directly via existing `_persist_and_enqueue`.
+9. New tables (`posture_runs`, `canary_tokens`, `threat_intel`) follow DEC-SCHEMA-002: idempotent `ALTER TABLE` in `init_db`, no migration framework.
+10. Posture scoring **depends on Phase 2.5 Sigma auto-deploy** for techniques YARA can't cover (process execution). If Phase 2.5 slips, Phase 3 P0 still ships but with biased score (YARA-only coverage) and REQ-P1-P3-004 becomes P2.
+11. Dashboard uses existing HTMX pattern (`hx-trigger="every 10s"`); no SPA, no chart library beyond CSS/SVG.
+12. Posture score persists per run in `posture_runs`; in-memory stats counters (per DEC-HEALTH-001) are additive — no lock added.
+
+### Files to Create / Update
+```
+shaferhund/
+  compose.yaml                          # (UPDATE) add redteam-runner + redteam-target containers
+  requirements.txt                      # (UPDATE) add httpx (if not present), dnslib (optional)
+  .env.example                          # (UPDATE) document Phase 3 env vars
+  atomic_tests.yaml                     # (NEW) declarative ART technique list
+  agent/
+    red_team.py                         # (NEW) ART runner invocation + posture_runs CRUD + scoring
+    canary.py                           # (NEW) spawn + receiver + token persistence
+    threat_intel.py                     # (NEW) URLhaus fetcher + lookup + poller Task
+    orchestrator.py                     # (UPDATE) add check_threat_intel tool def + dispatch entry + closure factory call
+    models.py                           # (UPDATE) posture_runs, canary_tokens, threat_intel tables + CRUD helpers
+    main.py                             # (UPDATE) /posture, /posture/run, /canary/spawn, /canary/hit/{token} routes; /health additions; URLhaus + ART schedule Tasks in lifespan
+    config.py                           # (UPDATE) Phase 3 env fields
+    templates/
+      posture.html                      # (NEW) score + technique breakdown + sparkline (P1)
+      canaries.html                     # (NEW, P1) active canary list + trigger counts
+  tests/
+    test_red_team_harness.py            # (NEW) mock ART runner → posture_runs row
+    test_posture_score.py               # (NEW) pass/fail scoring matrix
+    test_canary.py                      # (NEW) spawn → hit → alert row
+    test_threat_intel.py                # (NEW) URLhaus fetcher + check_threat_intel tool behaviour
+    test_orchestrator_threat_intel.py   # (NEW) tool-use loop includes check_threat_intel
+    fixtures/
+      urlhaus_sample.json               # (NEW) cached URLhaus payload for deterministic tests
+      atomic_test_sample.yaml           # (NEW) sample ART test definition
+      redteam_wazuh_alert.json          # (NEW) expected shape of a Wazuh alert from an ART run
+```
+
+### Success Criteria
+- `podman compose up` brings up Wazuh + Suricata + Shaferhund + `redteam-runner` + `redteam-target`
+- `POST /posture/run` triggers an ART batch; logs show technique execution within 10s
+- Within 60s of ART run completion, `posture_runs` row populated and `/health` reports `posture.last_score`
+- A DNS or HTTP canary spawn, triggered externally, produces a `source='canary'` alert that triages normally
+- URLhaus fetcher populates `threat_intel` within the first scheduled interval; at least one orchestrator test shows `check_threat_intel` used during triage
+- `/posture` (P1) renders the latest score and per-technique breakdown
+- Phase 1 / Phase 2 / Phase 2.5 tests pass unchanged; all new Phase 3 tests pass
+
+### Decision Log
+
+| ID | Title | Status |
+|----|-------|--------|
+| DEC-REDTEAM-001 | External scheduled ART harness (not Claude-driven) | planned |
+| DEC-POSTURE-001 | Posture score = ART pass rate (deployed-rule coverage over total tests) | planned |
+| DEC-CANARY-001 | DNS + HTTP canary tokens only; service honeypots deferred to Phase 4 | planned |
+| DEC-THREATINTEL-001 | URLhaus only; STIX/TAXII federation deferred | planned |
+| DEC-ORCH-004 | `check_threat_intel` added via direct TOOLS patch (no dynamic registration refactor) | planned |
+| DEC-REDTEAM-002 | Declarative `atomic_tests.yaml`; no full ART auto-discovery | planned |
+| DEC-CANARY-002 | Canary events enter via existing `_persist_and_enqueue`; `source='canary'` | planned |
+| DEC-POSTURE-002 | Phase 3 P0 ships even if Phase 2.5 Sigma slips; YARA-biased score acceptable as interim | planned |
 
 ## TODOs
-- [ ] Convert hund to ROADMAP.md (map 25 domains to phases)
+- [ ] Convert `hund` to `ROADMAP.md` (map 25 domains to phases)
+- [ ] Phase 4 scoping: agent-driven red team, containerised honeypots, threat-intel federation, rule fleet distribution, multi-cloud source coverage, dynamic orchestrator tool registration, posture SLO with paging
