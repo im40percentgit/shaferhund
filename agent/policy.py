@@ -78,6 +78,20 @@ def should_auto_deploy(
         return False, "rule syntax invalid"
 
     # Check 4: AI confidence must meet the threshold
+    #
+    # @decision DEC-AUTODEPLOY-002
+    # @title Explicit None guard on ai_confidence; defaults to 0.0 in finalize_triage
+    # @status accepted
+    # @rationale Pre-F4 the pipeline passed None from finalize_triage (the
+    #            finalize_triage tool schema had no confidence field, so
+    #            update_cluster_ai was called without ai_confidence, leaving
+    #            the DB column NULL). That caused TypeError: '<' not supported
+    #            between instances of 'NoneType' and 'float' here. Now
+    #            finalize_triage always writes a float (default 0.0) and the
+    #            gate returns a clean (False, reason) on missing confidence
+    #            rather than raising.
+    if cluster.ai_confidence is None:
+        return False, "confidence not set"
     if cluster.ai_confidence < settings.AUTO_DEPLOY_CONF_THRESHOLD:
         return False, "confidence below threshold"
 

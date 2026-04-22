@@ -720,3 +720,112 @@ def test_loop_with_conn_persists_verdict():
     assert cluster_row["ai_analysis"] == "Confirmed brute-force attack."
 
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 20: finalize_triage persists confidence (F4 / DEC-AUTODEPLOY-002)
+# ---------------------------------------------------------------------------
+
+def test_finalize_triage_persists_confidence():
+    """finalize_triage with confidence=0.92 writes ai_confidence=0.92 to cluster row."""
+    conn = _make_db()
+    cluster_id = "cluster-conf-persist"
+    _seed_cluster(conn, cluster_id)
+
+    responses = [
+        _tool_use_response(
+            "finalize_triage",
+            {
+                "severity": "High",
+                "analysis": "Confirmed attack with high confidence.",
+                "rule_ids": [],
+                "confidence": 0.92,
+            },
+            tool_id="tu_conf_001",
+        ),
+    ]
+
+    client = _make_mock_client(responses)
+    config = _make_config(max_calls=5, wall_timeout=10.0)
+    cluster = _make_cluster(cluster_id)
+
+    result = run_triage_loop(cluster, client, config, conn=conn)
+
+    assert result.severity == "High"
+
+    cluster_row = dict(get_cluster(conn, cluster_id))
+    assert cluster_row["ai_confidence"] == pytest.approx(0.92, abs=1e-6), (
+        f"Expected ai_confidence=0.92, got {cluster_row['ai_confidence']}"
+    )
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 21: finalize_triage missing confidence defaults to 0.0, not None/raise
+# ---------------------------------------------------------------------------
+
+def test_finalize_triage_missing_confidence_defaults_to_zero():
+    """finalize_triage with no confidence field writes ai_confidence=0.0, not None."""
+    conn = _make_db()
+    cluster_id = "cluster-conf-missing"
+    _seed_cluster(conn, cluster_id)
+
+    responses = [
+        _tool_use_response(
+            "finalize_triage",
+            {
+                "severity": "Medium",
+                "analysis": "Ambiguous activity, low confidence.",
+                "rule_ids": [],
+                # confidence intentionally omitted
+            },
+            tool_id="tu_conf_002",
+        ),
+    ]
+
+    client = _make_mock_client(responses)
+    config = _make_config(max_calls=5, wall_timeout=10.0)
+    cluster = _make_cluster(cluster_id)
+
+    result = run_triage_loop(cluster, client, config, conn=conn)
+
+    assert result.severity == "Medium"
+
+    cluster_row = dict(get_cluster(conn, cluster_id))
+    assert cluster_row["ai_confidence"] == pytest.approx(0.0, abs=1e-6), (
+        f"Expected ai_confidence=0.0 (not None), got {cluster_row['ai_confidence']!r}"
+    )
+
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 22: run_triage_loop passes system= kwarg to Claude API (DEC-ORCH-004)
+# ---------------------------------------------------------------------------
+
+def test_loop_passes_system_prompt_to_claude():
+    """run_triage_loop passes system=ORCHESTRATOR_SYSTEM_PROMPT to messages.create."""
+    from agent.orchestrator import ORCHESTRATOR_SYSTEM_PROMPT
+
+    responses = [
+        _tool_use_response(
+            "finalize_triage",
+            {"severity": "Low", "analysis": "Benign scan.", "rule_ids": [], "confidence": 0.5},
+            tool_id="tu_sys_001",
+        ),
+    ]
+    client = _make_mock_client(responses)
+    config = _make_config()
+    cluster = _make_cluster("cluster-system-prompt")
+
+    run_triage_loop(cluster, client, config)
+
+    # Inspect the kwargs used in the first (and only) API call
+    call_kwargs = client.messages.create.call_args_list[0].kwargs
+    assert "system" in call_kwargs, (
+        "messages.create was not called with system= kwarg"
+    )
+    assert call_kwargs["system"] == ORCHESTRATOR_SYSTEM_PROMPT, (
+        "system= kwarg does not match ORCHESTRATOR_SYSTEM_PROMPT"
+    )

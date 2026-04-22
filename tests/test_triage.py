@@ -138,3 +138,67 @@ async def test_budget_exhaustion_reenqueues():
     assert not queue._budget.can_call()
     assert queue.depth == 1  # cluster is still waiting, not consumed
     assert results == []     # no triage result produced yet
+
+
+# ---------------------------------------------------------------------------
+# Test 3: Single-shot fallback uses system= parameter (DEC-ORCH-004 / F4)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_single_shot_uses_system_prompt():
+    """call_claude single-shot fallback passes system= kwarg, not instructions in user content.
+
+    The orchestrator path raises TypeError (mock api_key is not str), so
+    call_claude falls back to the single-shot path.  We then inspect the
+    kwargs passed to client.messages.create to confirm:
+      - system= kwarg is present
+      - The user message content is JSON (cluster data only, not instructions)
+
+    # @mock-exempt: mock_client is the Anthropic HTTP API — an external boundary.
+    # We need a non-str api_key to force the single-shot fallback path without
+    # a real API key, and we inspect call kwargs to verify the system= parameter
+    # is passed correctly. No internal modules are mocked.
+    """
+    from agent.triage import TRIAGE_SYSTEM_PROMPT
+
+    fake_response_text = json.dumps({
+        "severity": "Low",
+        "threat_assessment": "Benign scan.",
+        "iocs": {"ips": [], "domains": [], "hashes": [], "paths": []},
+        "yara_rule": "",
+    })
+
+    mock_message = MagicMock()
+    mock_message.content = [MagicMock(text=fake_response_text)]
+
+    mock_client = AsyncMock()
+    # api_key is a MagicMock (not str) — forces the orchestrator path to raise
+    # TypeError and fall through to the single-shot path.
+    mock_client.api_key = MagicMock()
+    mock_client.messages.create = AsyncMock(return_value=mock_message)
+
+    cluster = _make_cluster("cluster-syscheck")
+    await call_claude(mock_client, cluster, "claude-opus-4-5")
+
+    mock_client.messages.create.assert_called_once()
+    call_kwargs = mock_client.messages.create.call_args.kwargs
+
+    # system= kwarg must be present and match TRIAGE_SYSTEM_PROMPT
+    assert "system" in call_kwargs, (
+        "single-shot path did not pass system= to messages.create"
+    )
+    assert call_kwargs["system"] == TRIAGE_SYSTEM_PROMPT
+
+    # The user message must be JSON (cluster data), not instructions
+    messages = call_kwargs.get("messages", [])
+    assert len(messages) == 1
+    user_content = messages[0]["content"]
+    # Must be valid JSON
+    parsed = json.loads(user_content)
+    assert "cluster_id" in parsed or "src_ip" in parsed, (
+        f"user message content does not look like cluster JSON: {user_content[:200]}"
+    )
+    # Must NOT contain the instruction text (which belongs in system=)
+    assert "cybersecurity analyst" not in user_content, (
+        "Instruction text found in user message — should be in system= only"
+    )
