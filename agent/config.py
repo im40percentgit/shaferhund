@@ -15,6 +15,7 @@ fail fast rather than silently degrading.
 """
 
 import json
+from typing import Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import field_validator
@@ -54,6 +55,13 @@ class Settings(BaseSettings):
     # Orchestrator caps (Phase 2)
     orch_max_tool_calls: int = 5
     orch_wall_timeout_seconds: float = 10.0
+
+    # Sigma-cli availability — populated by the lifespan startup probe
+    # (REQ-P0-P25-003). Defaults to False so a misconfigured container can
+    # never accidentally auto-deploy Sigma rules before the probe confirms
+    # sigma-cli is usable. Set by _probe_sigmac() in main.py lifespan.
+    sigmac_available: bool = False
+    sigmac_version: Optional[str] = None
 
     # Auto-deploy policy gate (Phase 2, REQ-P0-P2-006, DEC-AUTODEPLOY-001)
     # Default OFF — operator must explicitly enable via env var.

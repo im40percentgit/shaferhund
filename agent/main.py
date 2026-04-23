@@ -57,6 +57,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -111,6 +112,55 @@ _last_poll_at: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
+# Sigma-cli startup probe
+# ---------------------------------------------------------------------------
+
+def _probe_sigmac(settings: Settings) -> None:
+    """Probe for sigma-cli at startup and mutate settings fields in place.
+
+    Runs ``sigma --version`` once. On success, sets sigmac_available=True
+    and sigmac_version to the version string. On any failure
+    (FileNotFoundError, non-zero exit, or TimeoutExpired), leaves
+    sigmac_available=False and logs a single WARNING. Does NOT raise —
+    graceful degradation is the point.
+
+    @decision DEC-SIGMA-DEGRADE-001
+    @title Startup probe flips settings.sigmac_available once; downstream reads the bool
+    @status accepted
+    @rationale One sigma-cli invocation per startup is enough. Downstream code
+               (policy gate, orchestrator) reads sigmac_available without re-probing.
+               Re-probing on every triage would add 50-100 ms of latency per rule
+               for no benefit. Defaults to False so a misconfigured container can
+               never accidentally auto-deploy Sigma rules before the probe confirms
+               sigma-cli is usable (fail-safe default).
+    """
+    try:
+        result = subprocess.run(
+            ["sigma", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            settings.sigmac_available = True
+            settings.sigmac_version = result.stdout.strip()
+            log.info("sigma-cli available: %s", settings.sigmac_version)
+            return
+        # Non-zero exit — treat as unavailable
+        log.warning(
+            "sigma-cli not available; Sigma rules will generate but not auto-deploy"
+        )
+    except FileNotFoundError:
+        log.warning(
+            "sigma-cli not available; Sigma rules will generate but not auto-deploy"
+        )
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "sigma-cli not available; Sigma rules will generate but not auto-deploy"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 
@@ -119,6 +169,7 @@ async def lifespan(app: FastAPI):
     global _settings, _db, _triage_queue, _clusterer, _tailer_task, _suricata_tailer_task
 
     _settings = get_settings()
+    _probe_sigmac(_settings)
     _db = init_db(_settings.db_path)
     _clusterer = AlertClusterer(
         window_seconds=_settings.cluster_window_seconds,
@@ -288,6 +339,12 @@ async def metrics() -> JSONResponse:
             "deployed_last_24h": deployed_24h,
             "skipped_last_24h": skipped_24h,
             "reverted_last_24h": reverted_24h,
+        },
+        # Sigma-cli availability — set once at startup by _probe_sigmac()
+        # (REQ-P0-P25-003, REQ-P1-P25-001). Not exposed via /health (CSO F5).
+        "sigmac": {
+            "available": getattr(_settings, "sigmac_available", False) if _settings else False,
+            "version": getattr(_settings, "sigmac_version", None) if _settings else None,
         },
     })
 
