@@ -37,6 +37,9 @@ wazuh/
 # Session / tester artifacts — see CLAUDE.md "No /tmp/" convention
 tmp/
 
+# Feature-branch worktrees — per Sacred Practice #2 "Main is Sacred"
+.worktrees/
+
 # Auto-generated decision registry (produced by surface.sh)
 DECISIONS.md
 
