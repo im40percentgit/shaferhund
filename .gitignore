@@ -33,3 +33,15 @@ wazuh/
 
 # Wazuh Docker (vendored, modify compose from here)
 # wazuh-docker/ is tracked
+
+# Session / tester artifacts — see CLAUDE.md "No /tmp/" convention
+tmp/
+
+# Feature-branch worktrees — per Sacred Practice #2 "Main is Sacred"
+.worktrees/
+
+# Auto-generated decision registry (produced by surface.sh)
+DECISIONS.md
+
+# External reference repos accidentally cloned into the tree
+awesome-cybersecurity-blueteam/
