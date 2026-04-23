@@ -60,6 +60,9 @@ def _make_settings(rules_dir: str, token: str = "") -> SimpleNamespace:
         suricata_eve_file="/dev/null",
         triage_hourly_budget=20,
         AUTO_DEPLOY_ENABLED=False,
+        # Sigma-cli probe fields (REQ-P0-P25-003) — default False (not probed in tests)
+        sigmac_available=False,
+        sigmac_version=None,
     )
 
 
