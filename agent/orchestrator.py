@@ -104,7 +104,9 @@ from .models import (
     record_deploy_event,
     update_cluster_ai,
 )
+from . import sigmac as _sigmac
 from .policy import should_auto_deploy
+from .sigmac import SigmaConversionError
 from .triage import TriageResult
 
 log = logging.getLogger(__name__)
@@ -1210,8 +1212,43 @@ def _run_auto_deploy(
             if deploy_ok:
                 # Write rule file — mkdir is a no-op when dir already exists.
                 rules_dir.mkdir(parents=True, exist_ok=True)
-                rule_path = rules_dir / f"{rule_id}.yar"
-                rule_path.write_text(rule_row["rule_content"] or "", encoding="utf-8")
+
+                rule_type = rule_row["rule_type"]
+
+                if rule_type == "sigma":
+                    # See DEC-AUTODEPLOY-003 in agent/policy.py.
+                    #
+                    # Sigma conversion can fail (malformed rule, plugin missing, subprocess error).
+                    # Record a 'skipped' deploy_events row BEFORE the exception propagates so the
+                    # failure is auditable — the outer try/except below would otherwise swallow
+                    # the failure without a trail.
+                    try:
+                        rule_path = _sigmac.convert(
+                            rule_row["rule_content"] or "",
+                            rule_id,
+                            rules_dir,
+                        )
+                    except SigmaConversionError as exc:
+                        log.warning(
+                            "Sigma conversion failed for rule %s in cluster %s: %s",
+                            rule_id,
+                            cluster_id,
+                            exc,
+                        )
+                        record_deploy_event(
+                            conn,
+                            rule_id=rule_id,
+                            action="skipped",
+                            reason=f"sigmac conversion failed: {exc}",
+                            actor="orchestrator",
+                            rule_type=rule_type,
+                            src_ip=cluster_row["src_ip"],
+                        )
+                        continue
+                else:
+                    # YARA: file-drop to RULES_DIR/<rule_id>.yar (unchanged)
+                    rule_path = rules_dir / f"{rule_id}.yar"
+                    rule_path.write_text(rule_row["rule_content"] or "", encoding="utf-8")
 
                 mark_rule_deployed(conn, rule_id)
                 record_deploy_event(
@@ -1220,7 +1257,7 @@ def _run_auto_deploy(
                     action="auto-deploy",
                     reason=reason,
                     actor="orchestrator",
-                    rule_type=rule_row["rule_type"],
+                    rule_type=rule_type,
                     src_ip=cluster_row["src_ip"],
                 )
                 log.info(

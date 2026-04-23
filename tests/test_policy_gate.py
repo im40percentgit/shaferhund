@@ -12,8 +12,9 @@ uses SimpleNamespace / dicts throughout.
 @decision DEC-AUTODEPLOY-001
 @title Policy-gated auto-deploy, conservative defaults, default OFF
 @status accepted
-@rationale Tests cover all 7 rejection branches (disabled, rule_type, syntax,
-           confidence, severity, dedup, happy path) using plain dataclasses.
+@rationale Tests cover all rejection branches (disabled, rule_type, syntax,
+           confidence, severity, dedup, happy path, sigma-specific gates)
+           using plain dataclasses.
            The function under test is pure — no DB connections, no file I/O —
            so tests are fast and deterministic regardless of environment.
 """
@@ -91,13 +92,15 @@ def test_disabled_returns_false():
 
 
 # ---------------------------------------------------------------------------
-# Test 2: rule_type='sigma' → not eligible
+# Test 2: unknown rule_type (e.g. 'suricata') → not eligible
+# Phase 2.5: sigma IS eligible (see DEC-AUTODEPLOY-003); only truly unknown
+# types should be rejected at the rule_type gate.
 # ---------------------------------------------------------------------------
 
-def test_sigma_rule_type_rejected():
-    """Sigma rules are excluded from auto-deploy in Phase 2."""
+def test_unknown_rule_type_rejected():
+    """A rule_type not in {'yara', 'sigma'} is rejected at the rule_type gate."""
     settings = _make_settings(enabled=True)
-    rule = FakeRule(rule_type="sigma")
+    rule = FakeRule(rule_type="suricata")
     decision, reason = should_auto_deploy(rule, FakeCluster(), [], settings)
     assert decision is False
     assert "rule_type" in reason
@@ -243,3 +246,88 @@ def test_purity_no_side_effects():
 
     # Inputs must not be mutated
     assert recent == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 2.5 / DEC-AUTODEPLOY-003: Sigma rule gate tests
+# ---------------------------------------------------------------------------
+
+
+def _make_sigma_settings(
+    *,
+    sigmac_available: bool = True,
+    conf_threshold: float = 0.85,
+    severities: list[str] | None = None,
+) -> SimpleNamespace:
+    """Settings with sigmac_available wired in, used for Sigma-specific tests."""
+    return SimpleNamespace(
+        AUTO_DEPLOY_ENABLED=True,
+        AUTO_DEPLOY_CONF_THRESHOLD=conf_threshold,
+        AUTO_DEPLOY_DEDUP_WINDOW_SECONDS=3600,
+        AUTO_DEPLOY_SEVERITIES=severities if severities is not None else ["Critical", "High"],
+        sigmac_available=sigmac_available,
+    )
+
+
+def test_sigma_rule_deploys_when_sigmac_available():
+    """Sigma rule with sigmac_available=True, conf=0.9, Critical → (True, 'ok')."""
+    settings = _make_sigma_settings(sigmac_available=True)
+    rule = FakeRule(rule_type="sigma", syntax_valid=True)
+    cluster = FakeCluster(ai_confidence=0.9, ai_severity="Critical")
+
+    decision, reason = should_auto_deploy(rule, cluster, [], settings)
+
+    assert decision is True, f"Expected True, got False with reason={reason!r}"
+    assert reason == "ok"
+
+
+def test_sigma_rule_skipped_when_sigmac_unavailable():
+    """Sigma rule with sigmac_available=False → (False, 'sigmac not available')."""
+    settings = _make_sigma_settings(sigmac_available=False)
+    rule = FakeRule(rule_type="sigma", syntax_valid=True)
+    cluster = FakeCluster(ai_confidence=0.9, ai_severity="Critical")
+
+    decision, reason = should_auto_deploy(rule, cluster, [], settings)
+
+    assert decision is False
+    assert reason == "sigmac not available"
+
+
+def test_sigma_rule_respects_confidence_threshold():
+    """Sigma rule with conf=0.5 (below 0.85 threshold) → (False, 'confidence below threshold')."""
+    settings = _make_sigma_settings(sigmac_available=True, conf_threshold=0.85)
+    rule = FakeRule(rule_type="sigma", syntax_valid=True)
+    cluster = FakeCluster(ai_confidence=0.5, ai_severity="Critical")
+
+    decision, reason = should_auto_deploy(rule, cluster, [], settings)
+
+    assert decision is False
+    assert reason == "confidence below threshold"
+
+
+def test_sigma_rule_respects_severity_allowlist():
+    """Sigma rule with severity=Medium (not in allowlist) → (False, 'severity not in allowlist')."""
+    settings = _make_sigma_settings(sigmac_available=True)
+    rule = FakeRule(rule_type="sigma", syntax_valid=True)
+    cluster = FakeCluster(ai_confidence=0.9, ai_severity="Medium")
+
+    decision, reason = should_auto_deploy(rule, cluster, [], settings)
+
+    assert decision is False
+    assert reason == "severity not in allowlist"
+
+
+def test_sigma_rule_respects_none_confidence_guard():
+    """Sigma rule with ai_confidence=None → (False, 'confidence not set').
+
+    DEC-AUTODEPLOY-002 applies equally to Sigma rules. Must not raise TypeError.
+    """
+    settings = _make_sigma_settings(sigmac_available=True)
+    rule = FakeRule(rule_type="sigma", syntax_valid=True)
+    cluster = FakeCluster(ai_confidence=None)
+
+    # Must not raise
+    decision, reason = should_auto_deploy(rule, cluster, [], settings)
+
+    assert decision is False
+    assert reason == "confidence not set", f"Expected 'confidence not set', got {reason!r}"

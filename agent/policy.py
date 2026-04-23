@@ -15,12 +15,21 @@ Callers are responsible for supplying recent_deploys as a list.
                never silently auto-deploys on first run.
            (2) Every check is a hard gate with a named failure reason so the audit
                log tells operators exactly why a rule was or was not deployed.
-           Sigma rules are excluded in Phase 2 because there is no deploy path
-           without a sigmac conversion step (deferred to Phase 3). Only YARA
-           rules have a well-defined file-drop deploy path today.
+           Sigma deploy is unblocked in Phase 2.5 via sigmac conversion —
+           see DEC-AUTODEPLOY-003.
            The dedup window prevents duplicate rules from being deployed when
            the same threat pattern triggers multiple overlapping clusters within
            a short window — the first deploy wins and subsequent ones are skipped.
+
+@decision DEC-AUTODEPLOY-003
+@title Sigma now auto-deploys when sigmac_available=True
+@status accepted
+@rationale The rule_type gate accepts {'yara', 'sigma'}; the additional
+           sigmac_available gate for Sigma prevents deploy attempts when the
+           runtime probe found sigma-cli missing (settings.sigmac_available=False).
+           Keeps the function pure — sigmac_available is an attribute read,
+           never a subprocess call. DEC-AUTODEPLOY-002's ai_confidence None-guard
+           still protects both rule types equally.
 """
 
 import time
@@ -31,6 +40,11 @@ from typing import Any
 _RuleLike = Any
 _ClusterLike = Any
 _SettingsLike = Any
+
+# Rule types eligible for auto-deploy.  Only these two have defined deploy paths:
+#   yara  — file-drop to RULES_DIR/<rule_id>.yar
+#   sigma — sigmac conversion to RULES_DIR/sigma_<rule_id>.xml (requires sigmac_available=True)
+_ELIGIBLE_RULE_TYPES = frozenset({"yara", "sigma"})
 
 
 def should_auto_deploy(
@@ -59,6 +73,7 @@ def should_auto_deploy(
                     AUTO_DEPLOY_CONF_THRESHOLD (float)
                     AUTO_DEPLOY_DEDUP_WINDOW_SECONDS (int)
                     AUTO_DEPLOY_SEVERITIES (list[str])
+                    sigmac_available (bool, optional — checked only for sigma rules)
 
     Returns:
         (True, 'ok') when all checks pass.
@@ -69,9 +84,18 @@ def should_auto_deploy(
     if not settings.AUTO_DEPLOY_ENABLED:
         return False, "auto-deploy disabled"
 
-    # Check 2: only YARA rules have a deploy path in Phase 2
-    if rule.rule_type != "yara":
+    # Check 2: rule_type must be in the eligible set {'yara', 'sigma'}
+    # See DEC-AUTODEPLOY-003 for why sigma is now eligible.
+    if rule.rule_type not in _ELIGIBLE_RULE_TYPES:
         return False, "rule_type not eligible for auto-deploy"
+
+    # Check 2a: Sigma additionally requires sigmac to be available at runtime.
+    # sigmac_available is set by the startup probe (agent/main.py lifespan).
+    # This gate is a pure attribute read — no subprocess, no I/O.
+    # See DEC-AUTODEPLOY-003.
+    if rule.rule_type == "sigma":
+        if not getattr(settings, "sigmac_available", False):
+            return False, "sigmac not available"
 
     # Check 3: syntax must be valid
     if rule.syntax_valid is not True:
@@ -89,7 +113,8 @@ def should_auto_deploy(
     #            between instances of 'NoneType' and 'float' here. Now
     #            finalize_triage always writes a float (default 0.0) and the
     #            gate returns a clean (False, reason) on missing confidence
-    #            rather than raising.
+    #            rather than raising. DEC-AUTODEPLOY-002 applies to both YARA
+    #            and Sigma rules equally.
     if cluster.ai_confidence is None:
         return False, "confidence not set"
     if cluster.ai_confidence < settings.AUTO_DEPLOY_CONF_THRESHOLD:
