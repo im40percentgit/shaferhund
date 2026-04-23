@@ -314,12 +314,15 @@ shaferhund/
 
 ## Phase 2.5: Sigma Deploy Path (3–4 days)
 
-**Status:** planned
+**Status:** in-progress
+**Started:** 2026-04-22 (planner trace `planner-20260422-201536-956a04`, plan-only PR on `docs/plan-phase-2.5-start`)
 **Timebox:** 3–4 days
 
 ### Intent
 
-Phase 2 shipped Sigma rule generation wired up but auto-deploy explicitly blocked at `agent/policy.py:19` (DEC-AUTODEPLOY-001) — Sigma YAML can't become a Wazuh-native rule without sigmac conversion. Phase 2.5 closes that gap only. Cloud log ingestion (originally `REQ-NOGO-P2-001`) moves to Phase 4 where it belongs alongside multi-cloud and CSPM — ingesting CloudTrail in a homelab without a real AWS footprint would be fixture theatre (violating backlog item #5, "fixture-only testing is insufficient"), and the "source-agnostic" architecture is already proven by Wazuh + Suricata. Rule fleet distribution also stays in Phase 4.
+Phase 2 shipped Sigma rule generation wired up but auto-deploy explicitly blocked at `agent/policy.py:73` (DEC-AUTODEPLOY-001) — Sigma YAML can't become a Wazuh-native rule without sigmac conversion. Phase 2.5 closes that gap only. Cloud log ingestion (originally `REQ-NOGO-P2-001`) moves to Phase 4 where it belongs alongside multi-cloud and CSPM — ingesting CloudTrail in a homelab without a real AWS footprint would be fixture theatre (violating backlog item #5, "fixture-only testing is insufficient"), and the "source-agnostic" architecture is already proven by Wazuh + Suricata. Rule fleet distribution also stays in Phase 4.
+
+**Post-CSO reconciliation (2026-04-22):** The CSO audit (PRs #18–23) reshaped two surfaces this phase touches. (1) Operational stats moved from `/health` to `/metrics` behind `_require_auth` (DEC-HEALTH-002 at `agent/main.py:228`), so the P1 sigmac-exposure item targets `/metrics`, not `/health`. (2) `finalize_triage` now writes `ai_confidence` as a float (default 0.0) and `should_auto_deploy` hard-guards `None` before the threshold compare (DEC-AUTODEPLOY-002 at `agent/policy.py:82`); the Sigma auto-deploy path inherits that guarantee for free — the new `rule_type='sigma'` branch does not need to re-implement the None guard, only extend the eligibility check. Any new orchestrator-touching code must preserve the `system=` kwarg prompt pattern and the `sanitize_alert_field()` input-sanitisation applied in Phase 2's post-audit pass.
 
 ### Goals
 - Sigma rules auto-deploy through the same policy gate as YARA, via upstream sigmac conversion (REQ-P0-P25-001, REQ-P0-P25-002)
@@ -345,7 +348,7 @@ Phase 2 shipped Sigma rule generation wired up but auto-deploy explicitly blocke
 - REQ-P0-P25-004: All Phase 1 and Phase 2 tests pass unchanged.
 
 **Nice-to-Have (P1)**
-- REQ-P1-P25-001: `/health` exposes `sigmac.available` (bool) and `sigmac.version` (string, nullable).
+- REQ-P1-P25-001: `/metrics` (the authenticated stats endpoint per DEC-HEALTH-002; CSO F5 split this off from `/health`) exposes `sigmac.available` (bool) and `sigmac.version` (string, nullable). `/health` itself stays minimal — status + poller health only.
 - REQ-P1-P25-002: Dashboard cluster-detail view shows converted XML preview alongside raw Sigma YAML for rules that deployed.
 
 **Future Consideration (P2)**
@@ -407,14 +410,26 @@ shaferhund/
 - Container started without sigma-cli installed serves `/health` cleanly, logs WARNING, and stores Sigma rules as pending
 - Phase 1 and Phase 2 tests pass unchanged; new Phase 2.5 tests pass
 
+### GitHub Issues
+
+- **Wave A (parallel):**
+  - #24 — REQ-P0-P25-001: agent/sigmac.py subprocess wrapper + Dockerfile sigma-cli install (`feature/phase2.5-sigmac-wrapper`)
+  - #25 — REQ-P0-P25-003: sigma-cli startup probe + graceful degradation (`feature/phase2.5-sigmac-probe`)
+- **Wave B (blocked by Wave A):**
+  - #26 — REQ-P0-P25-002: policy gate accepts `rule_type='sigma'`; orchestrator routes through sigmac (`feature/phase2.5-policy-sigma-route`)
+- **Wave C (gate, blocked by #24/#25/#26):**
+  - #27 — REQ-P0-P25-004: zero regressions in Phase 1 + Phase 2 tests (merge-gate on integration branch)
+
 ### Decision Log
 
 | ID | Title | Status |
 |----|-------|--------|
-| DEC-SIGMA-002 | sigmac invoked via subprocess (sigma-cli), not Python API | planned |
-| DEC-AUTODEPLOY-002 | Sigma auto-deploy via extended policy gate + sigmac_available check | planned |
-| DEC-SIGMA-003 | Graceful degradation when sigmac missing — warn and disable, don't crash | planned |
+| DEC-SIGMA-CONVERT-001 | sigmac invoked via subprocess (sigma-cli), not Python API | planned |
+| DEC-AUTODEPLOY-003 | Sigma auto-deploy via extended policy gate + sigmac_available check | planned |
+| DEC-SIGMA-DEGRADE-001 | Graceful degradation when sigmac missing — warn and disable, don't crash | planned |
 | DEC-CLOUDLOG-001 | Cloud log source ingestion deferred to Phase 4 — needs real footprint to test, not fixtures | planned |
+
+> Note: `DEC-AUTODEPLOY-002` is **already taken** by the CSO-audit None-guard decision at `agent/policy.py:82` (accepted). The original Phase 2.5 plan pre-reserved that ID for the Sigma gate; reassigned to `DEC-AUTODEPLOY-003` during the 2026-04-22 planner pass. Similarly `DEC-SIGMA-002`/`DEC-SIGMA-003` are renamed to `DEC-SIGMA-CONVERT-001`/`DEC-SIGMA-DEGRADE-001` so the IDs name the concept rather than the number.
 
 ## Phase 3: Immune System (2–3 weeks after Phase 2.5)
 
@@ -423,7 +438,7 @@ shaferhund/
 
 ### Intent
 
-Phase 2 gave the agent eyes (unified Wazuh + Suricata ingestion), a brain (Claude tool-use orchestrator), and hands (policy-gated auto-deploy). Phase 2.5 finished the hands — Sigma rules auto-deploy too, via sigmac conversion. **Phase 3 gives it an immune system.** The agent attacks its own infrastructure on a schedule via Atomic Red Team, measures whether its deployed rules detect those attacks, and uses the resulting pass rate as a **single posture score**. An auto-spawnable canary network (DNS and HTTP tokens) traps opportunistic probing and feeds the same pipeline. A light-touch threat-intel feed (Abuse.ch URLhaus) adds indicator context to the orchestrator's reasoning. The platform becomes self-evaluating — when the posture score drops, the agent knows before the operator does.
+Phase 2 gave the agent eyes (unified Wazuh + Suricata ingestion), a brain (Claude tool-use orchestrator), and hands (policy-gated auto-deploy). Phase 2.5 will finish the hands — once shipped, Sigma rules will auto-deploy too, via sigmac conversion. **Phase 3 gives it an immune system.** The agent attacks its own infrastructure on a schedule via Atomic Red Team, measures whether its deployed rules detect those attacks, and uses the resulting pass rate as a **single posture score**. An auto-spawnable canary network (DNS and HTTP tokens) traps opportunistic probing and feeds the same pipeline. A light-touch threat-intel feed (Abuse.ch URLhaus) adds indicator context to the orchestrator's reasoning. The platform becomes self-evaluating — when the posture score drops, the agent knows before the operator does.
 
 This is deliberately **not** an agent-driven red team (Claude deciding when to attack) — that is Phase 4. Phase 3 is a scheduled, deterministic, measurable loop.
 
