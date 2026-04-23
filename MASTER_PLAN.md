@@ -314,9 +314,16 @@ shaferhund/
 
 ## Phase 2.5: Sigma Deploy Path (3–4 days)
 
-**Status:** in-progress
+**Status:** completed
 **Started:** 2026-04-22 (planner trace `planner-20260422-201536-956a04`, plan-only PR on `docs/plan-phase-2.5-start`)
+**Completed:** 2026-04-22
 **Timebox:** 3–4 days
+
+### Shipped
+- #30 — sigmac wrapper + Dockerfile install (REQ-P0-P25-001)
+- #29 — sigma-cli startup probe + /metrics exposure (REQ-P0-P25-003, REQ-P1-P25-001)
+- #31 — policy gate + orchestrator Sigma routing (REQ-P0-P25-002)
+- #27 closed — no-regression gate satisfied by #31's test suite (REQ-P0-P25-004)
 
 ### Intent
 
@@ -424,9 +431,9 @@ shaferhund/
 
 | ID | Title | Status |
 |----|-------|--------|
-| DEC-SIGMA-CONVERT-001 | sigmac invoked via subprocess (sigma-cli), not Python API | planned |
-| DEC-AUTODEPLOY-003 | Sigma auto-deploy via extended policy gate + sigmac_available check | planned |
-| DEC-SIGMA-DEGRADE-001 | Graceful degradation when sigmac missing — warn and disable, don't crash | planned |
+| DEC-SIGMA-CONVERT-001 | sigmac invoked via subprocess (sigma-cli), not Python API — subprocess boundary isolates crashes; pysigma-backend-wazuh ships as a sigma-cli plugin, not a PyPI library | accepted |
+| DEC-SIGMA-DEGRADE-001 | Startup probe sets `settings.sigmac_available`; downstream reads the bool (no re-probing per triage). Wrapper raises on missing binary; caller records a skipped `deploy_events` row before exception propagates | accepted |
+| DEC-AUTODEPLOY-003 | `rule_type` gate expanded to `{yara, sigma}` via `_ELIGIBLE_RULE_TYPES` frozenset; Sigma additionally requires `settings.sigmac_available`; DEC-AUTODEPLOY-002's `ai_confidence` None-guard continues to protect both types; gate stays pure (attribute read only) | accepted |
 | DEC-CLOUDLOG-001 | Cloud log source ingestion deferred to Phase 4 — needs real footprint to test, not fixtures | planned |
 
 > Note: `DEC-AUTODEPLOY-002` is **already taken** by the CSO-audit None-guard decision at `agent/policy.py:82` (accepted). The original Phase 2.5 plan pre-reserved that ID for the Sigma gate; reassigned to `DEC-AUTODEPLOY-003` during the 2026-04-22 planner pass. Similarly `DEC-SIGMA-002`/`DEC-SIGMA-003` are renamed to `DEC-SIGMA-CONVERT-001`/`DEC-SIGMA-DEGRADE-001` so the IDs name the concept rather than the number.
@@ -438,7 +445,7 @@ shaferhund/
 
 ### Intent
 
-Phase 2 gave the agent eyes (unified Wazuh + Suricata ingestion), a brain (Claude tool-use orchestrator), and hands (policy-gated auto-deploy). Phase 2.5 will finish the hands — once shipped, Sigma rules will auto-deploy too, via sigmac conversion. **Phase 3 gives it an immune system.** The agent attacks its own infrastructure on a schedule via Atomic Red Team, measures whether its deployed rules detect those attacks, and uses the resulting pass rate as a **single posture score**. An auto-spawnable canary network (DNS and HTTP tokens) traps opportunistic probing and feeds the same pipeline. A light-touch threat-intel feed (Abuse.ch URLhaus) adds indicator context to the orchestrator's reasoning. The platform becomes self-evaluating — when the posture score drops, the agent knows before the operator does.
+Phase 2 gave the agent eyes (unified Wazuh + Suricata ingestion), a brain (Claude tool-use orchestrator), and hands (policy-gated auto-deploy). Phase 2.5 finished the hands — Sigma rules auto-deploy too, via sigmac conversion. **Phase 3 gives it an immune system.** The agent attacks its own infrastructure on a schedule via Atomic Red Team, measures whether its deployed rules detect those attacks, and uses the resulting pass rate as a **single posture score**. An auto-spawnable canary network (DNS and HTTP tokens) traps opportunistic probing and feeds the same pipeline. A light-touch threat-intel feed (Abuse.ch URLhaus) adds indicator context to the orchestrator's reasoning. The platform becomes self-evaluating — when the posture score drops, the agent knows before the operator does.
 
 This is deliberately **not** an agent-driven red team (Claude deciding when to attack) — that is Phase 4. Phase 3 is a scheduled, deterministic, measurable loop.
 
