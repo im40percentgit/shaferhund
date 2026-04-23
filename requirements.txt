@@ -7,6 +7,11 @@ jinja2==3.1.6
 aiofiles==24.1.0
 yara-python==4.5.0
 pysigma>=1.2.0
+# sigma-cli: CLI wrapper for pySigma rule conversion.
+# pysigma-backend-wazuh does not exist on PyPI; the Wazuh backend is
+# installed at container build time via `sigma plugin install wazuh`
+# (see Dockerfile).  sigma-cli==1.0.4 is the last stable 1.x release.
+sigma-cli==1.0.4
 pytest==9.0.3
 pytest-asyncio==1.3.0
 httpx==0.28.1
