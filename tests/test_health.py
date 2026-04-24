@@ -136,10 +136,11 @@ def _make_config(max_calls: int = 5, wall_timeout: float = 10.0) -> SimpleNamesp
 
 
 def test_health_returns_only_liveness_fields(tmp_path):
-    """GET /health → exactly {status, poller_healthy, threat_intel}, nothing else.
+    """GET /health → exactly {status, poller_healthy, threat_intel, canary}, nothing else.
 
     Phase 3 (REQ-P0-P3-005) added threat_intel.record_count to /health.
-    The field is minimal (a count only) and does not expose operational detail,
+    Phase 3 (REQ-P0-P3-004) added canary.trigger_count_24h to /health.
+    Both fields are minimal counts that do not expose operational detail,
     consistent with DEC-HEALTH-002's "public liveness probe" intent.
     """
     _reset_orchestrator_stats()
@@ -149,13 +150,16 @@ def test_health_returns_only_liveness_fields(tmp_path):
     assert resp.status_code == 200
 
     data = resp.json()
-    assert set(data.keys()) == {"status", "poller_healthy", "threat_intel"}, (
-        f"Expected exactly {{status, poller_healthy, threat_intel}}, got keys: {set(data.keys())}"
+    assert set(data.keys()) == {"status", "poller_healthy", "threat_intel", "canary"}, (
+        f"Expected exactly {{status, poller_healthy, threat_intel, canary}}, "
+        f"got keys: {set(data.keys())}"
     )
     assert data["status"] == "ok"
     assert isinstance(data["poller_healthy"], bool)
     assert "record_count" in data["threat_intel"]
     assert isinstance(data["threat_intel"]["record_count"], int)
+    assert "trigger_count_24h" in data["canary"]
+    assert isinstance(data["canary"]["trigger_count_24h"], int)
 
     conn.close()
 

@@ -97,6 +97,8 @@ from .orchestrator import get_orchestrator_stats
 from .triage import TriageResult, TriageQueue
 from . import threat_intel as _threat_intel
 from .models import count_threat_intel_records
+from . import canary as _canary
+from .canary import spawn_canary, record_hit, count_canary_triggers_since
 
 log = logging.getLogger(__name__)
 
@@ -302,11 +304,19 @@ async def health() -> JSONResponse:
                probes, which only need {status, poller_healthy} to decide liveness.
     """
     ti_count = count_threat_intel_records(_db) if _db is not None else 0
+    canary_24h = (
+        count_canary_triggers_since(_db, time.time() - 86400)
+        if _db is not None
+        else 0
+    )
     return JSONResponse({
         "status": "ok",
         "poller_healthy": _poller_healthy,
         "threat_intel": {
             "record_count": ti_count,
+        },
+        "canary": {
+            "trigger_count_24h": canary_24h,
         },
     })
 
@@ -542,6 +552,117 @@ async def undo_deploy_rule(rule_id: str):
         )
 
     return {"reverted": True, "path": str(rule_file)}
+
+
+# ---------------------------------------------------------------------------
+# Canary token routes (Phase 3, REQ-P0-P3-004)
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/canary/spawn",
+    dependencies=[Depends(_require_auth)],
+)
+async def canary_spawn(request: Request) -> JSONResponse:
+    """Spawn a new DNS or HTTP canary token.
+
+    Auth-gated (same SHAFERHUND_TOKEN bearer scheme as /metrics).
+
+    Request body JSON:
+        type (str): 'dns' or 'http'
+        name (str): human-readable label for this canary
+
+    Returns:
+        JSON with: id, token, type, name, and either trap_url (http)
+        or trap_hostname (dns).
+    """
+    if _db is None or _settings is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON")
+
+    token_type = body.get("type", "")
+    name = body.get("name", "")
+
+    if token_type not in ("dns", "http"):
+        raise HTTPException(
+            status_code=422,
+            detail="type must be 'dns' or 'http'",
+        )
+    if not isinstance(name, str) or not name.strip():
+        raise HTTPException(status_code=422, detail="name must be a non-empty string")
+
+    try:
+        result = spawn_canary(
+            _db,
+            token_type=token_type,
+            name=name,
+            base_url=_settings.canary_base_url,
+            base_hostname=_settings.canary_base_hostname,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    return JSONResponse(result, status_code=201)
+
+
+@app.get("/canary/hit/{token}")
+async def canary_hit(token: str, request: Request) -> JSONResponse:
+    """Public trap endpoint — no auth required.
+
+    Called when an attacker follows an HTTP canary link. Returns an innocuous
+    response (200 with minimal body) to avoid tipping off the attacker that
+    they hit a trap. The real work happens in record_hit() which writes a
+    source='canary' alert row and routes it through the clusterer/triage pipeline.
+
+    The /canary/hit path is intentionally NOT behind _require_auth: an attacker
+    won't send a bearer token, and requiring auth would make the trap useless.
+    """
+    if _db is None:
+        # DB not ready — still return innocuous 200 to avoid fingerprinting
+        return JSONResponse({"ok": True})
+
+    # Extract sanitized request metadata (all attacker-controlled)
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    client_ip = (
+        forwarded_for.split(",")[0].strip()
+        if forwarded_for
+        else (request.client.host if request.client else "unknown")
+    )
+    request_meta = {
+        "src_ip": client_ip,
+        "user_agent": request.headers.get("user-agent", ""),
+        "path": str(request.url.path),
+        "x_forwarded_for": forwarded_for,
+    }
+
+    hit = record_hit(
+        _db,
+        token=token,
+        request_meta=request_meta,
+        enqueue_fn=_canary_enqueue,
+    )
+
+    # Always return innocuous 200 regardless of whether the token was known.
+    # A 404 for unknown tokens would let an attacker enumerate valid tokens.
+    return JSONResponse({"ok": True})
+
+
+async def _canary_enqueue(alert_obj) -> None:
+    """Bridge between record_hit() and the shared clusterer/triage pipeline.
+
+    record_hit() calls this with an Alert object. We add it to the shared
+    AlertClusterer (which may close a cluster) and persist + enqueue any
+    closed clusters for triage.
+    """
+    if _clusterer is None or _db is None:
+        return
+
+    closed = _clusterer.add(alert_obj)
+    for cluster in closed:
+        await _persist_and_enqueue(cluster)
 
 
 # ---------------------------------------------------------------------------
