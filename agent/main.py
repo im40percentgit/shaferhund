@@ -342,6 +342,14 @@ async def health() -> JSONResponse:
     posture_row = get_latest_posture_run(_db) if _db is not None else None
     posture_last_score = float(posture_row["score"]) if posture_row is not None else None
     posture_last_run_at = posture_row["started_at"] if posture_row is not None else None
+    # Phase 4 (REQ-P0-P4-003): weighted_score — guard against Phase 3 DBs that
+    # predate the column (IndexError on sqlite3.Row key access).
+    try:
+        posture_last_weighted_score = (
+            float(posture_row["weighted_score"]) if posture_row is not None else None
+        )
+    except (IndexError, KeyError):
+        posture_last_weighted_score = None
     return JSONResponse({
         "status": "ok",
         "poller_healthy": _poller_healthy,
@@ -354,6 +362,7 @@ async def health() -> JSONResponse:
         "posture": {
             "last_score": posture_last_score,
             "last_run_at": posture_last_run_at,
+            "last_weighted_score": posture_last_weighted_score,
         },
     })
 

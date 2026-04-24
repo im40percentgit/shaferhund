@@ -1,6 +1,9 @@
 # Cached sample ART YAML for deterministic tests.
 # Shape mirrors atomic_tests.yaml — used by test_red_team_harness.py so tests
 # do not depend on the repo-root file (which may change in future phases).
+#
+# Phase 4 (REQ-P0-P4-003): weight field added. Mix of weights 1, 2, 3 to
+# exercise weighted-vs-flat divergence in test scenarios.
 
 tests:
   - technique_id: "T1059.003"
@@ -9,6 +12,7 @@ tests:
       echo 'ART T1059.003 test'
     expected_wazuh_rule_ids:
       - 5501
+    weight: 3
 
   - technique_id: "T1053.003"
     test_name: "Scheduled Task/Job: Cron (list cron jobs)"
@@ -16,6 +20,7 @@ tests:
       crontab -l 2>/dev/null || echo 'no crontab'
     expected_wazuh_rule_ids:
       - 5401
+    weight: 2
 
   - technique_id: "T1087.001"
     test_name: "Account Discovery: Local Account"
@@ -23,3 +28,4 @@ tests:
       cat /etc/passwd | cut -d: -f1 | head -5
     expected_wazuh_rule_ids:
       - 5715
+    weight: 1

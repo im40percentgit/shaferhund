@@ -61,6 +61,7 @@ import yaml
 
 from .models import (
     compute_posture_score_for_run,
+    compute_posture_weighted_score_for_run,
     insert_posture_run,
     insert_posture_test_result,
     update_posture_run,
@@ -89,6 +90,9 @@ def load_atomic_tests(path: str) -> list[dict]:
         test_name (str)              — human-readable label
         command_or_script_hint (str) — command executed via the target container
         expected_wazuh_rule_ids (list[int]) — optional, for scoring hints
+        weight (int)                 — importance weight for weighted posture
+                                       score (Phase 4, REQ-P0-P4-003).
+                                       Absent entries default to 1 in run_batch.
 
     Args:
         path: Filesystem path to the YAML file (absolute or relative to cwd).
@@ -210,11 +214,13 @@ def run_batch(
             # Strip YAML block-scalar trailing whitespace
             if isinstance(command, str):
                 command = command.strip()
+            # Phase 4: read per-test weight (default 1 if absent, REQ-P0-P4-003)
+            weight = int(test.get("weight", 1))
 
             fired_at = datetime.now(timezone.utc).isoformat()
             log.info(
-                "ART run %d: executing technique=%s name=%r",
-                run_id, technique_id, test_name,
+                "ART run %d: executing technique=%s name=%r weight=%d",
+                run_id, technique_id, test_name, weight,
             )
 
             try:
@@ -236,6 +242,7 @@ def run_batch(
                 fired_at=fired_at,
                 exit_code=exit_code,
                 output=output,
+                weight=weight,
             )
 
             log.info(
@@ -247,15 +254,23 @@ def run_batch(
         log.error("ART run %d: batch loop error: %s", run_id, exc, exc_info=True)
         overall_status = "failed"
 
-    # Compute score via SQL join (DEC-POSTURE-001)
+    # Compute flat score via SQL join (DEC-POSTURE-001)
     try:
         score_result = compute_posture_score_for_run(conn, run_id)
         passes = score_result["passes"]
         score = score_result["score"]
     except Exception as exc:
-        log.error("ART run %d: score computation failed: %s", run_id, exc)
+        log.error("ART run %d: flat score computation failed: %s", run_id, exc)
         passes = 0
         score = 0.0
+        overall_status = "failed"
+
+    # Compute weighted score (REQ-P0-P4-003, DEC-POSTURE-003)
+    try:
+        weighted_score = compute_posture_weighted_score_for_run(conn, run_id)
+    except Exception as exc:
+        log.error("ART run %d: weighted score computation failed: %s", run_id, exc)
+        weighted_score = 0.0
         overall_status = "failed"
 
     finished_at = datetime.now(timezone.utc).isoformat()
@@ -266,11 +281,12 @@ def run_batch(
         passes=passes,
         score=score,
         status=overall_status,
+        weighted_score=weighted_score,
     )
 
     log.info(
-        "Posture run %d complete: status=%s passes=%d/%d score=%.3f",
-        run_id, overall_status, passes, total_tests, score,
+        "Posture run %d complete: status=%s passes=%d/%d score=%.3f weighted_score=%.3f",
+        run_id, overall_status, passes, total_tests, score, weighted_score,
     )
     return run_id
 

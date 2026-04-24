@@ -16,6 +16,11 @@
 #   test_name                 — human-readable label for this specific test
 #   command_or_script_hint    — the command or script fragment to execute
 #   expected_wazuh_rule_ids   — list of Wazuh rule IDs expected to fire (for scoring)
+#   weight                    — integer importance weight for weighted posture score
+#                               (optional; defaults to 1 if absent). Higher = more
+#                               critical technique. Used by Phase 4 weighted scoring
+#                               (REQ-P0-P4-003, DEC-POSTURE-003). T1486/ransomware
+#                               would get weight=3; T1087/discovery stays at 1.
 #
 # The command_or_script_hint is executed via:
 #   podman exec <redteam-target> /bin/bash -c "<command_or_script_hint>"
@@ -30,6 +35,7 @@ tests:
     expected_wazuh_rule_ids:
       - 5501
       - 5502
+    weight: 2
 
   - technique_id: "T1059.004"
     test_name: "Command and Scripting Interpreter: Unix Shell"
@@ -37,6 +43,7 @@ tests:
       /bin/sh -c 'id && whoami && uname -a'
     expected_wazuh_rule_ids:
       - 5501
+    weight: 2
 
   - technique_id: "T1053.003"
     test_name: "Scheduled Task/Job: Cron (list cron jobs)"
@@ -46,6 +53,7 @@ tests:
     expected_wazuh_rule_ids:
       - 5401
       - 5402
+    weight: 2
 
   - technique_id: "T1087.001"
     test_name: "Account Discovery: Local Account"
@@ -54,3 +62,4 @@ tests:
     expected_wazuh_rule_ids:
       - 5501
       - 5715
+    weight: 1
