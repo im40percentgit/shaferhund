@@ -1,0 +1,33 @@
+{
+  "_index": "wazuh-alerts-4.x-2026.04.24",
+  "_source": {
+    "timestamp": "2026-04-24T14:00:00.000Z",
+    "rule": {
+      "id": "5501",
+      "description": "Attempt to run python script",
+      "level": 7,
+      "groups": ["syscheck", "bash"]
+    },
+    "agent": {
+      "id": "001",
+      "name": "redteam-target",
+      "ip": "10.0.0.2"
+    },
+    "manager": {
+      "name": "wazuh.manager"
+    },
+    "id": "1714060800.00000001",
+    "full_log": "ART T1059.003 test: cmd.exe stub via bash",
+    "data": {
+      "srcip": "10.0.0.2",
+      "dstip": "10.0.0.1",
+      "srcport": "45678",
+      "dstport": "443",
+      "protocol": "TCP"
+    },
+    "location": "redteam-target->/var/log/syslog",
+    "decoder": {
+      "name": "syslog"
+    }
+  }
+}

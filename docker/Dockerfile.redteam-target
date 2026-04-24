@@ -1,0 +1,41 @@
+# Phase 3 — Atomic Red Team target container (REQ-P0-P3-002, DEC-REDTEAM-005)
+#
+# @decision DEC-REDTEAM-005
+# @title Wazuh agent pre-installed, enrollment deferred to runtime
+# @status accepted
+# @rationale Baking the Wazuh 4.x APT package into the image avoids per-run
+#   package installation overhead while keeping the image immutable and
+#   enrollment-free. The compose.yaml entrypoint (tail -f /dev/null) keeps the
+#   container alive; the orchestrator enrolls and starts wazuh-agent at runtime
+#   via `docker exec`. This separates build-time (image) from runtime (config)
+#   concerns and allows the same image to target different Wazuh managers.
+#
+# Minimal Ubuntu host with Wazuh agent pre-installed. Enrollment is deferred
+# to runtime — do not run ossec-authd or start wazuh-agent in the image.
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    gnupg \
+    openssh-client \
+    python3 \
+    lsb-release \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Wazuh 4.x agent (not enrolled — runtime enrollment per DEC-REDTEAM-005)
+RUN curl -s https://packages.wazuh.com/key/GPG-KEY-WAZUH | \
+    gpg --no-default-keyring --keyring gnupg-ring:/usr/share/keyrings/wazuh.gpg --import && \
+    chmod 644 /usr/share/keyrings/wazuh.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main" \
+      | tee /etc/apt/sources.list.d/wazuh.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends wazuh-agent && \
+    rm -rf /var/lib/apt/lists/*
+
+# Entrypoint is overridden in compose.yaml to `tail -f /dev/null`; defining a
+# default here ensures the image is usable standalone for debugging.
+CMD ["/bin/bash", "-c", "tail -f /dev/null"]

@@ -208,6 +208,62 @@ CREATE INDEX IF NOT EXISTS idx_canary_tokens_last_triggered
 """
 
 
+# ---------------------------------------------------------------------------
+# Phase 3 schema additions — posture_runs + posture_test_results tables
+# (REQ-P0-P3-001, REQ-P0-P3-003)
+# ---------------------------------------------------------------------------
+#
+# posture_runs tracks each Atomic Red Team posture evaluation run.
+# posture_test_results tracks per-test fired_at timestamps for the scoring join.
+# Both created with CREATE TABLE IF NOT EXISTS — idempotent for all prior DBs
+# (DEC-SCHEMA-002).
+#
+# posture_runs columns:
+#   started_at     — ISO8601 timestamp when run_batch() was called.
+#   finished_at    — ISO8601 timestamp when all tests completed (NULL while running).
+#   technique_ids  — JSON array of technique IDs tested (e.g. ["T1059.003", "T1053.003"]).
+#   total_tests    — number of tests in the batch.
+#   passes         — number of tests that scored as a pass (cluster + deployed rule found).
+#   score          — passes / total_tests (REAL, 0.0–1.0).
+#   status         — 'running' | 'complete' | 'failed'.
+_POSTURE_RUNS_SQL = """
+CREATE TABLE IF NOT EXISTS posture_runs (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at     TEXT    NOT NULL,
+    finished_at    TEXT,
+    technique_ids  TEXT    NOT NULL DEFAULT '[]',
+    total_tests    INTEGER NOT NULL DEFAULT 0,
+    passes         INTEGER NOT NULL DEFAULT 0,
+    score          REAL    NOT NULL DEFAULT 0.0,
+    status         TEXT    NOT NULL DEFAULT 'running'
+                           CHECK(status IN ('running', 'complete', 'failed'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_posture_runs_started_at
+    ON posture_runs(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_posture_runs_status
+    ON posture_runs(status);
+"""
+
+# posture_test_results: per-test row recording fired_at for the scoring join.
+# Must be defined before init_db references it.
+_POSTURE_TEST_RESULTS_SQL = """
+CREATE TABLE IF NOT EXISTS posture_test_results (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id       INTEGER NOT NULL REFERENCES posture_runs(id),
+    technique_id TEXT    NOT NULL,
+    test_name    TEXT    NOT NULL DEFAULT '',
+    fired_at     TEXT    NOT NULL,
+    exit_code    INTEGER,
+    output       TEXT,
+    passed       INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_ptr_run_id ON posture_test_results(run_id);
+CREATE INDEX IF NOT EXISTS idx_ptr_fired_at ON posture_test_results(fired_at);
+"""
+
+
 def init_db(db_path: str) -> sqlite3.Connection:
     """Open (or create) the SQLite database and apply schema.
 
@@ -270,6 +326,12 @@ def init_db(db_path: str) -> sqlite3.Connection:
 
     # canary_tokens table (Phase 3, REQ-P0-P3-004) — idempotent.
     conn.executescript(_CANARY_TOKENS_SQL)
+
+    # posture_runs table (Phase 3, REQ-P0-P3-001) — idempotent.
+    conn.executescript(_POSTURE_RUNS_SQL)
+
+    # posture_test_results table (Phase 3, REQ-P0-P3-003) — idempotent.
+    conn.executescript(_POSTURE_TEST_RESULTS_SQL)
 
     conn.commit()
     log.info("Database initialised at %s", db_path)
@@ -978,3 +1040,249 @@ def count_threat_intel_records(conn: sqlite3.Connection) -> int:
     """
     row = conn.execute("SELECT COUNT(*) FROM threat_intel").fetchone()
     return int(row[0]) if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Posture Runs CRUD  (Phase 3 — REQ-P0-P3-001)
+# ---------------------------------------------------------------------------
+
+def insert_posture_run(
+    conn: sqlite3.Connection,
+    started_at: str,
+    technique_ids: list,
+    total_tests: int,
+) -> int:
+    """Insert a new posture_runs row with status='running' and return the row id.
+
+    Called at the start of run_batch() before any tests execute.
+
+    Args:
+        conn:          Open SQLite connection.
+        started_at:    ISO8601 timestamp when the run began.
+        technique_ids: List of technique ID strings being tested.
+        total_tests:   Total number of tests in this batch.
+
+    Returns:
+        The INTEGER PRIMARY KEY of the new row.
+    """
+    import json as _json
+    with get_cursor(conn) as cur:
+        cur.execute(
+            """
+            INSERT INTO posture_runs
+                (started_at, technique_ids, total_tests, passes, score, status)
+            VALUES (?, ?, ?, 0, 0.0, 'running')
+            """,
+            (started_at, _json.dumps(technique_ids), total_tests),
+        )
+        return cur.lastrowid
+
+
+def update_posture_run(
+    conn: sqlite3.Connection,
+    run_id: int,
+    finished_at: str,
+    passes: int,
+    score: float,
+    status: str,
+) -> None:
+    """Update a posture_runs row with final results.
+
+    Called after run_batch() completes (successfully or with failures).
+
+    Args:
+        conn:        Open SQLite connection.
+        run_id:      The posture_runs.id to update.
+        finished_at: ISO8601 timestamp when the run completed.
+        passes:      Number of tests that scored as a pass.
+        score:       passes / total_tests (0.0–1.0).
+        status:      'complete' or 'failed'.
+    """
+    with get_cursor(conn) as cur:
+        cur.execute(
+            """
+            UPDATE posture_runs
+               SET finished_at = ?,
+                   passes      = ?,
+                   score       = ?,
+                   status      = ?
+             WHERE id = ?
+            """,
+            (finished_at, passes, score, status, run_id),
+        )
+
+
+def get_posture_run(
+    conn: sqlite3.Connection,
+    run_id: int,
+) -> Optional[sqlite3.Row]:
+    """Return a single posture_runs row by id, or None.
+
+    Args:
+        conn:   Open SQLite connection.
+        run_id: The posture_runs.id to fetch.
+
+    Returns:
+        sqlite3.Row or None.
+    """
+    return conn.execute(
+        "SELECT * FROM posture_runs WHERE id = ?",
+        (run_id,),
+    ).fetchone()
+
+
+def get_latest_posture_run(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
+    """Return the most recently started posture_runs row, or None if no runs exist.
+
+    Used by /health to surface last_score and last_run_at.
+
+    Args:
+        conn: Open SQLite connection.
+
+    Returns:
+        sqlite3.Row (most recent row) or None.
+    """
+    return conn.execute(
+        "SELECT * FROM posture_runs ORDER BY started_at DESC LIMIT 1",
+    ).fetchone()
+
+
+def list_posture_runs(
+    conn: sqlite3.Connection,
+    limit: int = 50,
+    status: Optional[str] = None,
+) -> list[sqlite3.Row]:
+    """Return posture_runs rows, newest first, optionally filtered by status.
+
+    Args:
+        conn:   Open SQLite connection.
+        limit:  Maximum rows to return.
+        status: If given, restrict to rows with this status value.
+
+    Returns:
+        List of sqlite3.Row objects.
+    """
+    if status is not None:
+        return conn.execute(
+            "SELECT * FROM posture_runs WHERE status = ? ORDER BY started_at DESC LIMIT ?",
+            (status, limit),
+        ).fetchall()
+    return conn.execute(
+        "SELECT * FROM posture_runs ORDER BY started_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+
+def compute_posture_score_for_run(
+    conn: sqlite3.Connection,
+    run_id: int,
+) -> dict:
+    """Compute the posture score for a completed run via a SQL join.
+
+    Scoring rule (DEC-POSTURE-001):
+      A test "passes" when:
+        1. The test's fired_at timestamp falls inside a cluster's time window
+           (window_start <= fired_at <= window_end), AND
+        2. That cluster has at least one rule with deployed=1.
+
+    The join is done entirely in SQL to avoid pulling large rowsets into Python.
+    The posture_runs row is updated in place with the computed passes and score.
+
+    Args:
+        conn:   Open SQLite connection.
+        run_id: The posture_runs.id to score.
+
+    Returns:
+        Dict with keys: run_id, total_tests, passes, score.
+
+    @decision DEC-POSTURE-001
+    @title Posture pass = cluster window overlap AND deployed rule — pure SQL join
+    @status accepted
+    @rationale Implementing the scoring in SQL keeps it O(n log n) via indexes
+               rather than O(n*m) via Python-side nested loops. The join touches
+               posture_test_results (per-test fired_at), clusters (window bounds),
+               and rules (deployed flag). No Python-side filtering on large rowsets.
+               Edge cases (no cluster, cluster with no deployed rule) naturally
+               produce 0 passes from the LEFT JOIN returning NULLs.
+    """
+    # Fetch the run to get total_tests
+    run_row = get_posture_run(conn, run_id)
+    if run_row is None:
+        return {"run_id": run_id, "total_tests": 0, "passes": 0, "score": 0.0}
+
+    total_tests = run_row["total_tests"]
+    if total_tests == 0:
+        return {"run_id": run_id, "total_tests": 0, "passes": 0, "score": 0.0}
+
+    # Count passing tests: fired_at inside a cluster window AND that cluster
+    # has a deployed rule. Uses posture_test_results joined to clusters+rules.
+    row = conn.execute(
+        """
+        SELECT COUNT(DISTINCT ptr.id) AS passes
+          FROM posture_test_results ptr
+          JOIN clusters cl
+            ON ptr.fired_at >= cl.window_start
+           AND ptr.fired_at <= cl.window_end
+          JOIN rules r
+            ON r.cluster_id = cl.id
+           AND r.deployed    = 1
+         WHERE ptr.run_id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+
+    passes = int(row["passes"]) if row else 0
+    score = passes / total_tests if total_tests > 0 else 0.0
+
+    # Persist the computed values back to posture_runs
+    with get_cursor(conn) as cur:
+        cur.execute(
+            "UPDATE posture_runs SET passes = ?, score = ? WHERE id = ?",
+            (passes, score, run_id),
+        )
+
+    return {"run_id": run_id, "total_tests": total_tests, "passes": passes, "score": score}
+
+
+# ---------------------------------------------------------------------------
+# Posture Test Results CRUD  (Phase 3 — REQ-P0-P3-003)
+# ---------------------------------------------------------------------------
+#
+# Per-test tracking table for the scoring join in compute_posture_score_for_run.
+# Schema constant _POSTURE_TEST_RESULTS_SQL is defined above (before init_db)
+# so init_db can reference it. CRUD helpers follow here.
+
+def insert_posture_test_result(
+    conn: sqlite3.Connection,
+    run_id: int,
+    technique_id: str,
+    test_name: str,
+    fired_at: str,
+    exit_code: Optional[int] = None,
+    output: Optional[str] = None,
+) -> int:
+    """Insert a per-test result row and return its id.
+
+    Args:
+        conn:         Open SQLite connection.
+        run_id:       The parent posture_runs.id.
+        technique_id: MITRE technique ID (e.g. 'T1059.003').
+        test_name:    Human-readable test label.
+        fired_at:     ISO8601 timestamp when the test command was launched.
+        exit_code:    Shell exit code of the test command (None if not yet run).
+        output:       Captured stdout/stderr (truncated to 4096 chars).
+
+    Returns:
+        The new row's INTEGER PRIMARY KEY.
+    """
+    safe_output = (output or "")[:4096]
+    with get_cursor(conn) as cur:
+        cur.execute(
+            """
+            INSERT INTO posture_test_results
+                (run_id, technique_id, test_name, fired_at, exit_code, output, passed)
+            VALUES (?, ?, ?, ?, ?, ?, 0)
+            """,
+            (run_id, technique_id, test_name, fired_at, exit_code, safe_output),
+        )
+        return cur.lastrowid
