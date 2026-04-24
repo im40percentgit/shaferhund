@@ -71,6 +71,16 @@ class Settings(BaseSettings):
     # table. Defaults to 3600 (hourly) per MASTER_PLAN.md Phase 3 spec.
     urlhaus_fetch_interval_seconds: int = 3600
 
+    # Phase 3 — Canary tokens (REQ-P0-P3-004)
+    # Base URL for HTTP canary trap URLs. Override when Shaferhund is reachable
+    # at a public hostname so external attackers can reach the /canary/hit/{token}
+    # route. Defaults to localhost for local dev / test.
+    canary_base_url: str = "http://127.0.0.1:8000"
+    # Base hostname suffix for DNS canary traps. Tokens take the form
+    # {token}.{canary_base_hostname}. For DNS traps to fire, the hostname must
+    # be resolvable — configure a wildcard DNS record or Wazuh DNS monitoring.
+    canary_base_hostname: str = "canary.local"
+
     # Auto-deploy policy gate (Phase 2, REQ-P0-P2-006, DEC-AUTODEPLOY-001)
     # Default OFF — operator must explicitly enable via env var.
     AUTO_DEPLOY_ENABLED: bool = False

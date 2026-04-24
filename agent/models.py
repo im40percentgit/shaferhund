@@ -175,6 +175,39 @@ CREATE INDEX IF NOT EXISTS idx_threat_intel_type
 """
 
 
+
+# ---------------------------------------------------------------------------
+# Phase 3 schema additions — canary_tokens table (REQ-P0-P3-004)
+# ---------------------------------------------------------------------------
+#
+# Created with CREATE TABLE IF NOT EXISTS — idempotent for Phase 1/2/2.5/3
+# databases (per DEC-SCHEMA-002).
+#
+# Columns:
+#   token             — opaque URL-safe base64 string embedded in trap URL/hostname.
+#   type              — 'dns' or 'http'; CHECK constraint enforced at DB level.
+#   name              — operator-supplied label for this canary.
+#   created_at        — ISO8601 timestamp when the token was spawned.
+#   trigger_count     — number of times the trap has been hit (accumulated).
+#   last_triggered_at — ISO8601 timestamp of the most recent hit (NULL until first hit).
+_CANARY_TOKENS_SQL = """
+CREATE TABLE IF NOT EXISTS canary_tokens (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    token             TEXT    NOT NULL UNIQUE,
+    type              TEXT    NOT NULL CHECK(type IN ('dns', 'http')),
+    name              TEXT    NOT NULL DEFAULT '',
+    created_at        TEXT    NOT NULL,
+    trigger_count     INTEGER NOT NULL DEFAULT 0,
+    last_triggered_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_canary_tokens_token
+    ON canary_tokens(token);
+CREATE INDEX IF NOT EXISTS idx_canary_tokens_last_triggered
+    ON canary_tokens(last_triggered_at);
+"""
+
+
 def init_db(db_path: str) -> sqlite3.Connection:
     """Open (or create) the SQLite database and apply schema.
 
@@ -234,6 +267,9 @@ def init_db(db_path: str) -> sqlite3.Connection:
 
     # threat_intel table (Phase 3, REQ-P0-P3-005) — idempotent.
     conn.executescript(_THREAT_INTEL_SQL)
+
+    # canary_tokens table (Phase 3, REQ-P0-P3-004) — idempotent.
+    conn.executescript(_CANARY_TOKENS_SQL)
 
     conn.commit()
     log.info("Database initialised at %s", db_path)
