@@ -621,6 +621,206 @@ shaferhund/
 | DEC-REDTEAM-004 | `POST /posture/run` inserts the `posture_runs` row synchronously before spawning the asyncio background task, so the caller receives a valid `run_id` immediately and avoids a poll-before-row race; SQLite WAL mode lets concurrent readers see the committed row before the task completes. Annotated at `agent/main.py:711` | accepted |
 | DEC-REDTEAM-005 | `redteam-target` container ships Wazuh agent installed but NOT enrolled at build time; enrollment is a runtime operator step (`agent-auth -m wazuh.manager` after first compose up), avoiding build-time secrets and matching Wazuh 4.x recommended workflow. Annotated in `compose.yaml` | accepted |
 
+## Phase 4: Adaptive Immune System (3–4 weeks after Phase 3)
+
+**Status:** planned
+**Timebox:** 3–4 weeks
+
+### Intent
+
+Phase 3 gave the platform an immune system — a scheduled, deterministic loop of attack → measure → score. The agent now knows when its posture is weak, but it does not yet **decide** what to do about it. Phase 4 closes that decision loop. The agent gains the ability to recommend which Atomic Red Team techniques to run next based on posture gaps and cluster history, an operator-gated `redteam-runner` mode that executes those recommendations, and a posture SLO that pages when the score drops below threshold. The orchestrator's tool registry is refactored from the direct `TOOLS`-list patch pattern (DEC-ORCH-005) to a dynamic registration mechanism — necessary technical debt before crossing the 8-tool boundary, and the unblocking refactor for every future phase.
+
+This is the conceptual unlock the Original Intent (line 5) names directly: *"a self-evolving offensive-defensive loop that attacks its own infrastructure, finds gaps, writes rules, and retests... an immune system, not a tool"*. Phase 1 built the triage. Phase 2 built the agent loop. Phase 2.5 closed the rule-deploy hands. Phase 3 built the measuring half (eyes that look inward). **Phase 4 builds the deciding half** — Claude becomes the conductor of the offensive-defensive feedback loop, not just the analyst at its end.
+
+The phase is deliberately scoped to one new capability domain (agent-driven red team) plus one cross-cutting refactor (dynamic tool registration) plus one SRE-grade addition (posture SLO + paging). Cloud log ingestion, rule fleet distribution, containerised honeypots, threat-intel federation, and adversarial rule scoring are explicitly deferred to Phase 5+ — each is a real week of work and will not be rushed into a fused 6-month phase that never closes.
+
+### Goals
+- Orchestrator gains `recommend_attack` tool — Claude proposes ART techniques based on posture gaps + cluster history (REQ-P0-P4-001)
+- New `redteam-runner` execution mode reads recommendations and runs them with operator gating for destructive techniques (REQ-P0-P4-002)
+- Posture score becomes adaptive — technique weights influenced by Claude's relevance judgment, not flat-uniform (REQ-P0-P4-003)
+- Orchestrator tool registration refactored from direct `TOOLS`-list patch to dynamic `register_tool()` API (REQ-P0-P4-004)
+- Posture SLO with paging — when score drops below `POSTURE_SLO_THRESHOLD` for N consecutive runs, fire a webhook (REQ-P0-P4-005)
+- All Phase 1, Phase 2, Phase 2.5, Phase 3 tests pass unchanged (REQ-P0-P4-006)
+
+### Non-Goals
+- REQ-NOGO-P4-001: Cloud log source ingestion (AWS CloudTrail / GCP Audit / Azure Monitor) — Phase 5; needs real-footprint validation per the recurring "fixture-only testing is insufficient" constraint
+- REQ-NOGO-P4-002: Rule fleet distribution (signed pull, multi-agent rollout, version pinning) — Phase 5; orthogonal to the immune-system loop
+- REQ-NOGO-P4-003: Containerised service honeypots (SSH, MySQL, Redis) — Phase 6; doubles attack surface and needs separate isolation analysis
+- REQ-NOGO-P4-004: STIX/TAXII threat-intel federation (multiple feeds, indicator deconfliction) — Phase 6; URLhaus is sufficient for the timebox
+- REQ-NOGO-P4-005: Adversarial rule-effectiveness scoring (evasion variants, ART payload mutation) — Phase 6; depends on a stable `recommend_attack` baseline first
+- REQ-NOGO-P4-006: Multi-tenant posture / per-team scoring / RBAC — Phase 7; still solo-dev scale
+- REQ-NOGO-P4-007: Multi-user auth / signed audit logs (REQ-NOGO-P2-006 carry-forward) — Phase 7
+- REQ-NOGO-P4-008: Replacing the existing `redteam-target` Ubuntu container with a Windows or macOS target — Phase 6; broadens technique coverage but requires separate licensing and image strategy
+
+### Requirements
+
+**Must-Have (P0)**
+
+- REQ-P0-P4-001: 8th orchestrator tool `recommend_attack(posture_gap_summary)` returns a structured `{techniques: [{technique_id, rationale, priority}], confidence}`. Read-only — never executes; only writes to a new `attack_recommendations` table for operator review.
+  - Acceptance: a unit test seeds a posture run with two failing technique IDs, drives a triage loop, and verifies (a) `recommend_attack` appears in the tool transcript, (b) the returned techniques include at least one of the failing IDs in its rationale, (c) the recommendation persists in `attack_recommendations` with `status='pending'`.
+- REQ-P0-P4-002: `POST /redteam/recommendations/{id}/approve` accepts an operator confirmation; `redteam-runner` then executes the recommended techniques via the existing `red_team.run_batch` path. Destructive techniques (a hardcoded allowlist set in `agent/red_team.py:DESTRUCTIVE_TECHNIQUES`) require explicit `force=true` in the approval body. Default behaviour for any unknown technique is **non-destructive only** — fail-closed.
+  - Acceptance: approving a non-destructive recommendation triggers a posture run; approving a destructive one without `force=true` returns 409; with `force=true` it runs.
+- REQ-P0-P4-003: `posture_runs.score` calculation gains a `weighted_score` column derived from per-technique weights stored in `attack_recommendations.priority`. Existing flat-pass-rate score remains as `score` for backwards compat. `/health` exposes both `posture.last_score` (flat) and `posture.last_weighted_score`.
+  - Acceptance: a synthetic run with three techniques weighted [0.5, 0.3, 0.2] where only the highest-weighted one passes yields `weighted_score=0.5` while flat `score=1/3≈0.33`.
+- REQ-P0-P4-004: `agent/orchestrator.py` exposes a public `register_tool(spec, handler, requires_conn)` API. The 7 existing tools register through this API at module load. `TOOLS` and `_TOOL_DISPATCH` become module-private build artifacts populated by `register_tool` calls — no external code mutates them. The 8th tool (`recommend_attack`) lands via `register_tool` in the same way the existing 7 are migrated. The closure-factory pattern (`make_read_tool_handlers`, `make_write_tool_handlers`) is preserved — `register_tool` declares the dependency set, the factories build the closures.
+  - Acceptance: a unit test imports `register_tool`, registers a synthetic tool with a stub handler, drives `run_triage_loop` with a mocked Anthropic client that calls the synthetic tool, and verifies the handler executes. The 7 pre-existing tools continue to function with no behavioural change. `grep -r "TOOLS\.append\|_TOOL_DISPATCH\[" agent/` returns zero hits outside `orchestrator.py` itself.
+- REQ-P0-P4-005: `POSTURE_SLO_THRESHOLD` (float, default 0.7) and `POSTURE_SLO_CONSECUTIVE_RUNS` (int, default 3). Background asyncio Task evaluates after each posture run; if the last N runs all scored below threshold, POST a JSON payload to `POSTURE_SLO_WEBHOOK_URL` (env var, optional). Idempotency: each breach fires once until score recovers above threshold for one run.
+  - Acceptance: with threshold=0.7, consecutive=3, three sub-threshold runs trigger one webhook POST (verified via mock httpx). A fourth sub-threshold run does NOT re-fire. A run at 0.8 resets the counter; the next sub-threshold streak does fire again.
+- REQ-P0-P4-006: All Phase 1 / Phase 2 / Phase 2.5 / Phase 3 tests pass unchanged. ≥1 new unit test per P0 capability above.
+
+**Nice-to-Have (P1)**
+
+- REQ-P1-P4-001: Dashboard `/redteam/recommendations` page — list pending recommendations with technique_id, rationale, priority, approve/dismiss actions (HTMX, no SPA).
+- REQ-P1-P4-002: `recommend_attack` tool consults `threat_intel` for IOCs from recent failing clusters and incorporates them into the rationale (e.g. "URLhaus shows two recent C2 domains using T1059.003 — recommend testing PowerShell coverage").
+- REQ-P1-P4-003: SLO breach payload includes a 30-day score sparkline (small ASCII or base64 SVG) so the paging channel gets actionable context without a dashboard click-through.
+- REQ-P1-P4-004: `register_tool` accepts an optional `requires_capabilities=['threat_intel']` declaration; if a capability is unavailable at startup (e.g. URLhaus poller failed), the tool is silently dropped from `TOOLS`. Lays groundwork for future tools that depend on optional infrastructure.
+
+**Future Consideration (P2)**
+
+- REQ-P2-P4-001: Cloud log source ingestion (first provider, AWS CloudTrail) — Phase 5
+- REQ-P2-P4-002: Rule fleet distribution (signed pull from a single shaferhund agent to N remote Wazuh agents) — Phase 5
+- REQ-P2-P4-003: Containerised service honeypots (SSH/MySQL/Redis) — Phase 6
+- REQ-P2-P4-004: STIX/TAXII threat-intel federation (multi-feed, indicator deconfliction) — Phase 6
+- REQ-P2-P4-005: Adversarial rule-effectiveness scoring (evasion variants, payload mutation) — Phase 6
+- REQ-P2-P4-006: Multi-tenant posture / RBAC / signed audit logs — Phase 7
+
+### Architecture
+
+```
+[Phase 3 surface, unchanged: Wazuh + Suricata + canary + threat_intel + scheduled ART]
+                              |
+                              v
+                   [posture_runs table]
+                              |
+                              v
+                     posture-gap query
+              (recent low-score runs grouped by technique)
+                              |
+                              v
+              [Triage Queue → Orchestrator Tool Loop]
+                tools (now 8, registered via register_tool):
+                  - get_cluster_context        [read]
+                  - search_related_alerts      [read]
+                  - check_threat_intel         [read]
+                  - write_yara_rule            [write]
+                  - write_sigma_rule           [write]
+                  - recommend_deploy           [write]
+                  - finalize_triage            [write, terminal]
+                  - recommend_attack           [write, NEW] ──┐
+                                                              |
+                              v                               v
+              [Policy Gate]                        [attack_recommendations table]
+                              |                       (status: pending|approved|dismissed)
+                              v                               |
+              [/rules/ + deploy_events]                       |
+                              |                               |
+                              v                               v
+                   [posture_runs join]                [Operator Review UI]
+                  + weighted_score column            (HTMX, /redteam/recommendations)
+                              |                               |
+                              v                               v
+                   [Posture SLO Evaluator]             [POST /redteam/recommendations/{id}/approve]
+                  (consecutive sub-threshold runs)            |
+                              |                               v
+                              v                       [redteam-runner: run_batch]
+                   [POSTURE_SLO_WEBHOOK_URL]          (existing Phase 3 path, force= for destructive)
+                  (one POST per breach window)                |
+                                                              v
+                                                   [Wazuh tailer → posture_runs]
+                                                   (loop closes — gap addressed or persists)
+```
+
+### Stack Delta vs Phase 3
+- **No new containers.** All Phase 4 work lands in the existing `shaferhund-agent` and reuses `redteam-target` from Phase 3.
+- **No new Python libraries.** Webhook delivery uses existing `httpx` (already in requirements for URLhaus). Dynamic tool registration is pure Python.
+- **New env vars:** `POSTURE_SLO_THRESHOLD` (default 0.7), `POSTURE_SLO_CONSECUTIVE_RUNS` (default 3), `POSTURE_SLO_WEBHOOK_URL` (optional), `REDTEAM_DESTRUCTIVE_ALLOW` (default empty — explicit allowlist for `force=true` techniques)
+- **New table:** `attack_recommendations (id, generated_at, technique_id, rationale, priority REAL, status, approved_at, executed_at, posture_run_id)` — idempotent ALTER per DEC-SCHEMA-002
+- **Extended table:** `posture_runs` gains `weighted_score REAL NULL` column (idempotent ADD COLUMN)
+
+### Eng Review Decisions
+
+1. **`recommend_attack` is read-only-from-Claude's-perspective.** It writes to `attack_recommendations` but executes nothing — execution requires an explicit operator HTTP POST. Self-attacking infrastructure without human approval is a hard line we don't cross in Phase 4 even though the loop conceptually invites it; pushing the gate to operator approval keeps the system auditable and makes the Claude call cheap to retry.
+2. **Destructive technique allowlist is a frozenset in code, not a config file.** Operator `force=true` is the only path to running a destructive technique; the set is reviewed at code-review time, not runtime. Eliminates the "operator can YOLO any technique through env var" risk class.
+3. **Dynamic tool registration via `register_tool(spec, handler, requires_conn)`** — extends the closure-factory pattern at `agent/orchestrator.py:674` rather than replacing it. The factories live, but `TOOLS` and `_TOOL_DISPATCH` become *outputs* of registration calls, not hand-edited lists. This is the smallest refactor that satisfies REQ-NOGO-P3-008 and unblocks Phase 5+ tools.
+4. **`weighted_score` is additive, not replacement.** Flat `score` stays in `posture_runs` for backwards compat with Phase 3 dashboards and the existing `/health` field. Operators see both. This avoids a breaking schema change and lets us A/B the two scoring methods in real conditions before any future phase makes weighted the canonical metric.
+5. **Posture SLO uses a webhook, not a paging integration.** PagerDuty / OpsGenie / Slack each have their own auth model; a generic webhook URL keeps the integration footprint zero and lets operators bridge to whatever they already use. The payload schema is documented; integration adapters are a Phase 5+ concern.
+6. **SLO breach idempotency tracked in a new `slo_breaches` row, not in-memory.** A restart mid-breach must not re-fire. Recovery (one run above threshold) closes the breach row; the next streak opens a fresh row. Same idempotency pattern as `deploy_events`.
+7. **`recommend_attack` runs inside the existing 5-tool-call / 10s-wall caps.** No new caps, no parallel orchestrator. If the loop runs out of budget after writing rules and lands the recommendation in turn 6+, it gets dropped — Claude must prioritise. This forces the right behaviour: rules first, recommendations second.
+8. **Posture-gap context is pre-computed and injected into the system prompt at loop start**, not fetched via a tool. Tool calls are expensive (Claude turn + DB round-trip); the gap summary is small, deterministic, and known up-front. This is the same reasoning as DEC-ORCH-004 (instructions in system prompt) applied to context.
+9. **No retry on webhook failure.** A transient failure means the operator misses one breach signal — but the breach record persists, so the next posture run will include it in the next webhook payload. Retries with backoff create a separate failure mode (delayed pages bunched together) that's worse than missing one.
+10. **Migration of existing 7 tools to `register_tool` is mechanical, not redesigned.** Every existing tool's spec dict and dispatch entry is converted 1:1 to a `register_tool` call. No tool gets a new schema, new caps, or new behaviour. The refactor is invisible from outside `orchestrator.py`.
+11. **`attack_recommendations.priority` defaults to 1/N where N=count(recommendations in same triage run).** Claude can override by returning explicit priority floats summing to ≤1.0. If they don't sum, we normalise. Removes the "Claude returns priority=999 for everything" footgun.
+12. **`weighted_score` calculation is in SQL, not Python**, mirroring the Phase 3 `compute_posture_score_for_run` pattern at `agent/red_team.py`. Keeps scoring auditable via `EXPLAIN QUERY PLAN` and avoids round-tripping rows through Python for what is fundamentally a `SUM(passed * weight) / SUM(weight)`.
+
+### Files to Create / Update
+
+```
+shaferhund/
+  .env.example                              # (UPDATE) document Phase 4 env vars
+  agent/
+    orchestrator.py                         # (UPDATE) register_tool() API; migrate 7 tools to it; add recommend_attack as 8th tool via the new API; preserve closure factories
+    red_team.py                             # (UPDATE) DESTRUCTIVE_TECHNIQUES frozenset; weighted_score helper; posture-gap query for system-prompt injection
+    posture_slo.py                          # (NEW) SLO evaluator + breach idempotency + webhook poster
+    recommendations.py                      # (NEW) attack_recommendations CRUD + approval flow + execution dispatch
+    models.py                               # (UPDATE) attack_recommendations + slo_breaches tables; weighted_score column on posture_runs; helpers
+    main.py                                 # (UPDATE) /redteam/recommendations, /redteam/recommendations/{id}/approve routes; SLO evaluator background Task in lifespan; /health adds posture.last_weighted_score + slo.last_breach_at
+    config.py                               # (UPDATE) POSTURE_SLO_THRESHOLD, POSTURE_SLO_CONSECUTIVE_RUNS, POSTURE_SLO_WEBHOOK_URL, REDTEAM_DESTRUCTIVE_ALLOW
+    templates/
+      recommendations.html                  # (NEW, P1) pending recommendations list + approve action
+  tests/
+    test_register_tool.py                   # (NEW) register_tool API + 7-tool migration regression
+    test_recommend_attack.py                # (NEW) tool transcript + persistence
+    test_recommendation_approval.py         # (NEW) approve flow + destructive gate (force=true)
+    test_weighted_score.py                  # (NEW) priority weighting matrix
+    test_posture_slo.py                     # (NEW) consecutive-run breach detection + idempotency
+    test_slo_webhook.py                     # (NEW) mock httpx webhook delivery + payload shape
+    fixtures/
+      recommend_attack_response.json        # (NEW) golden Claude response for tool replay
+      slo_breach_payload.json               # (NEW) expected webhook JSON shape
+```
+
+### Success Criteria
+- `podman compose up` brings up the existing 5-service stack (Phase 4 adds no containers); container logs show `register_tool` invocations for 8 tools at startup
+- A scripted scenario (sub-threshold posture run × 3) produces exactly one webhook POST with the expected JSON shape; a recovery run resets the breach state
+- `POST /redteam/recommendations/{id}/approve` with a non-destructive technique triggers a real ART batch run; the same call with a destructive technique returns 409 unless `force=true`
+- Orchestrator transcript on a synthetic cluster shows `recommend_attack` called and persisted to `attack_recommendations` with `status='pending'`
+- `/health` reports both `posture.last_score` and `posture.last_weighted_score`; the two diverge predictably on a weighted-test fixture
+- `grep -r "TOOLS\.append\|_TOOL_DISPATCH\[" agent/` returns zero hits outside `agent/orchestrator.py`
+- Phase 1 / Phase 2 / Phase 2.5 / Phase 3 tests pass unchanged; all new Phase 4 tests pass
+
+### GitHub Issues
+
+- **Wave A (parallel — no inter-dependencies):**
+  - REQ-P0-P4-004 — `register_tool` API + 7-tool migration (`feature/phase4-register-tool`)
+  - REQ-P0-P4-003 — `weighted_score` column + SQL helper + `/health` field (`feature/phase4-weighted-score`)
+  - REQ-P0-P4-005 — Posture SLO evaluator + webhook + idempotency (`feature/phase4-posture-slo`)
+- **Wave B (depends on Wave A `register_tool`):**
+  - REQ-P0-P4-001 — `recommend_attack` tool + `attack_recommendations` table (`feature/phase4-recommend-attack`)
+  - REQ-P0-P4-002 — recommendation approval route + destructive allowlist + execution dispatch (`feature/phase4-approval-flow`)
+- **Wave C (gate, blocked by Wave A + B):**
+  - REQ-P0-P4-006 — zero-regression gate across all prior phases; final integration smoke (`feature/phase4-regression-gate`)
+- **Wave D (P1, parallelizable after Wave B; only if timebox allows):**
+  - REQ-P1-P4-001 — `/redteam/recommendations` HTMX dashboard (`feature/phase4-recs-dashboard`)
+  - REQ-P1-P4-002 — `recommend_attack` consults `threat_intel` for IOC context (`feature/phase4-recs-threat-intel`)
+  - REQ-P1-P4-003 — Sparkline in SLO breach payload (`feature/phase4-slo-sparkline`)
+  - REQ-P1-P4-004 — `requires_capabilities` for register_tool (`feature/phase4-capability-gating`)
+
+### Decision Log
+
+| ID | Title | Status |
+|----|-------|--------|
+| DEC-ORCH-006 | `register_tool(spec, handler, requires_conn)` API replaces direct `TOOLS`/`_TOOL_DISPATCH` mutation; preserves closure-factory pattern | planned |
+| DEC-RECOMMEND-001 | `recommend_attack` writes to `attack_recommendations` only; execution requires explicit operator approval HTTP POST | planned |
+| DEC-RECOMMEND-002 | Destructive technique allowlist as a code-resident frozenset; `force=true` is the only runtime path to bypass | planned |
+| DEC-RECOMMEND-003 | Priority defaults to 1/N normalisation when Claude returns malformed weights | planned |
+| DEC-POSTURE-003 | `weighted_score` is additive to flat `score`; both persisted; SQL-based calculation per DEC-POSTURE-001 pattern | planned |
+| DEC-SLO-001 | Generic webhook (not paging-vendor-specific); operators bridge externally | planned |
+| DEC-SLO-002 | Idempotency via `slo_breaches` table; one POST per breach window; recovery closes the row | planned |
+| DEC-SLO-003 | No retry on webhook failure; the next breach evaluation re-includes the missed run if still sub-threshold | planned |
+| DEC-RECOMMEND-004 | Posture-gap context injected into system prompt at loop start, not fetched via a tool — same reasoning as DEC-ORCH-004 | planned |
+| DEC-ORCH-007 | Migration of existing 7 tools to `register_tool` is mechanical 1:1; no behavioural changes; refactor invisible from outside `orchestrator.py` | planned |
+| DEC-RECOMMEND-005 | Cloud log + rule fleet + honeypots + STIX/TAXII + adversarial scoring all explicitly deferred to Phase 5+; Phase 4 stays scoped to one capability + one refactor + one SRE feature | planned |
+
 ## TODOs
 - [ ] Convert `hund` to `ROADMAP.md` (map 25 domains to phases)
-- [ ] Phase 4 scoping: agent-driven red team, containerised honeypots, threat-intel federation, rule fleet distribution, cloud log source ingestion (first provider) + multi-cloud coverage, dynamic orchestrator tool registration, posture SLO with paging
+- [ ] Phase 5+ scoping: cloud log source ingestion (first provider, likely AWS CloudTrail) + multi-cloud coverage; rule fleet distribution to remote Wazuh agents; containerised service honeypots (SSH/MySQL/Redis); STIX/TAXII threat-intel federation; adversarial rule-effectiveness scoring (evasion variants); multi-tenant posture + RBAC + signed audit logs (REQ-NOGO-P2-006 carry-forward)
