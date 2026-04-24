@@ -440,8 +440,10 @@ shaferhund/
 
 ## Phase 3: Immune System (2–3 weeks after Phase 2.5)
 
-**Status:** planned
+**Status:** completed
 **Timebox:** 2–3 weeks
+**Landed:** 2026-04-24 across PRs #37, #38, #39 (all squash-merged from `feature/phase3-*` branches; final commit `4e01640`)
+**Verified:** 2026-04-24 via Phase 3 zero-regression gate (issue #36): 180 passed / 1 skipped / 0 failed; `/health` integrates `{threat_intel, canary, posture}` keys cleanly; DB migration Phase 2.5 → Phase 3 idempotent; compose.yaml integrates `redteam-target` for 5 services total.
 
 ### Intent
 
@@ -605,14 +607,19 @@ shaferhund/
 
 | ID | Title | Status |
 |----|-------|--------|
-| DEC-REDTEAM-001 | External scheduled ART harness (not Claude-driven) | planned |
-| DEC-POSTURE-001 | Posture score = ART pass rate (deployed-rule coverage over total tests) | planned |
-| DEC-CANARY-001 | DNS + HTTP canary tokens only; service honeypots deferred to Phase 4 | planned |
-| DEC-THREATINTEL-001 | URLhaus only; STIX/TAXII federation deferred | planned |
-| DEC-ORCH-004 | `check_threat_intel` added via direct TOOLS patch (no dynamic registration refactor) | planned |
-| DEC-REDTEAM-002 | Declarative `atomic_tests.yaml`; no full ART auto-discovery | planned |
-| DEC-CANARY-002 | Canary events enter via existing `_persist_and_enqueue`; `source='canary'` | planned |
-| DEC-POSTURE-002 | Phase 3 P0 ships even if Phase 2.5 Sigma slips; YARA-biased score acceptable as interim | planned |
+| DEC-REDTEAM-001 | External scheduled ART harness (not Claude-driven) | accepted |
+| DEC-POSTURE-001 | Posture score = ART pass rate (deployed-rule coverage over total tests) | accepted |
+| DEC-CANARY-001 | DNS + HTTP canary tokens only; service honeypots deferred to Phase 4 | accepted |
+| DEC-THREATINTEL-001 | URLhaus only; STIX/TAXII federation deferred | accepted |
+| DEC-ORCH-004 | `check_threat_intel` added via direct TOOLS patch (no dynamic registration refactor) | accepted |
+| DEC-REDTEAM-002 | Declarative `atomic_tests.yaml`; no full ART auto-discovery | accepted |
+| DEC-CANARY-002 | Canary events enter via existing `_persist_and_enqueue`; `source='canary'` | accepted |
+| DEC-POSTURE-002 | Phase 3 P0 ships even if Phase 2.5 Sigma slips; YARA-biased score acceptable as interim | accepted |
+| DEC-ORCH-005 | 7th orchestrator tool added via direct `TOOLS` list patch + `make_read_tool_handlers` closure factory + `_TOOL_DISPATCH` entry; validates the scaling pattern, dynamic-registration refactor remains a Phase 4 item (REQ-NOGO-P3-008). Annotated at `agent/orchestrator.py:84` and `agent/threat_intel.py:20` | accepted |
+| DEC-CANARY-003 | Canary spawn/hit split: `agent/canary.py` owns DB helpers and pure functions; HTTP wiring (`POST /canary/spawn`, `GET /canary/hit/{token}`) stays in `agent/main.py` next to other route handlers — keeps the canary module testable without TestClient overhead. Annotated at `agent/canary.py:43` | accepted |
+| DEC-REDTEAM-003 | `run_batch` accepts an injectable `executor` callable so unit tests can mock subprocess invocation without monkey-patching; real path uses `subprocess.run([... podman exec ...])`. Annotated in `agent/red_team.py` | accepted |
+| DEC-REDTEAM-004 | `POST /posture/run` inserts the `posture_runs` row synchronously before spawning the asyncio background task, so the caller receives a valid `run_id` immediately and avoids a poll-before-row race; SQLite WAL mode lets concurrent readers see the committed row before the task completes. Annotated at `agent/main.py:711` | accepted |
+| DEC-REDTEAM-005 | `redteam-target` container ships Wazuh agent installed but NOT enrolled at build time; enrollment is a runtime operator step (`agent-auth -m wazuh.manager` after first compose up), avoiding build-time secrets and matching Wazuh 4.x recommended workflow. Annotated in `compose.yaml` | accepted |
 
 ## TODOs
 - [ ] Convert `hund` to `ROADMAP.md` (map 25 domains to phases)
