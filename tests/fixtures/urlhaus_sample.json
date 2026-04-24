@@ -1,0 +1,41 @@
+{
+  "query_status": "ok",
+  "urls": [
+    {
+      "id": "2801234",
+      "url_status": "online",
+      "date_added": "2026-04-20 10:00:00 UTC",
+      "url": "http://malware.example.com/payload.exe",
+      "last_online": "2026-04-24 08:00:00 UTC",
+      "threat": "malware_download",
+      "tags": ["Emotet", "TA542"],
+      "urlhaus_reference": "https://urlhaus.abuse.ch/url/2801234/",
+      "reporter": "abuse_reporter_1",
+      "payload_md5": "d41d8cd98f00b204e9800998ecf8427e"
+    },
+    {
+      "id": "2801235",
+      "url_status": "online",
+      "date_added": "2026-04-21 14:30:00 UTC",
+      "url": "http://c2.badactor.net/gate.php",
+      "last_online": "2026-04-24 07:45:00 UTC",
+      "threat": "botnet_cc",
+      "tags": ["Qakbot"],
+      "urlhaus_reference": "https://urlhaus.abuse.ch/url/2801235/",
+      "reporter": "abuse_reporter_2",
+      "payload_md5": ""
+    },
+    {
+      "id": "2801236",
+      "url_status": "online",
+      "date_added": "2026-04-22 09:15:00 UTC",
+      "url": "http://filehost.shady.ru/dropper.bin",
+      "last_online": "2026-04-23 22:00:00 UTC",
+      "threat": "malware_download",
+      "tags": ["AgentTesla"],
+      "urlhaus_reference": "https://urlhaus.abuse.ch/url/2801236/",
+      "reporter": "abuse_reporter_3",
+      "payload_md5": "5d41402abc4b2a76b9719d911017c592"
+    }
+  ]
+}
