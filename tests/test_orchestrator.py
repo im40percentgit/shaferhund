@@ -73,12 +73,13 @@ from agent.orchestrator import (
     TOOLS,
     _check_yara_syntax,
     _handle_finalize_triage,
+    _handle_get_cluster_context,
     _handle_recommend_deploy,
+    _handle_search_related_alerts,
     _handle_write_sigma_rule,
     _handle_write_yara_rule,
     build_cluster_context_prompt,
-    make_read_tool_handlers,
-    make_write_tool_handlers,
+    dispatch,
     run_triage_loop,
 )
 from agent.triage import TriageResult
@@ -300,15 +301,14 @@ def test_failsafe_on_end_turn_without_finalize():
 # ---------------------------------------------------------------------------
 
 def test_no_conn_write_stubs_return_error():
-    """When run_triage_loop is called without conn, write tools return error JSON to Claude.
+    """When dispatch() is called without conn, write tools return error JSON to Claude.
 
-    This verifies the _TOOL_DISPATCH fallback stubs return informative errors
-    rather than crashing, so Claude can gracefully proceed to finalize_triage.
+    This verifies that dispatch() returns informative error JSON (not a crash)
+    for DB-dependent tools when conn=None, so Claude can gracefully proceed to
+    finalize_triage.  Uses the new dispatch() API (DEC-ORCH-006).
     """
-    from agent.orchestrator import _TOOL_DISPATCH
-
     for tool_name in ("write_yara_rule", "write_sigma_rule", "recommend_deploy"):
-        result = _TOOL_DISPATCH[tool_name]({})
+        result = dispatch(tool_name, {}, conn=None)
         parsed = json.loads(result)
         assert "error" in parsed, f"{tool_name} no-conn stub should return error JSON"
         assert "database connection" in parsed["error"].lower() or "conn" in parsed["error"]
@@ -365,8 +365,7 @@ def test_get_cluster_context_returns_summary():
     conn = _make_db()
     _seed_cluster(conn, "cluster-ctx-001", src_ip="10.1.2.3", rule_id=5501)
 
-    handlers = make_read_tool_handlers(conn)
-    result_json = handlers["get_cluster_context"]({"cluster_id": "cluster-ctx-001"})
+    result_json = _handle_get_cluster_context({"cluster_id": "cluster-ctx-001"}, conn)
     result = json.loads(result_json)
 
     assert result.get("cluster_id") == "cluster-ctx-001"
@@ -395,8 +394,7 @@ def test_get_cluster_context_not_found():
     """Handler returns an error JSON when the cluster_id does not exist."""
     conn = _make_db()
 
-    handlers = make_read_tool_handlers(conn)
-    result_json = handlers["get_cluster_context"]({"cluster_id": "bogus-99999"})
+    result_json = _handle_get_cluster_context({"cluster_id": "bogus-99999"}, conn)
     result = json.loads(result_json)
 
     assert "error" in result
@@ -424,9 +422,8 @@ def test_search_related_alerts_cross_source():
     conn.execute("UPDATE alerts SET source = 'suricata' WHERE id = 'sur-001'")
     conn.commit()
 
-    handlers = make_read_tool_handlers(conn)
-    result_json = handlers["search_related_alerts"](
-        {"src_ip": src_ip, "time_range_hours": 24}
+    result_json = _handle_search_related_alerts(
+        {"src_ip": src_ip, "time_range_hours": 24}, conn
     )
     result = json.loads(result_json)
 
@@ -449,9 +446,8 @@ def test_search_related_alerts_no_results():
     """Handler returns total_count=0 and empty by_source for an IP with no alerts."""
     conn = _make_db()
 
-    handlers = make_read_tool_handlers(conn)
-    result_json = handlers["search_related_alerts"](
-        {"src_ip": "203.0.113.255", "time_range_hours": 24}
+    result_json = _handle_search_related_alerts(
+        {"src_ip": "203.0.113.255", "time_range_hours": 24}, conn
     )
     result = json.loads(result_json)
 
@@ -472,11 +468,10 @@ def test_write_yara_rule_persists_valid():
     cluster_id = "cluster-yara-valid"
     _seed_cluster(conn, cluster_id)
 
-    handlers = make_write_tool_handlers(conn, cluster_id)
-    result_json = handlers["write_yara_rule"]({
+    result_json = _handle_write_yara_rule({
         "content": 'rule TestRule { strings: $s = "test" condition: $s }',
         "description": "Detects test string",
-    })
+    }, conn, cluster_id)
     result = json.loads(result_json)
 
     assert result["rule_type"] == "yara"
@@ -506,11 +501,10 @@ def test_write_yara_rule_persists_invalid():
     cluster_id = "cluster-yara-invalid"
     _seed_cluster(conn, cluster_id)
 
-    handlers = make_write_tool_handlers(conn, cluster_id)
-    result_json = handlers["write_yara_rule"]({
+    result_json = _handle_write_yara_rule({
         "content": "rule BrokenRule { condition: undefined_var }",
         "description": "Broken rule",
-    })
+    }, conn, cluster_id)
     result = json.loads(result_json)
 
     assert result["rule_type"] == "yara"
@@ -552,11 +546,10 @@ detection:
 level: high
 """
 
-    handlers = make_write_tool_handlers(conn, cluster_id)
-    result_json = handlers["write_sigma_rule"]({
+    result_json = _handle_write_sigma_rule({
         "content": sigma_yaml,
         "description": "Detects mimikatz usage",
-    })
+    }, conn, cluster_id)
     result = json.loads(result_json)
 
     assert result["rule_type"] == "sigma"
@@ -584,11 +577,10 @@ def test_write_sigma_rule_empty_content():
     cluster_id = "cluster-sigma-empty"
     _seed_cluster(conn, cluster_id)
 
-    handlers = make_write_tool_handlers(conn, cluster_id)
-    result_json = handlers["write_sigma_rule"]({
+    result_json = _handle_write_sigma_rule({
         "content": "   ",
         "description": "empty",
-    })
+    }, conn, cluster_id)
     result = json.loads(result_json)
 
     assert "error" in result
@@ -611,11 +603,10 @@ def test_recommend_deploy_records_event():
     cluster_id = "cluster-deploy-rec"
     _seed_cluster(conn, cluster_id)
 
-    handlers = make_write_tool_handlers(conn, cluster_id)
-    result_json = handlers["recommend_deploy"]({
+    result_json = _handle_recommend_deploy({
         "rule_id": 42,
         "reason": "High confidence SSH brute-force detection rule",
-    })
+    }, conn)
     result = json.loads(result_json)
 
     assert result["action"] == "recommend"
