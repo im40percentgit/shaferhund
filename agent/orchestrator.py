@@ -1,28 +1,27 @@
 """
-Claude tool-use orchestrator for Shaferhund Phase 2.
+Claude tool-use orchestrator for Shaferhund Phase 2+.
 
 Replaces the single-shot call_claude with a multi-turn tool-use loop where
 Claude can fetch cluster context, search related alerts, draft YARA/Sigma
 rules, recommend deployment, and finalize triage — all within a single
 reasoning session bounded by hard caps.
 
-All 6 tool handlers are fully implemented and wired to the database via
-closure factories. Read tools (get_cluster_context, search_related_alerts)
-query existing data. Write tools (write_yara_rule, write_sigma_rule) validate
-and persist detection rules. recommend_deploy records a deploy recommendation
-in the deploy_events audit table. finalize_triage commits the AI verdict to
-the cluster row and returns a TriageResult.
+Phase 4 (REQ-P0-P4-004) replaces the direct TOOLS-list / _TOOL_DISPATCH
+mutation pattern with a single ``register_tool()`` API. All 7 tools are
+registered at module load via ``register_tool`` calls after their handler
+functions. The public ``TOOLS`` list and the ``dispatch()`` function are
+derived from the internal ``_REGISTRY`` dict — no external code mutates them.
+
+The handlers are exposed as standalone functions for direct unit-testing,
+but need a DB connection to operate. run_triage_loop accepts an optional
+``conn`` parameter; when provided, ``dispatch()`` injects the connection
+(and cluster_id for write tools) transparently. When conn=None, DB-dependent
+tools return informative error JSON so Claude can proceed to finalize_triage.
 
 After finalize_triage completes, _run_auto_deploy iterates all rules
 persisted for the cluster and calls should_auto_deploy() for each.
 Passing rules are written to the RULES_DIR filesystem path; every
 decision (deploy or skip) is recorded in deploy_events for auditing.
-
-The handlers are exposed as standalone functions for direct unit-testing,
-but need a DB connection to operate. run_triage_loop accepts an optional `conn`
-parameter; when provided, it builds a local dispatch dict that injects the
-connection (and cluster_id for write tools) via closures, overriding the
-module-level stubs.
 
 @decision DEC-ORCH-001
 @title Claude tool-use loop with 6 tools, 5-call / 10s caps
@@ -40,18 +39,18 @@ module-level stubs.
 @rationale Keeping handlers as module-level functions (not a class) preserves
            the existing dispatch dict pattern and makes each handler independently
            testable without instantiating an orchestrator object. run_triage_loop
-           receives an optional conn and builds closures locally, so no global
-           state or module-level connection is required.
+           receives an optional conn; dispatch() injects it transparently, so no
+           global state or module-level connection is required.
 
 @decision DEC-ORCH-003
-@title Write tool handlers use make_write_tool_handlers(conn, cluster_id) closure factory
+@title Write tool handlers declared with requires_conn=True, requires_cluster_id=True
 @status accepted
 @rationale Write tools (write_yara_rule, write_sigma_rule, recommend_deploy,
            finalize_triage) need both a DB connection and the current cluster_id.
-           A closure factory parallel to make_read_tool_handlers keeps the same
-           pattern: run_triage_loop builds an effective dispatch dict by merging
-           read and write closures, no global state required. finalize_triage
-           now calls update_cluster_ai to persist the verdict.
+           Phase 4 replaces the explicit closure factories with register_tool flags
+           (requires_conn, requires_cluster_id) — dispatch() handles injection.
+           Behaviour is identical; the refactor removes the two closure-factory
+           call sites in run_triage_loop.
 
 @decision DEC-ORCH-004
 @title Task instructions in system prompt; sanitized user-role content
@@ -82,7 +81,7 @@ module-level stubs.
            fails in the deploy step.
 
 @decision DEC-ORCH-005
-@title check_threat_intel is the 7th orchestrator tool — direct TOOLS-list patch
+@title check_threat_intel is the 7th orchestrator tool — direct TOOLS-list patch (Phase 3)
 @status accepted
 @rationale REQ-P0-P3-005 adds URLhaus indicator context to the orchestrator's
            reasoning loop. The tool is read-only (queries threat_intel table via
@@ -93,8 +92,40 @@ module-level stubs.
            The tool input (value: str) is passed through sanitize_alert_field before
            DB query per DEC-ORCH-004 — attacker-controlled alert fields can influence
            what the orchestrator passes to check_threat_intel.
+           Phase 4 migrates this tool to register_tool() along with the other 6.
+
+@decision DEC-ORCH-006
+@title register_tool() API replaces direct TOOLS/_TOOL_DISPATCH mutation (REQ-P0-P4-004)
+@status accepted
+@rationale Phases 1-3 grew the orchestrator from 3 to 7 tools by directly mutating
+           the TOOLS list, _TOOL_DISPATCH dict, and the two closure factories
+           (make_read_tool_handlers, make_write_tool_handlers). DEC-ORCH-005 captured
+           this as the "patch path" with an explicit note that Phase 4 would land the
+           refactor. Adding an 8th, 9th, or 10th tool via direct mutation requires
+           touching three places per tool and remembering both factory functions.
+           register_tool() collapses this to a single call site per tool:
+             register_tool(spec, handler, requires_conn=True, requires_cluster_id=False)
+           The _REGISTRY dict is the single source of truth; TOOLS is a derived list
+           ([t.spec for t in _REGISTRY.values()]); dispatch() replaces both the
+           closure-factory merge step and the effective_dispatch lookup in
+           run_triage_loop. Spec validation (previously _validate_tool_schema()) runs
+           at registration time. Duplicate name detection also runs at registration.
+           PR: feature/phase4-register-tool, issue #42.
+
+@decision DEC-ORCH-007
+@title Migration of existing 7 tools to register_tool is mechanical 1:1 (REQ-P0-P4-004)
+@status accepted
+@rationale Every existing tool's spec dict and dispatch entry is converted 1:1 to a
+           register_tool call at module load, immediately after its handler function
+           is defined. No tool gets a new schema, new caps, or new behaviour. The
+           refactor is invisible from outside orchestrator.py — TOOLS, dispatch(),
+           and the handler functions retain their public API. The closure factories
+           (make_read_tool_handlers, make_write_tool_handlers) are deleted; their
+           callers in tests are updated to use dispatch() directly or the
+           _handle_* functions with explicit conn injection.
 """
 
+import dataclasses
 import json
 import logging
 import re
@@ -103,7 +134,7 @@ import time
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from .models import (
     get_alerts_by_src_ip,
@@ -124,6 +155,200 @@ from .sigmac import SigmaConversionError
 from .triage import TriageResult
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Tool registry — register_tool() API (DEC-ORCH-006, REQ-P0-P4-004)
+#
+# _REGISTRY is the single source of truth for all orchestrator tools.
+# TOOLS (the Anthropic API payload) and dispatch() (the call-time router)
+# are both derived from _REGISTRY. No external code mutates TOOLS or
+# _REGISTRY directly — all registrations go through register_tool().
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class RegisteredTool:
+    """Metadata and handler for a single registered orchestrator tool.
+
+    Attributes:
+        spec:                 The Anthropic tool definition dict
+                              (name, description, input_schema).
+        handler:              Callable(tool_input: dict, ...) -> str | TriageResult.
+                              Does NOT receive conn/cluster_id directly; dispatch()
+                              injects them based on the requires_* flags.
+        requires_conn:        If True, dispatch() injects conn as second positional arg.
+                              When conn is None and allows_no_conn is False, dispatch()
+                              returns an error JSON instead of calling the handler.
+        requires_cluster_id:  If True, dispatch() injects cluster_id as third positional
+                              arg. Only meaningful when requires_conn is also True.
+        allows_no_conn:       If True, dispatch() calls the handler even when conn is
+                              None, passing None explicitly. Used by finalize_triage
+                              which produces a valid TriageResult in no-DB mode.
+        kind:                 'read' | 'write' — purely organisational; used by
+                              /metrics and audit tooling. Does not change runtime
+                              behaviour (requires_* flags govern injection).
+    """
+
+    spec: dict
+    handler: Callable
+    requires_conn: bool = False
+    requires_cluster_id: bool = False
+    allows_no_conn: bool = False
+    kind: str = "read"
+
+
+# Internal registry: insertion order is preserved (Python 3.7+).
+_REGISTRY: dict[str, RegisteredTool] = {}
+
+# Public TOOLS list — derived from _REGISTRY; rebuilt after each register_tool call.
+# External code (including run_triage_loop) reads this; no external code writes it.
+TOOLS: list[dict] = []
+
+# ---------------------------------------------------------------------------
+# Schema validation helpers (called at registration time)
+# ---------------------------------------------------------------------------
+
+_REQUIRED_TOOL_KEYS = {"name", "description", "input_schema"}
+
+
+def _validate_spec(spec: dict) -> None:
+    """Validate a single tool spec dict.  Raises ValueError on any violation.
+
+    Checks presence of required top-level keys, that input_schema is a dict
+    with type='object', and that properties/required are present.
+    """
+    missing_keys = _REQUIRED_TOOL_KEYS - set(spec.keys())
+    if missing_keys:
+        raise ValueError(
+            f"Tool spec for {spec.get('name', '?')!r} missing required keys: {missing_keys}"
+        )
+    schema = spec.get("input_schema")
+    if not isinstance(schema, dict):
+        raise ValueError(
+            f"Tool {spec['name']!r} input_schema must be a dict, got {type(schema).__name__}"
+        )
+    if schema.get("type") != "object":
+        raise ValueError(
+            f"Tool {spec['name']!r} input_schema.type must be 'object', got {schema.get('type')!r}"
+        )
+    if "properties" not in schema:
+        raise ValueError(f"Tool {spec['name']!r} input_schema missing 'properties'")
+    if "required" not in schema:
+        raise ValueError(f"Tool {spec['name']!r} input_schema missing 'required'")
+
+
+# ---------------------------------------------------------------------------
+# Public API — register_tool() and dispatch()
+# ---------------------------------------------------------------------------
+
+
+def register_tool(
+    spec: dict,
+    handler: Callable,
+    requires_conn: bool = False,
+    requires_cluster_id: bool = False,
+    allows_no_conn: bool = False,
+    kind: str = "read",
+) -> None:
+    """Register an orchestrator tool.
+
+    Validates the spec shape, rejects duplicate names, stores the handler
+    with its dependency flags in _REGISTRY, and rebuilds the public TOOLS
+    list from the updated registry.
+
+    Args:
+        spec:                 Anthropic tool definition dict.  Must have
+                              ``name`` (str), ``description`` (str), and
+                              ``input_schema`` (dict with type='object',
+                              properties, required).
+        handler:              Callable that accepts (tool_input, [conn, [cluster_id]]).
+                              dispatch() handles injection based on requires_* flags;
+                              callers never pass conn/cluster_id directly.
+        requires_conn:        True for DB-dependent tools. dispatch() injects the
+                              active conn as the second positional argument.
+        requires_cluster_id:  True for write tools that need the cluster being
+                              triaged. dispatch() injects cluster_id as the third
+                              positional argument. Requires requires_conn=True.
+        allows_no_conn:       True for tools that can run with conn=None (e.g.
+                              finalize_triage which still returns a TriageResult
+                              when no DB is present). dispatch() calls the handler
+                              with conn=None rather than returning an error JSON.
+        kind:                 'read' | 'write' — informational only.
+
+    Raises:
+        ValueError: If spec is malformed or the tool name is already registered.
+    """
+    global TOOLS  # noqa: PLW0603 — TOOLS is the derived public list
+
+    _validate_spec(spec)
+    name = spec["name"]
+    if name in _REGISTRY:
+        raise ValueError(f"Duplicate tool name: {name!r} — already registered")
+
+    _REGISTRY[name] = RegisteredTool(
+        spec=spec,
+        handler=handler,
+        requires_conn=requires_conn,
+        requires_cluster_id=requires_cluster_id,
+        allows_no_conn=allows_no_conn,
+        kind=kind,
+    )
+    # Rebuild the public TOOLS list to reflect the new registration.
+    TOOLS = [t.spec for t in _REGISTRY.values()]
+    log.debug("register_tool: registered %r (kind=%s, conn=%s, cluster_id=%s)",
+              name, kind, requires_conn, requires_cluster_id)
+
+
+def dispatch(
+    name: str,
+    tool_input: dict,
+    conn: Optional[sqlite3.Connection] = None,
+    cluster_id: str = "",
+) -> Any:
+    """Invoke a registered tool handler with dependency injection.
+
+    Looks up the tool by name, validates that required dependencies (conn,
+    cluster_id) are present, then calls the handler with the appropriate
+    positional arguments.
+
+    When the tool is not registered, returns an error JSON string so Claude
+    can proceed gracefully rather than crashing the loop.
+
+    When conn is None and the tool requires_conn, returns an informative
+    error JSON string (same behaviour as the old _no_conn_stub pattern).
+
+    Args:
+        name:       Tool name as received from Claude's tool_use block.
+        tool_input: Input dict from Claude's tool_use block.
+        conn:       Optional SQLite connection.  Injected when requires_conn=True.
+        cluster_id: Cluster being triaged.  Injected when requires_cluster_id=True.
+
+    Returns:
+        str (JSON) or TriageResult — whatever the handler returns.
+
+    Raises:
+        Nothing — errors are returned as JSON strings so Claude can recover.
+    """
+    entry = _REGISTRY.get(name)
+    if entry is None:
+        return json.dumps({"error": f"Unknown tool {name!r} — not registered"})
+
+    if entry.requires_conn and conn is None and not entry.allows_no_conn:
+        return json.dumps({
+            "error": (
+                f"Tool {name!r} requires a database connection "
+                "(conn=None in run_triage_loop)."
+            )
+        })
+
+    if entry.requires_cluster_id:
+        # conn may be None here only when allows_no_conn=True (finalize_triage).
+        return entry.handler(tool_input, conn, cluster_id)
+    elif entry.requires_conn or entry.allows_no_conn:
+        return entry.handler(tool_input, conn)
+    else:
+        return entry.handler(tool_input)
+
 
 # ---------------------------------------------------------------------------
 # In-memory orchestrator run statistics (REQ-P1-P2-004)
@@ -283,251 +508,6 @@ def build_cluster_context_prompt(cluster: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool schema — 6 tools for the orchestrator loop
-# Each entry is a valid Anthropic tool definition dict.
-# ---------------------------------------------------------------------------
-
-TOOLS: list[dict] = [
-    {
-        "name": "get_cluster_context",
-        "description": (
-            "Retrieve full context for an alert cluster including all member alerts, "
-            "source IP history, and associated rule details."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "cluster_id": {
-                    "type": "integer",
-                    "description": "The numeric ID of the cluster to retrieve.",
-                },
-            },
-            "required": ["cluster_id"],
-        },
-    },
-    {
-        "name": "search_related_alerts",
-        "description": (
-            "Search for alerts from the same source IP across a time window. "
-            "Surfaces cross-source correlation (Wazuh + Suricata) for the same actor."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "src_ip": {
-                    "type": "string",
-                    "description": "Source IP address to search for.",
-                },
-                "time_range_hours": {
-                    "type": "integer",
-                    "description": "How many hours back to search.",
-                },
-            },
-            "required": ["src_ip", "time_range_hours"],
-        },
-    },
-    {
-        "name": "write_yara_rule",
-        "description": (
-            "Draft and persist a YARA detection rule for the current cluster. "
-            "The rule is syntax-validated before storage. Returns the rule_id."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "string",
-                    "description": "Complete YARA rule text.",
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Human-readable description of what this rule detects.",
-                },
-            },
-            "required": ["content", "description"],
-        },
-    },
-    {
-        "name": "write_sigma_rule",
-        "description": (
-            "Draft and persist a Sigma detection rule for the current cluster. "
-            "The rule is validated with pysigma before storage. Returns the rule_id."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "content": {
-                    "type": "string",
-                    "description": "Complete Sigma rule YAML.",
-                },
-                "description": {
-                    "type": "string",
-                    "description": "Human-readable description of what this rule detects.",
-                },
-            },
-            "required": ["content", "description"],
-        },
-    },
-    {
-        "name": "recommend_deploy",
-        "description": (
-            "Signal the policy gate that a rule is ready for auto-deployment. "
-            "The gate evaluates confidence, severity, and dedup constraints. "
-            "Does not deploy directly — sets a recommendation flag."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "rule_id": {
-                    "type": "integer",
-                    "description": "ID of the rule to recommend for deployment.",
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "Justification for the deployment recommendation.",
-                },
-            },
-            "required": ["rule_id", "reason"],
-        },
-    },
-    {
-        "name": "finalize_triage",
-        "description": (
-            "Commit the final triage verdict for this cluster and close the loop. "
-            "MUST be called to produce a non-default result. Severity must be one of "
-            "Critical, High, Medium, Low."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "severity": {
-                    "type": "string",
-                    "enum": ["Critical", "High", "Medium", "Low"],
-                    "description": "Final severity classification.",
-                },
-                "analysis": {
-                    "type": "string",
-                    "description": "2-4 sentence threat assessment narrative.",
-                },
-                "rule_ids": {
-                    "type": "array",
-                    "items": {"type": "integer"},
-                    "description": "IDs of rules drafted during this session (may be empty).",
-                },
-                "confidence": {
-                    "type": "number",
-                    "minimum": 0.0,
-                    "maximum": 1.0,
-                    "description": (
-                        "Confidence in the verdict, 0.0 (unsure) to 1.0 (certain). "
-                        "Used by the auto-deploy policy gate."
-                    ),
-                },
-            },
-            "required": ["severity", "analysis", "rule_ids", "confidence"],
-        },
-    },
-    # Tool 7 — Phase 3 (REQ-P0-P3-005, DEC-ORCH-005)
-    {
-        "name": "check_threat_intel",
-        "description": (
-            "Look up a URL or MD5 hash in the local URLhaus threat-intelligence "
-            "database. Returns whether the indicator is known-malicious, plus any "
-            "context (threat category, tags, reporter) from the feed. Use this to "
-            "enrich analysis when an alert contains a URL or file hash."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "value": {
-                    "type": "string",
-                    "description": (
-                        "The indicator to check — a URL (e.g. http://evil.com/payload) "
-                        "or an MD5 hash (32 hex characters)."
-                    ),
-                },
-            },
-            "required": ["value"],
-        },
-    },
-]
-
-# ---------------------------------------------------------------------------
-# Schema validation — called at module import
-# ---------------------------------------------------------------------------
-
-_REQUIRED_TOOL_KEYS = {"name", "description", "input_schema"}
-_REQUIRED_SCHEMA_KEYS = {"type", "properties", "required"}
-
-
-def _validate_tool_schema() -> None:
-    """Validate that TOOLS is a well-formed list of Anthropic tool definitions.
-
-    Called automatically at module import. Raises ValueError if any entry is
-    malformed so broken schemas surface immediately rather than at runtime.
-    """
-    tool_names = set()
-    for i, tool in enumerate(TOOLS):
-        missing_keys = _REQUIRED_TOOL_KEYS - set(tool.keys())
-        if missing_keys:
-            raise ValueError(
-                f"TOOLS[{i}] ({tool.get('name', '?')!r}) missing required keys: {missing_keys}"
-            )
-
-        schema = tool["input_schema"]
-        if not isinstance(schema, dict):
-            raise ValueError(
-                f"TOOLS[{i}] ({tool['name']!r}) input_schema must be a dict"
-            )
-        if schema.get("type") != "object":
-            raise ValueError(
-                f"TOOLS[{i}] ({tool['name']!r}) input_schema.type must be 'object'"
-            )
-        if "properties" not in schema:
-            raise ValueError(
-                f"TOOLS[{i}] ({tool['name']!r}) input_schema missing 'properties'"
-            )
-        if "required" not in schema:
-            raise ValueError(
-                f"TOOLS[{i}] ({tool['name']!r}) input_schema missing 'required'"
-            )
-
-        if tool["name"] in tool_names:
-            raise ValueError(f"Duplicate tool name: {tool['name']!r}")
-        tool_names.add(tool["name"])
-
-
-# Run at import time — catches schema regressions before any loop executes.
-_validate_tool_schema()
-
-# ---------------------------------------------------------------------------
-# Prompt builder
-# ---------------------------------------------------------------------------
-
-
-def build_cluster_context_prompt(cluster: dict) -> str:
-    """Format a cluster dict into a readable prompt for the orchestrator loop.
-
-    The cluster dict is expected to have the keys produced by the existing
-    _build_cluster_summary helper in triage.py (cluster_id, src_ip, rule_id,
-    alert_count, window_start, window_end, sample_alerts). Missing keys are
-    handled gracefully — the prompt is best-effort.
-    """
-    lines = [
-        "You are a cybersecurity analyst operating as an agentic defender.",
-        "Analyse the following alert cluster and use your available tools to:",
-        "  1. Gather any additional context you need.",
-        "  2. Draft detection rules (YARA and/or Sigma) if the cluster looks malicious.",
-        "  3. Recommend deployment for high-confidence rules.",
-        "  4. Call finalize_triage with your verdict to close the session.",
-        "",
-        "Alert cluster:",
-        json.dumps(cluster, default=str, indent=2),
-    ]
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
 # Tool handlers — read tools (issue #8)
 # ---------------------------------------------------------------------------
 
@@ -671,25 +651,85 @@ def _handle_check_threat_intel(tool_input: dict, conn: sqlite3.Connection) -> st
     return json.dumps(result, default=str)
 
 
-def make_read_tool_handlers(conn: sqlite3.Connection) -> dict:
-    """Return a partial dispatch dict with DB-bound read tool handlers.
+# Register the three read tools (DEC-ORCH-006, DEC-ORCH-007).
+# Each requires a DB connection; dispatch() injects it at call time.
+register_tool(
+    spec={
+        "name": "get_cluster_context",
+        "description": (
+            "Retrieve full context for an alert cluster including all member alerts, "
+            "source IP history, and associated rule details."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cluster_id": {
+                    "type": "integer",
+                    "description": "The numeric ID of the cluster to retrieve.",
+                },
+            },
+            "required": ["cluster_id"],
+        },
+    },
+    handler=_handle_get_cluster_context,
+    requires_conn=True,
+    kind="read",
+)
 
-    Used by run_triage_loop to override the module-level no-conn stubs for
-    get_cluster_context, search_related_alerts, and check_threat_intel when a
-    real DB connection is available. Write tools are handled separately by
-    make_write_tool_handlers.
+register_tool(
+    spec={
+        "name": "search_related_alerts",
+        "description": (
+            "Search for alerts from the same source IP across a time window. "
+            "Surfaces cross-source correlation (Wazuh + Suricata) for the same actor."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "src_ip": {
+                    "type": "string",
+                    "description": "Source IP address to search for.",
+                },
+                "time_range_hours": {
+                    "type": "integer",
+                    "description": "How many hours back to search.",
+                },
+            },
+            "required": ["src_ip", "time_range_hours"],
+        },
+    },
+    handler=_handle_search_related_alerts,
+    requires_conn=True,
+    kind="read",
+)
 
-    Args:
-        conn: Open SQLite connection to inject into the closures.
-
-    Returns:
-        Dict mapping tool name -> callable(tool_input: dict) -> str.
-    """
-    return {
-        "get_cluster_context":    lambda ti: _handle_get_cluster_context(ti, conn),
-        "search_related_alerts":  lambda ti: _handle_search_related_alerts(ti, conn),
-        "check_threat_intel":     lambda ti: _handle_check_threat_intel(ti, conn),
-    }
+register_tool(
+    spec={
+        "name": "check_threat_intel",
+        "description": (
+            "Look up a URL or MD5 hash in the local URLhaus threat-intelligence "
+            "database. Returns whether the indicator is known-malicious, plus any "
+            "context (threat category, tags, reporter) from the feed. Use this to "
+            "enrich analysis when an alert contains a URL or file hash."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "value": {
+                    "type": "string",
+                    "description": (
+                        "The indicator to check — a URL (e.g. http://evil.com/payload) "
+                        "or an MD5 hash (32 hex characters)."
+                    ),
+                },
+            },
+            "required": ["value"],
+        },
+    },
+    handler=_handle_check_threat_intel,
+    requires_conn=True,
+    kind="read",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -935,63 +975,138 @@ def _handle_finalize_triage(
     )
 
 
-# ---------------------------------------------------------------------------
-# Closure factory — injects DB connection + cluster_id into write handlers
-# ---------------------------------------------------------------------------
+# Register the four write tools (DEC-ORCH-006, DEC-ORCH-007).
+# Write tools require conn; yara/sigma/finalize also require cluster_id.
+# dispatch() injects both at call time from the active run_triage_loop context.
+register_tool(
+    spec={
+        "name": "write_yara_rule",
+        "description": (
+            "Draft and persist a YARA detection rule for the current cluster. "
+            "The rule is syntax-validated before storage. Returns the rule_id."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "Complete YARA rule text.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Human-readable description of what this rule detects.",
+                },
+            },
+            "required": ["content", "description"],
+        },
+    },
+    handler=_handle_write_yara_rule,
+    requires_conn=True,
+    requires_cluster_id=True,
+    kind="write",
+)
 
+register_tool(
+    spec={
+        "name": "write_sigma_rule",
+        "description": (
+            "Draft and persist a Sigma detection rule for the current cluster. "
+            "The rule is validated with pysigma before storage. Returns the rule_id."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "Complete Sigma rule YAML.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Human-readable description of what this rule detects.",
+                },
+            },
+            "required": ["content", "description"],
+        },
+    },
+    handler=_handle_write_sigma_rule,
+    requires_conn=True,
+    requires_cluster_id=True,
+    kind="write",
+)
 
-def make_write_tool_handlers(
-    conn: sqlite3.Connection, cluster_id: str
-) -> dict:
-    """Return a partial dispatch dict with DB-bound write tool handlers.
+register_tool(
+    spec={
+        "name": "recommend_deploy",
+        "description": (
+            "Signal the policy gate that a rule is ready for auto-deployment. "
+            "The gate evaluates confidence, severity, and dedup constraints. "
+            "Does not deploy directly — sets a recommendation flag."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rule_id": {
+                    "type": "integer",
+                    "description": "ID of the rule to recommend for deployment.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Justification for the deployment recommendation.",
+                },
+            },
+            "required": ["rule_id", "reason"],
+        },
+    },
+    handler=_handle_recommend_deploy,
+    requires_conn=True,
+    requires_cluster_id=False,
+    kind="write",
+)
 
-    Used by run_triage_loop to override the module-level no-conn stubs for
-    write_yara_rule, write_sigma_rule, recommend_deploy, and finalize_triage
-    when a real DB connection is available.
-
-    Args:
-        conn:       Open SQLite connection to inject into the closures.
-        cluster_id: The cluster being triaged (needed by rule insert and
-                    finalize_triage's update_cluster_ai call).
-
-    Returns:
-        Dict mapping tool name -> callable(tool_input: dict) -> str|TriageResult.
-    """
-    return {
-        "write_yara_rule":   lambda ti: _handle_write_yara_rule(ti, conn, cluster_id),
-        "write_sigma_rule":  lambda ti: _handle_write_sigma_rule(ti, conn, cluster_id),
-        "recommend_deploy":  lambda ti: _handle_recommend_deploy(ti, conn),
-        "finalize_triage":   lambda ti: _handle_finalize_triage(ti, conn, cluster_id),
-    }
-
-
-def _no_conn_stub(tool_name: str) -> str:
-    """Return an informative JSON error when a tool is called without a DB connection.
-
-    Used as the fallback in _TOOL_DISPATCH for all DB-dependent tools when
-    run_triage_loop is called without a conn. Claude receives a clear message
-    and can proceed to finalize_triage.
-    """
-    return json.dumps({
-        "error": f"Tool '{tool_name}' requires a database connection (conn=None in run_triage_loop)."
-    })
-
-
-# Map tool names to their handler functions.
-# All DB-dependent tools use no-conn stubs here; they are replaced with real
-# DB-bound closures in run_triage_loop when conn is provided via
-# make_read_tool_handlers() and make_write_tool_handlers().
-# finalize_triage has a special no-conn stub that still returns a TriageResult
-# (without DB persistence) so the loop can always produce a verdict.
-_TOOL_DISPATCH: dict[str, Any] = {
-    "get_cluster_context":   lambda ti: _no_conn_stub("get_cluster_context"),
-    "search_related_alerts": lambda ti: _no_conn_stub("search_related_alerts"),
-    "check_threat_intel":    lambda ti: _no_conn_stub("check_threat_intel"),
-    "write_yara_rule":       lambda ti: _no_conn_stub("write_yara_rule"),
-    "write_sigma_rule":      lambda ti: _no_conn_stub("write_sigma_rule"),
-    "recommend_deploy":      lambda ti: _no_conn_stub("recommend_deploy"),
-    "finalize_triage":       lambda ti: _handle_finalize_triage(ti),
-}
+register_tool(
+    spec={
+        "name": "finalize_triage",
+        "description": (
+            "Commit the final triage verdict for this cluster and close the loop. "
+            "MUST be called to produce a non-default result. Severity must be one of "
+            "Critical, High, Medium, Low."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "severity": {
+                    "type": "string",
+                    "enum": ["Critical", "High", "Medium", "Low"],
+                    "description": "Final severity classification.",
+                },
+                "analysis": {
+                    "type": "string",
+                    "description": "2-4 sentence threat assessment narrative.",
+                },
+                "rule_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "IDs of rules drafted during this session (may be empty).",
+                },
+                "confidence": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "description": (
+                        "Confidence in the verdict, 0.0 (unsure) to 1.0 (certain). "
+                        "Used by the auto-deploy policy gate."
+                    ),
+                },
+            },
+            "required": ["severity", "analysis", "rule_ids", "confidence"],
+        },
+    },
+    handler=_handle_finalize_triage,
+    requires_conn=True,
+    requires_cluster_id=True,
+    allows_no_conn=True,  # produces TriageResult even without DB (no-DB unit test path)
+    kind="write",
+)
 
 # Default verdict returned when the loop exits without finalize_triage.
 _FAILSAFE_RESULT = TriageResult(
@@ -1043,12 +1158,8 @@ def run_triage_loop(
     wall_timeout: float = config.orch_wall_timeout_seconds
     cluster_id: str = str(cluster.get("cluster_id", "unknown"))
 
-    # Build an effective dispatch dict: start from the module-level stubs and
-    # overlay with DB-bound closures when a connection is available.
-    effective_dispatch: dict[str, Any] = dict(_TOOL_DISPATCH)
-    if conn is not None:
-        effective_dispatch.update(make_read_tool_handlers(conn))
-        effective_dispatch.update(make_write_tool_handlers(conn, cluster_id))
+    # dispatch() handles conn/cluster_id injection based on each tool's
+    # requires_conn / requires_cluster_id flags — no effective_dispatch dict needed.
 
     messages: list[dict] = [{"role": "user", "content": build_user_message(cluster)}]
 
@@ -1151,8 +1262,7 @@ def run_triage_loop(
                 cluster_id,
                 tool_input.get("severity", "?"),
             )
-            finalize_handler = effective_dispatch["finalize_triage"]
-            result = finalize_handler(tool_input)
+            result = dispatch("finalize_triage", tool_input, conn=conn, cluster_id=cluster_id)
             result.cluster_id = cluster_id
 
             # Auto-deploy integration (REQ-P0-P2-006, DEC-AUTODEPLOY-INTEG-001).
@@ -1172,21 +1282,20 @@ def run_triage_loop(
 
             return result
 
-        # Dispatch to the handler — catch NotImplementedError gracefully for stubs.
+        # Dispatch to the handler via dispatch() — conn/cluster_id injected per flags.
         # Increment tool_calls each time a handler is invoked (REQ-P1-P2-004).
         _STATS["tool_calls"] += 1
-        handler = effective_dispatch.get(tool_name)
-        if handler is None:
+        if tool_name not in _REGISTRY:
             tool_result_content = f"Error: unknown tool '{tool_name}'"
             log.error("Orchestrator: unknown tool %r for cluster %s", tool_name, cluster_id)
         else:
             try:
-                tool_result_content = handler(tool_input)
+                tool_result_content = dispatch(tool_name, tool_input, conn=conn, cluster_id=cluster_id)
                 if not isinstance(tool_result_content, str):
                     tool_result_content = json.dumps(tool_result_content, default=str)
             except NotImplementedError as exc:
-                # Stubs raise NotImplementedError — return a clear error to Claude
-                # so it can decide what to do (likely proceed to finalize_triage).
+                # Legacy path — return a clear error to Claude so it can decide
+                # what to do (likely proceed to finalize_triage).
                 tool_result_content = f"Tool not yet implemented: {exc}"
                 log.debug(
                     "Orchestrator: stub tool %r called for cluster %s: %s",
