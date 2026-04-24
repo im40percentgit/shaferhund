@@ -95,6 +95,8 @@ from .models import (
 )
 from .orchestrator import get_orchestrator_stats
 from .triage import TriageResult, TriageQueue
+from . import threat_intel as _threat_intel
+from .models import count_threat_intel_records
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +109,7 @@ _triage_queue: Optional[TriageQueue] = None
 _clusterer: Optional[AlertClusterer] = None
 _tailer_task: Optional[asyncio.Task] = None
 _suricata_tailer_task: Optional[asyncio.Task] = None
+_urlhaus_task: Optional[asyncio.Task] = None
 _poller_healthy: bool = False
 _last_poll_at: Optional[str] = None
 
@@ -166,7 +169,7 @@ def _probe_sigmac(settings: Settings) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _settings, _db, _triage_queue, _clusterer, _tailer_task, _suricata_tailer_task
+    global _settings, _db, _triage_queue, _clusterer, _tailer_task, _suricata_tailer_task, _urlhaus_task
 
     _settings = get_settings()
     _probe_sigmac(_settings)
@@ -182,12 +185,25 @@ async def lifespan(app: FastAPI):
     _suricata_tailer_task = asyncio.create_task(
         _suricata_tailer_loop(), name="suricata-tailer"
     )
-    log.info("Shaferhund agent started (wazuh-tailer + suricata-tailer running)")
+
+    # Phase 3 — URLhaus threat-intel hourly poller (REQ-P0-P3-005)
+    _urlhaus_task = asyncio.create_task(
+        _threat_intel.urlhaus_poll_loop(
+            _db,
+            _settings.urlhaus_feed_url,
+            _settings.urlhaus_fetch_interval_seconds,
+        ),
+        name="urlhaus-poller",
+    )
+
+    log.info(
+        "Shaferhund agent started (wazuh-tailer + suricata-tailer + urlhaus-poller running)"
+    )
 
     yield
 
-    # Shutdown — cancel both tailer tasks
-    for task in (_tailer_task, _suricata_tailer_task):
+    # Shutdown — cancel all background tasks
+    for task in (_tailer_task, _suricata_tailer_task, _urlhaus_task):
         if task:
             task.cancel()
             try:
@@ -285,9 +301,13 @@ async def health() -> JSONResponse:
                SHAFERHUND_TOKEN is set) limits exposure without breaking container
                probes, which only need {status, poller_healthy} to decide liveness.
     """
+    ti_count = count_threat_intel_records(_db) if _db is not None else 0
     return JSONResponse({
         "status": "ok",
         "poller_healthy": _poller_healthy,
+        "threat_intel": {
+            "record_count": ti_count,
+        },
     })
 
 

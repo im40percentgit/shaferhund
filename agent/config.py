@@ -63,6 +63,14 @@ class Settings(BaseSettings):
     sigmac_available: bool = False
     sigmac_version: Optional[str] = None
 
+    # Phase 3 — Threat Intel (REQ-P0-P3-005)
+    # URLhaus online-URL CSV feed endpoint. Override for air-gapped deployments
+    # or to pin a specific feed variant. The default points to the live feed.
+    urlhaus_feed_url: str = "https://urlhaus.abuse.ch/downloads/csv_online/"
+    # How often (in seconds) the URLhaus poller refreshes the local threat_intel
+    # table. Defaults to 3600 (hourly) per MASTER_PLAN.md Phase 3 spec.
+    urlhaus_fetch_interval_seconds: int = 3600
+
     # Auto-deploy policy gate (Phase 2, REQ-P0-P2-006, DEC-AUTODEPLOY-001)
     # Default OFF — operator must explicitly enable via env var.
     AUTO_DEPLOY_ENABLED: bool = False

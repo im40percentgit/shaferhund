@@ -143,6 +143,38 @@ _DEPLOY_EVENTS_WAVE_C_COLUMNS: list[tuple[str, str]] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Phase 3 schema additions — threat_intel table (REQ-P0-P3-005)
+# ---------------------------------------------------------------------------
+#
+# Created with CREATE TABLE IF NOT EXISTS — idempotent for Phase 1/2/2.5
+# databases that predate Phase 3 (per DEC-SCHEMA-002).
+#
+# Columns:
+#   indicator      — the raw IOC value (URL, domain, or MD5 hash).
+#   indicator_type — 'url', 'domain', or 'md5' (matches URLhaus feed fields).
+#   first_seen     — ISO8601 timestamp when first observed by the feed source.
+#   last_seen      — ISO8601 timestamp when last observed (updated on refresh).
+#   source         — feed name, e.g. 'urlhaus_online'.
+#   context_json   — JSON blob with any extra feed metadata (tags, reporter, etc.).
+_THREAT_INTEL_SQL = """
+CREATE TABLE IF NOT EXISTS threat_intel (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    indicator      TEXT NOT NULL,
+    indicator_type TEXT NOT NULL,
+    first_seen     TEXT,
+    last_seen      TEXT,
+    source         TEXT NOT NULL DEFAULT 'urlhaus_online',
+    context_json   TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_threat_intel_indicator
+    ON threat_intel(indicator, indicator_type, source);
+CREATE INDEX IF NOT EXISTS idx_threat_intel_type
+    ON threat_intel(indicator_type);
+"""
+
+
 def init_db(db_path: str) -> sqlite3.Connection:
     """Open (or create) the SQLite database and apply schema.
 
@@ -199,6 +231,9 @@ def init_db(db_path: str) -> sqlite3.Connection:
                 f"ALTER TABLE deploy_events ADD COLUMN {col_name} {col_def}"
             )
             log.info("deploy_events table: added column %s", col_name)
+
+    # threat_intel table (Phase 3, REQ-P0-P3-005) — idempotent.
+    conn.executescript(_THREAT_INTEL_SQL)
 
     conn.commit()
     log.info("Database initialised at %s", db_path)
@@ -826,3 +861,84 @@ def get_recent_deploys(conn: sqlite3.Connection, window_seconds: int) -> list[di
             "deployed_at_ts": float(row["deployed_at_epoch"] or 0),
         })
     return result
+
+
+# ---------------------------------------------------------------------------
+# Threat Intel CRUD  (Phase 3 — REQ-P0-P3-005)
+# ---------------------------------------------------------------------------
+
+def insert_threat_intel(
+    conn: sqlite3.Connection,
+    indicator: str,
+    indicator_type: str,
+    first_seen: Optional[str] = None,
+    last_seen: Optional[str] = None,
+    source: str = "urlhaus_online",
+    context_json: Optional[str] = None,
+) -> None:
+    """Insert or refresh a threat-intel indicator row.
+
+    Uses INSERT OR REPLACE against the unique index on (indicator, indicator_type,
+    source) so repeated feed refreshes update last_seen without creating duplicates.
+
+    Args:
+        conn:           Open SQLite connection.
+        indicator:      The raw IOC value (URL, domain, or MD5 hash).
+        indicator_type: 'url', 'domain', or 'md5'.
+        first_seen:     ISO8601 string from the feed. None if not provided.
+        last_seen:      ISO8601 string from the feed. None if not provided.
+        source:         Feed name; defaults to 'urlhaus_online'.
+        context_json:   JSON string with extra feed metadata.
+    """
+    with get_cursor(conn) as cur:
+        cur.execute(
+            """
+            INSERT INTO threat_intel
+                (indicator, indicator_type, first_seen, last_seen, source, context_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(indicator, indicator_type, source) DO UPDATE SET
+                last_seen    = excluded.last_seen,
+                context_json = excluded.context_json
+            """,
+            (indicator, indicator_type, first_seen, last_seen, source, context_json),
+        )
+
+
+def get_threat_intel_matches(
+    conn: sqlite3.Connection,
+    value: str,
+) -> list[dict]:
+    """Return all threat_intel rows whose indicator matches value (exact, case-insensitive).
+
+    Queries all indicator_type columns for the same value so callers don't need to
+    know the type upfront. URL lookups should be exact; MD5 lookups are inherently
+    exact because hashes are fixed-length strings.
+
+    Args:
+        conn:  Open SQLite connection.
+        value: The indicator value to look up (URL, domain, or MD5 hash).
+
+    Returns:
+        List of dicts — each dict has keys: id, indicator, indicator_type, first_seen,
+        last_seen, source, context_json. Empty list when no match.
+    """
+    rows = conn.execute(
+        "SELECT * FROM threat_intel WHERE LOWER(indicator) = LOWER(?)",
+        (value,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def count_threat_intel_records(conn: sqlite3.Connection) -> int:
+    """Return the total number of rows in the threat_intel table.
+
+    Used by the /health endpoint to report indicator count without pulling rows.
+
+    Args:
+        conn: Open SQLite connection.
+
+    Returns:
+        Integer row count, 0 if the table is empty.
+    """
+    row = conn.execute("SELECT COUNT(*) FROM threat_intel").fetchone()
+    return int(row[0]) if row else 0

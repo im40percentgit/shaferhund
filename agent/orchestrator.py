@@ -80,6 +80,19 @@ module-level stubs.
            triage verdict is already committed by update_cluster_ai, so the
            caller always receives a valid result even if file-write or DB-insert
            fails in the deploy step.
+
+@decision DEC-ORCH-005
+@title check_threat_intel is the 7th orchestrator tool — direct TOOLS-list patch
+@status accepted
+@rationale REQ-P0-P3-005 adds URLhaus indicator context to the orchestrator's
+           reasoning loop. The tool is read-only (queries threat_intel table via
+           models.get_threat_intel_matches) and injected into make_read_tool_handlers
+           alongside get_cluster_context and search_related_alerts — the same
+           closure-factory pattern already established by DEC-ORCH-003. Dynamic
+           tool registration is explicitly deferred to Phase 4 (REQ-NOGO-P3-008).
+           The tool input (value: str) is passed through sanitize_alert_field before
+           DB query per DEC-ORCH-004 — attacker-controlled alert fields can influence
+           what the orchestrator passes to check_threat_intel.
 """
 
 import json
@@ -104,6 +117,7 @@ from .models import (
     record_deploy_event,
     update_cluster_ai,
 )
+from . import threat_intel as _threat_intel
 from . import sigmac as _sigmac
 from .policy import should_auto_deploy
 from .sigmac import SigmaConversionError
@@ -413,6 +427,29 @@ TOOLS: list[dict] = [
             "required": ["severity", "analysis", "rule_ids", "confidence"],
         },
     },
+    # Tool 7 — Phase 3 (REQ-P0-P3-005, DEC-ORCH-005)
+    {
+        "name": "check_threat_intel",
+        "description": (
+            "Look up a URL or MD5 hash in the local URLhaus threat-intelligence "
+            "database. Returns whether the indicator is known-malicious, plus any "
+            "context (threat category, tags, reporter) from the feed. Use this to "
+            "enrich analysis when an alert contains a URL or file hash."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "value": {
+                    "type": "string",
+                    "description": (
+                        "The indicator to check — a URL (e.g. http://evil.com/payload) "
+                        "or an MD5 hash (32 hex characters)."
+                    ),
+                },
+            },
+            "required": ["value"],
+        },
+    },
 ]
 
 # ---------------------------------------------------------------------------
@@ -602,12 +639,45 @@ def _handle_search_related_alerts(tool_input: dict, conn: sqlite3.Connection) ->
 # Closure factory — injects DB connection into read handlers
 # ---------------------------------------------------------------------------
 
+def _handle_check_threat_intel(tool_input: dict, conn: sqlite3.Connection) -> str:
+    """Look up an indicator value in the local threat_intel table.
+
+    Sanitizes the input value (DEC-ORCH-004) before querying the DB — the
+    value arrives from the Claude tool call and may ultimately derive from
+    attacker-controlled alert fields (e.g. a URL from a Suricata alert).
+
+    This is a READ-ONLY handler — it never modifies DB state.
+
+    Args:
+        tool_input: Dict with key ``value`` (str) — the URL or MD5 to check.
+        conn:       Open SQLite connection (injected by run_triage_loop).
+
+    Returns:
+        JSON string with keys: hit (bool), matches (list), context (dict|None).
+    """
+    raw_value = tool_input.get("value", "")
+    # Sanitize per DEC-ORCH-004 — strips ANSI escapes, control bytes, truncates.
+    safe_value = sanitize_alert_field(raw_value)
+    if not safe_value:
+        return json.dumps({"error": "value is required", "hit": False, "matches": []})
+
+    result = _threat_intel.lookup(safe_value, conn)
+    log.debug(
+        "check_threat_intel: value=%r hit=%s matches=%d",
+        safe_value,
+        result["hit"],
+        len(result["matches"]),
+    )
+    return json.dumps(result, default=str)
+
+
 def make_read_tool_handlers(conn: sqlite3.Connection) -> dict:
     """Return a partial dispatch dict with DB-bound read tool handlers.
 
     Used by run_triage_loop to override the module-level no-conn stubs for
-    get_cluster_context and search_related_alerts when a real DB connection
-    is available. Write tools are handled separately by make_write_tool_handlers.
+    get_cluster_context, search_related_alerts, and check_threat_intel when a
+    real DB connection is available. Write tools are handled separately by
+    make_write_tool_handlers.
 
     Args:
         conn: Open SQLite connection to inject into the closures.
@@ -618,6 +688,7 @@ def make_read_tool_handlers(conn: sqlite3.Connection) -> dict:
     return {
         "get_cluster_context":    lambda ti: _handle_get_cluster_context(ti, conn),
         "search_related_alerts":  lambda ti: _handle_search_related_alerts(ti, conn),
+        "check_threat_intel":     lambda ti: _handle_check_threat_intel(ti, conn),
     }
 
 
@@ -915,6 +986,7 @@ def _no_conn_stub(tool_name: str) -> str:
 _TOOL_DISPATCH: dict[str, Any] = {
     "get_cluster_context":   lambda ti: _no_conn_stub("get_cluster_context"),
     "search_related_alerts": lambda ti: _no_conn_stub("search_related_alerts"),
+    "check_threat_intel":    lambda ti: _no_conn_stub("check_threat_intel"),
     "write_yara_rule":       lambda ti: _no_conn_stub("write_yara_rule"),
     "write_sigma_rule":      lambda ti: _no_conn_stub("write_sigma_rule"),
     "recommend_deploy":      lambda ti: _no_conn_stub("recommend_deploy"),
