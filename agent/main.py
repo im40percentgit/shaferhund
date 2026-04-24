@@ -99,6 +99,11 @@ from . import threat_intel as _threat_intel
 from .models import count_threat_intel_records
 from . import canary as _canary
 from .canary import spawn_canary, record_hit, count_canary_triggers_since
+from . import red_team as _red_team
+from .models import (
+    get_latest_posture_run,
+    insert_posture_run,
+)
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +117,7 @@ _clusterer: Optional[AlertClusterer] = None
 _tailer_task: Optional[asyncio.Task] = None
 _suricata_tailer_task: Optional[asyncio.Task] = None
 _urlhaus_task: Optional[asyncio.Task] = None
+_posture_task: Optional[asyncio.Task] = None
 _poller_healthy: bool = False
 _last_poll_at: Optional[str] = None
 
@@ -171,7 +177,7 @@ def _probe_sigmac(settings: Settings) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _settings, _db, _triage_queue, _clusterer, _tailer_task, _suricata_tailer_task, _urlhaus_task
+    global _settings, _db, _triage_queue, _clusterer, _tailer_task, _suricata_tailer_task, _urlhaus_task, _posture_task
 
     _settings = get_settings()
     _probe_sigmac(_settings)
@@ -198,6 +204,30 @@ async def lifespan(app: FastAPI):
         name="urlhaus-poller",
     )
 
+    # Phase 3 — Atomic Red Team posture scheduler (REQ-P0-P3-001, DEC-POSTURE-002)
+    # Only starts a background task when POSTURE_RUN_SCHEDULE_SECONDS > 0.
+    # When it is 0, posture_schedule_loop returns immediately and no task is needed.
+    if _settings.posture_run_schedule_seconds > 0:
+        try:
+            _art_tests = _red_team.load_atomic_tests(_settings.art_tests_file)
+        except Exception as exc:
+            log.warning(
+                "Posture scheduler disabled — failed to load %s: %s",
+                _settings.art_tests_file, exc,
+            )
+            _art_tests = []
+
+        if _art_tests:
+            _posture_task = asyncio.create_task(
+                _red_team.posture_schedule_loop(
+                    _db,
+                    _art_tests,
+                    _settings.redteam_target_container,
+                    _settings.posture_run_schedule_seconds,
+                ),
+                name="posture-scheduler",
+            )
+
     log.info(
         "Shaferhund agent started (wazuh-tailer + suricata-tailer + urlhaus-poller running)"
     )
@@ -205,7 +235,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown — cancel all background tasks
-    for task in (_tailer_task, _suricata_tailer_task, _urlhaus_task):
+    for task in (_tailer_task, _suricata_tailer_task, _urlhaus_task, _posture_task):
         if task:
             task.cancel()
             try:
@@ -309,6 +339,9 @@ async def health() -> JSONResponse:
         if _db is not None
         else 0
     )
+    posture_row = get_latest_posture_run(_db) if _db is not None else None
+    posture_last_score = float(posture_row["score"]) if posture_row is not None else None
+    posture_last_run_at = posture_row["started_at"] if posture_row is not None else None
     return JSONResponse({
         "status": "ok",
         "poller_healthy": _poller_healthy,
@@ -317,6 +350,10 @@ async def health() -> JSONResponse:
         },
         "canary": {
             "trigger_count_24h": canary_24h,
+        },
+        "posture": {
+            "last_score": posture_last_score,
+            "last_run_at": posture_last_run_at,
         },
     })
 
@@ -648,6 +685,78 @@ async def canary_hit(token: str, request: Request) -> JSONResponse:
     # Always return innocuous 200 regardless of whether the token was known.
     # A 404 for unknown tokens would let an attacker enumerate valid tokens.
     return JSONResponse({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Posture run route (Phase 3, REQ-P0-P3-001)
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/posture/run",
+    dependencies=[Depends(_require_auth)],
+)
+async def posture_run() -> JSONResponse:
+    """Fire an ad-hoc Atomic Red Team posture batch and return immediately.
+
+    Auth-gated via _require_auth — this endpoint execs commands inside a
+    container and must NOT be exposed without token protection.
+
+    Creates a posture_runs row with status='running', then fires the batch
+    as an asyncio background task. Returns immediately with the run_id so
+    callers can poll /health for last_score / last_run_at.
+
+    Returns:
+        JSON: {run_id: int, status: "running"}
+
+    @decision DEC-REDTEAM-004
+    @title POST /posture/run inserts the DB row before fire-and-forget
+    @status accepted
+    @rationale Inserting the posture_runs row synchronously before spawning
+               the asyncio task means the caller receives a valid run_id
+               immediately. The background task then updates the same row
+               to 'complete' or 'failed'. This avoids a race where the
+               caller polls before the row exists. The row is committed
+               before the task starts — SQLite's WAL mode allows concurrent
+               readers to see it immediately.
+    """
+    if _db is None or _settings is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+
+    try:
+        tests = _red_team.load_atomic_tests(_settings.art_tests_file)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to load ART tests file ({_settings.art_tests_file}): {exc}",
+        )
+
+    if not tests:
+        raise HTTPException(status_code=422, detail="No ART tests defined in art_tests_file")
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    technique_ids = [t.get("technique_id", "unknown") for t in tests]
+    run_id = insert_posture_run(_db, started_at, technique_ids, len(tests))
+
+    # Fire-and-forget: run_batch runs synchronously in a thread so the event
+    # loop is not blocked during subprocess calls (same pattern as posture_schedule_loop).
+    loop = asyncio.get_event_loop()
+
+    async def _run_in_background() -> None:
+        try:
+            await loop.run_in_executor(
+                None,
+                _red_team.run_batch,
+                _db,
+                tests,
+                _settings.redteam_target_container,
+                None,  # use default executor (podman exec)
+            )
+        except Exception as exc:
+            log.error("Background posture run %d error: %s", run_id, exc, exc_info=True)
+
+    asyncio.create_task(_run_in_background(), name=f"posture-run-{run_id}")
+    log.info("POST /posture/run: started run_id=%d (%d tests)", run_id, len(tests))
+    return JSONResponse({"run_id": run_id, "status": "running"})
 
 
 async def _canary_enqueue(alert_obj) -> None:

@@ -1,0 +1,25 @@
+# Cached sample ART YAML for deterministic tests.
+# Shape mirrors atomic_tests.yaml — used by test_red_team_harness.py so tests
+# do not depend on the repo-root file (which may change in future phases).
+
+tests:
+  - technique_id: "T1059.003"
+    test_name: "Command and Scripting Interpreter: Windows Command Shell (bash stub)"
+    command_or_script_hint: >
+      echo 'ART T1059.003 test'
+    expected_wazuh_rule_ids:
+      - 5501
+
+  - technique_id: "T1053.003"
+    test_name: "Scheduled Task/Job: Cron (list cron jobs)"
+    command_or_script_hint: >
+      crontab -l 2>/dev/null || echo 'no crontab'
+    expected_wazuh_rule_ids:
+      - 5401
+
+  - technique_id: "T1087.001"
+    test_name: "Account Discovery: Local Account"
+    command_or_script_hint: >
+      cat /etc/passwd | cut -d: -f1 | head -5
+    expected_wazuh_rule_ids:
+      - 5715

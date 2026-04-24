@@ -136,11 +136,50 @@ services:
       - RULES_DIR=/rules
       - TRIAGE_HOURLY_BUDGET=20
       - SHAFERHUND_TOKEN=${SHAFERHUND_TOKEN:-}
+      - POSTURE_RUN_SCHEDULE_SECONDS=${POSTURE_RUN_SCHEDULE_SECONDS:-0}
+      - REDTEAM_TARGET_CONTAINER=${REDTEAM_TARGET_CONTAINER:-redteam-target}
+      - ART_TESTS_FILE=${ART_TESTS_FILE:-atomic_tests.yaml}
     volumes:
       - wazuh_logs:/var/ossec/logs:ro
       - shaferhund_rules:/rules
       - shaferhund_data:/data
       - suricata_logs:/var/log/suricata:ro
+
+  # Phase 3 — Atomic Red Team target container (REQ-P0-P3-001, DEC-REDTEAM-001)
+  # A minimal Ubuntu 22.04 host with a Wazuh agent installed. The Wazuh agent
+  # is NOT enrolled at build time — enrollment happens at runtime via env var
+  # or volume mount. ART commands are exec'd into this container by the
+  # shaferhund-agent via `podman exec redteam-target /bin/bash -c <cmd>`.
+  # The container runs indefinitely (tail -f /dev/null) so it is always ready
+  # to receive exec calls from the harness without restart churn.
+  #
+  # Network: shares the default compose network so wazuh.manager can receive
+  # agent registration from within the container, and shaferhund-agent can exec
+  # commands into it via the container name.
+  #
+  # @decision DEC-REDTEAM-005
+  # @title redteam-target as a long-running stub container, enrollment deferred
+  # @status accepted
+  # @rationale Phase 3 scope establishes the container shape and wires the
+  #            harness. Wazuh agent enrollment (ossec-authd, agent.conf) is
+  #            a Phase 3 integration step that requires a running Wazuh manager
+  #            with a known registration key. Baking enrollment into the image
+  #            would require build-time secrets. Instead, operators enroll after
+  #            first `compose up` by exec-ing into the container and running
+  #            `agent-auth -m wazuh.manager`. This matches the Wazuh 4.x
+  #            recommended enrollment workflow.
+  redteam-target:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.redteam-target
+    image: shaferhund-redteam-target:latest
+    container_name: redteam-target
+    restart: unless-stopped
+    depends_on:
+      - wazuh.manager
+    # No ports exposed — the container is exec'd into by shaferhund-agent,
+    # not reached via TCP from the host or external networks.
+    entrypoint: ["/bin/bash", "-c", "tail -f /dev/null"]
 
 volumes:
   wazuh_api_configuration:

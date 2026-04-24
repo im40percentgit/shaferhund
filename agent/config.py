@@ -81,6 +81,17 @@ class Settings(BaseSettings):
     # be resolvable — configure a wildcard DNS record or Wazuh DNS monitoring.
     canary_base_hostname: str = "canary.local"
 
+    # Phase 3 — Atomic Red Team posture evaluation (REQ-P0-P3-001)
+    # Seconds between automatic posture runs. 0 = ad-hoc only (POST /posture/run).
+    # Non-zero values enable a sleep-loop scheduler in the lifespan (DEC-POSTURE-002).
+    posture_run_schedule_seconds: int = 0
+    # Name of the container the ART harness execs commands into.
+    # Must match the service name (or container_name) in compose.yaml.
+    redteam_target_container: str = "redteam-target"
+    # Path to the declarative YAML file listing ART test definitions (DEC-REDTEAM-002).
+    # Relative paths are resolved from the process CWD (the repo root in compose).
+    art_tests_file: str = "atomic_tests.yaml"
+
     # Auto-deploy policy gate (Phase 2, REQ-P0-P2-006, DEC-AUTODEPLOY-001)
     # Default OFF — operator must explicitly enable via env var.
     AUTO_DEPLOY_ENABLED: bool = False
