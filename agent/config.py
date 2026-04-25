@@ -55,6 +55,19 @@ class Settings(BaseSettings):
     # Default is 'single' so existing deployments are byte-identical until opt-in.
     shaferhund_auth_mode: str = "single"
 
+    # Phase 6 Wave A3 — Audit log HMAC key (REQ-P0-P6-005, DEC-AUDIT-P6-001)
+    # Operator-supplied hex string (recommend 32 bytes = 64 hex chars) used to
+    # key the HMAC-SHA256 chain over audit_log rows.  The same key is reused by
+    # Wave A4 fleet manifest signing so operators manage a single audit/fleet secret.
+    #
+    # If unset (empty string), a WARNING is logged at startup and an ephemeral
+    # fallback key derived from SHAFERHUND_TOKEN is used within the session.
+    # The chain is still tamper-evident within a session, but breaks across
+    # restarts if the key changes.  PRODUCTION DEPLOYMENTS MUST SET THIS VALUE.
+    #
+    # Env var: SHAFERHUND_AUDIT_KEY
+    shaferhund_audit_key: str = ""
+
     # Claude model
     claude_model: str = "claude-opus-4-5"
 

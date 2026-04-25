@@ -93,6 +93,7 @@ Route RBAC table (Wave A2, REQ-P0-P6-004):
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -105,10 +106,11 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from .cluster import Alert, AlertClusterer, Cluster, parse_wazuh_alert
 from .config import Settings, get_settings
@@ -154,6 +156,11 @@ from .models import (
 )
 from . import slo as _slo
 from . import recommendations as _recommendations
+from . import audit as _audit
+from .models import (
+    count_audit_events,
+    list_audit_events,
+)
 
 log = logging.getLogger(__name__)
 
@@ -162,6 +169,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _settings: Optional[Settings] = None
 _db = None
+_audit_hmac_key: bytes = b""  # populated in lifespan; see _resolve_audit_key()
 _triage_queue: Optional[TriageQueue] = None
 _clusterer: Optional[AlertClusterer] = None
 _tailer_task: Optional[asyncio.Task] = None
@@ -224,15 +232,61 @@ def _probe_sigmac(settings: Settings) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Audit HMAC key resolver (DEC-AUDIT-P6-001)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_audit_key(settings: Settings) -> bytes:
+    """Derive the HMAC key bytes for the audit_log chain.
+
+    Priority:
+      1. SHAFERHUND_AUDIT_KEY env var (hex string → bytes).  Recommended for
+         production.  Operators should generate via ``openssl rand -hex 32``.
+      2. Fallback: SHA-256 of SHAFERHUND_TOKEN (produces a stable-within-session
+         key so the chain is intact during a run, but breaks across restarts
+         if the token changes).  A WARNING is logged to remind operators to
+         set the dedicated env var.
+
+    Returns:
+        Raw key bytes, always non-empty.  If the operator-supplied hex string
+        is invalid (e.g. odd length), falls back to option 2 with a WARNING.
+    """
+    audit_key_hex = getattr(settings, "shaferhund_audit_key", "") or ""
+    if audit_key_hex:
+        try:
+            key_bytes = bytes.fromhex(audit_key_hex)
+            log.info(
+                "Audit HMAC key loaded from SHAFERHUND_AUDIT_KEY (%d bytes)",
+                len(key_bytes),
+            )
+            return key_bytes
+        except ValueError:
+            log.warning(
+                "SHAFERHUND_AUDIT_KEY is not valid hex — falling back to token-derived key"
+            )
+
+    # Fallback: derive from SHAFERHUND_TOKEN (or a fixed salt if unset).
+    token = getattr(settings, "shaferhund_token", "") or "shaferhund-audit-fallback"
+    key_bytes = hashlib.sha256(token.encode()).digest()
+    log.warning(
+        "SHAFERHUND_AUDIT_KEY is not set — using token-derived ephemeral audit key. "
+        "The audit chain is intact within this session but may break across restarts. "
+        "Set SHAFERHUND_AUDIT_KEY to a stable 32-byte hex value for production use."
+    )
+    return key_bytes
+
+
+# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _settings, _db, _triage_queue, _clusterer, _tailer_task, _suricata_tailer_task, _urlhaus_task, _posture_task, _slo_task, _cloudtrail_task
+    global _settings, _db, _triage_queue, _clusterer, _tailer_task, _suricata_tailer_task, _urlhaus_task, _posture_task, _slo_task, _cloudtrail_task, _audit_hmac_key
 
     _settings = get_settings()
     _probe_sigmac(_settings)
+    _audit_hmac_key = _resolve_audit_key(_settings)
     _db = init_db(_settings.db_path)
     _clusterer = AlertClusterer(
         window_seconds=_settings.cluster_window_seconds,
@@ -376,6 +430,86 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 # ---------------------------------------------------------------------------
+# Audit middleware (Phase 6 Wave A3, REQ-P0-P6-005)
+#
+# @decision DEC-AUDIT-P6-002
+# @title Audit middleware fires after response; skips unauthenticated requests
+# @status accepted
+# @rationale BaseHTTPMiddleware wraps every request so no per-route boilerplate
+#            is needed. The middleware only records a row when request.state
+#            carries a resolved user (set by _require_auth). Public routes
+#            (/health, /canary/hit) never call _require_auth and therefore
+#            never set request.state.user — the middleware skips them cleanly.
+#            Audit insert is best-effort: a DB error logs and continues so the
+#            response is never blocked (DEC-SLO-004 pattern).
+# ---------------------------------------------------------------------------
+
+
+class AuditMiddleware(BaseHTTPMiddleware):
+    """Record authenticated mutating requests and admin GETs to audit_log.
+
+    Fires after the route handler has produced a response so the recorded
+    status_code reflects the actual outcome (e.g. 200, 403, 500).
+
+    No-op when:
+    - The route is public (no request.state.user set by _require_auth).
+    - _audit.should_audit(method, path) returns False (viewer/operator GETs).
+    - The DB or audit key is not yet initialised (pre-lifespan calls in tests).
+    """
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        response = await call_next(request)
+
+        # Only record if auth resolved a user (set on request.state by _require_auth).
+        user = getattr(request.state, "user", None)
+        if user is None:
+            return response
+
+        method = request.method
+        path = request.url.path
+
+        if not _audit.should_audit(method, path):
+            return response
+
+        if _db is None or not _audit_hmac_key:
+            return response
+
+        # Build body excerpt from cached body bytes stored by _require_auth.
+        # _require_auth reads request.state.body_bytes when it caches the body
+        # for JSON endpoints; for routes with no body this will be absent/None.
+        raw_body = getattr(request.state, "body_bytes", None)
+        body_excerpt: str | None = None
+        if raw_body:
+            try:
+                body_excerpt = raw_body.decode("utf-8", errors="replace")[:200]
+            except Exception:
+                body_excerpt = None
+
+        try:
+            _audit.record_audit(
+                conn=_db,
+                key=_audit_hmac_key,
+                actor_username=user.get("username", "__unknown__"),
+                actor_role=user.get("role", "unknown"),
+                method=method,
+                path=path,
+                status_code=response.status_code,
+                body_excerpt=body_excerpt,
+            )
+        except Exception as exc:
+            log.error(
+                "audit_log insert failed for %s %s (actor=%s): %s",
+                method, path, user.get("username"), exc,
+            )
+            # Best-effort — never block the response.
+
+        return response
+
+
+app.add_middleware(AuditMiddleware)
+
+
+# ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
 
@@ -383,12 +517,18 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 
 
 def _require_auth(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
 ) -> dict:
     """FastAPI dependency: enforce bearer token auth.
 
     Returns a user dict so downstream dependencies (Wave A2 _require_role) can
     inspect the resolved user's role without re-authenticating.
+
+    Also stores the resolved user on ``request.state.user`` so the
+    AuditMiddleware can read it after the route handler returns — this avoids
+    re-authenticating in the middleware and keeps the audit record consistent
+    with what the route saw (DEC-AUDIT-P6-002).
 
     Two modes (DEC-AUTH-P6-004, DEC-COMPAT-P6-001):
 
@@ -430,6 +570,7 @@ def _require_auth(
     if auth_mode == "single":
         if not legacy_token:
             # No token configured → localhost-only binding is the guard.
+            request.state.user = LEGACY_ADMIN_USER
             return LEGACY_ADMIN_USER
         if provided != legacy_token:
             raise HTTPException(
@@ -437,6 +578,7 @@ def _require_auth(
                 detail="Invalid or missing token",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        request.state.user = LEGACY_ADMIN_USER
         return LEGACY_ADMIN_USER
 
     # ------------------------------------------------------------------
@@ -444,6 +586,7 @@ def _require_auth(
     # ------------------------------------------------------------------
     # Legacy SHAFERHUND_TOKEN still works as admin-equivalent (DEC-AUTH-P6-004).
     if legacy_token and provided == legacy_token:
+        request.state.user = LEGACY_ADMIN_USER
         return LEGACY_ADMIN_USER
 
     if not provided:
@@ -460,6 +603,7 @@ def _require_auth(
             detail="Invalid or missing token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    request.state.user = user
     return user
 
 
@@ -1243,6 +1387,65 @@ async def list_cloud_findings_route(
         finding["event_age_seconds"] = age
         result.append(finding)
 
+    return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
+# Audit log routes (Phase 6 Wave A3, REQ-P0-P6-005)
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/audit",
+    dependencies=[Depends(_require_role("admin"))],
+)
+async def list_audit_route(
+    limit: int = 100,
+    since_id: Optional[int] = None,
+    actor: Optional[str] = None,
+) -> JSONResponse:
+    """Return paginated audit_log rows, newest-first.
+
+    Requires admin role — audit trail access is admin-only (DEC-AUDIT-P6-002).
+
+    Query params:
+        limit    — Max rows to return (default 100, capped at 500).
+        since_id — If set, return only rows with id > since_id (forward pagination).
+        actor    — If set, filter by actor_username (exact match).
+
+    Returns:
+        JSON array of audit_log row objects in descending id order.
+        Empty array when no rows match the filter.
+    """
+    if _db is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+
+    limit = max(1, min(limit, 500))
+    rows = list_audit_events(_db, limit=limit, since_id=since_id, actor=actor)
+    return JSONResponse([dict(r) for r in rows])
+
+
+@app.get(
+    "/audit/verify",
+    dependencies=[Depends(_require_role("admin"))],
+)
+async def verify_audit_chain() -> JSONResponse:
+    """Re-compute the audit_log HMAC chain and report the first break.
+
+    Requires admin role — operators run this after a suspected incident to
+    confirm or deny tampering (DEC-AUDIT-P6-001).
+
+    Returns:
+        JSON object:
+            intact          (bool)      — True iff every row's HMAC matches.
+            total_rows      (int)       — Number of rows examined.
+            broken_at_id    (int|null)  — First row id where the chain breaks.
+            broken_field_clue (str|null)— Human-readable hint about what differs.
+    """
+    if _db is None or not _audit_hmac_key:
+        raise HTTPException(status_code=503, detail="Database or audit key not ready")
+
+    result = _audit.verify_chain(_db, _audit_hmac_key)
     return JSONResponse(result)
 
 

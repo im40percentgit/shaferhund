@@ -29,14 +29,14 @@ CRUD helpers: get_cloudtrail_cursor, update_cloudtrail_cursor,
 insert_cloudtrail_alert.
 
 @decision DEC-SCHEMA-P6-001
-@title Phase 6 users + user_tokens tables via idempotent CREATE TABLE IF NOT EXISTS
+@title Phase 6 tables via idempotent CREATE TABLE IF NOT EXISTS (Wave A1 + A3)
 @status accepted
 @rationale Six new tables in Phase 6 (users, user_tokens, audit_log, fleet_agents,
-           fleet_checkins, rule_tags). This Wave A1 issue adds users + user_tokens.
-           Both use CREATE TABLE IF NOT EXISTS so a Phase 5 DB upgrades in place
-           without data loss or a migration framework (DEC-SCHEMA-002 pattern).
-           role CHECK constraint and UNIQUE constraints enforce integrity at the
-           DB layer, not only at the application layer.
+           fleet_checkins, rule_tags). Wave A1 adds users + user_tokens; Wave A3
+           adds audit_log. All use CREATE TABLE IF NOT EXISTS so a Phase 5 DB
+           upgrades in place without data loss or a migration framework
+           (DEC-SCHEMA-002 pattern). Constraints (role CHECK, UNIQUE) enforce
+           integrity at the DB layer, not only at the application layer.
 
 @decision DEC-CLOUD-011
 @title cloudtrail_progress uses CREATE TABLE IF NOT EXISTS — idempotent for all prior DBs
@@ -572,6 +572,53 @@ CREATE INDEX IF NOT EXISTS idx_user_tokens_user_id    ON user_tokens(user_id);
 """
 
 
+# ---------------------------------------------------------------------------
+# Phase 6 Wave A3 schema additions — audit_log table
+# (REQ-P0-P6-005, DEC-AUDIT-P6-001, DEC-AUDIT-P6-002)
+# ---------------------------------------------------------------------------
+#
+# audit_log: append-only tamper-evident log of every authenticated mutating
+# request and every admin-only GET.  Each row's HMAC is chained to the
+# previous row's HMAC so any tampering with historical rows breaks the chain
+# at exactly that ID.
+#
+# Columns:
+#   ts              — UTC ISO-8601 timestamp of the request.
+#   actor_username  — 'username' from the auth token, or '__legacy_token__'
+#                     for single-mode SHAFERHUND_TOKEN deployments.
+#   actor_role      — resolved role ('viewer', 'operator', 'admin').
+#   method          — HTTP method (POST, DELETE, etc.).
+#   path            — URL path (e.g. /posture/run).
+#   status_code     — HTTP response status code.
+#   body_excerpt    — first _BODY_EXCERPT_MAX chars of request body after
+#                     sanitize_alert_field(); NULL for methods with no body.
+#   prev_hmac       — previous row's row_hmac; NULL for the first row.
+#   row_hmac        — HMAC-SHA256(key, canonical(prev_hmac || row_data)).
+#
+# DEC-AUDIT-P6-001: CREATE TABLE IF NOT EXISTS — idempotent for Phase 6 Wave
+#   A1/A2-baseline DBs and all prior Phase DBs (DEC-SCHEMA-002 pattern).
+# DEC-SCHEMA-P6-001: follows the same idempotent-migration pattern as all
+#   other Phase 6 tables.
+
+_AUDIT_LOG_SQL = """
+CREATE TABLE IF NOT EXISTS audit_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              TEXT    NOT NULL,
+    actor_username  TEXT    NOT NULL,
+    actor_role      TEXT    NOT NULL,
+    method          TEXT    NOT NULL,
+    path            TEXT    NOT NULL,
+    status_code     INTEGER NOT NULL,
+    body_excerpt    TEXT,
+    prev_hmac       TEXT,
+    row_hmac        TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_ts    ON audit_log(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor_username);
+"""
+
+
 def init_db(db_path: str) -> sqlite3.Connection:
     """Open (or create) the SQLite database and apply schema.
 
@@ -682,6 +729,9 @@ def init_db(db_path: str) -> sqlite3.Connection:
 
     # Phase 6 Wave A1: user_tokens table (REQ-P0-P6-003, DEC-SCHEMA-P6-001).
     conn.executescript(_USER_TOKENS_SQL)
+
+    # Phase 6 Wave A3: audit_log table (REQ-P0-P6-005, DEC-AUDIT-P6-001).
+    conn.executescript(_AUDIT_LOG_SQL)
 
     conn.commit()
     log.info("Database initialised at %s", db_path)
@@ -2468,3 +2518,115 @@ def list_user_tokens(
         "SELECT * FROM user_tokens WHERE user_id = ? ORDER BY created_at ASC",
         (user_id,),
     ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 Wave A3 — audit_log CRUD helpers (REQ-P0-P6-005, DEC-AUDIT-P6-001)
+# ---------------------------------------------------------------------------
+
+
+def get_latest_audit_hmac(conn: sqlite3.Connection) -> Optional[str]:
+    """Return the ``row_hmac`` of the most recent audit_log row, or None.
+
+    Used by ``insert_audit_event`` to chain the new row's HMAC to the previous
+    row.  Returns None when the table is empty (first row has prev_hmac=NULL).
+
+    The query selects by MAX(id) rather than ORDER BY id DESC LIMIT 1 to be
+    explicit about which row is "latest" in a concurrent write scenario — the
+    highest id wins.
+    """
+    row = conn.execute(
+        "SELECT row_hmac FROM audit_log WHERE id = (SELECT MAX(id) FROM audit_log)"
+    ).fetchone()
+    if row is None:
+        return None
+    return row[0]
+
+
+def insert_audit_event(
+    conn: sqlite3.Connection,
+    ts: str,
+    actor_username: str,
+    actor_role: str,
+    method: str,
+    path: str,
+    status_code: int,
+    body_excerpt: Optional[str],
+    prev_hmac: Optional[str],
+    row_hmac: str,
+) -> int:
+    """Insert one row into audit_log within a single transaction.
+
+    The caller (record_audit in agent/audit.py) must read prev_hmac via
+    get_latest_audit_hmac and compute row_hmac before calling this function.
+    This function only does the INSERT — the transaction lock prevents a
+    concurrent writer from inserting between the read and the insert.
+
+    Returns the new row's id (``lastrowid``).
+
+    Raises:
+        sqlite3.Error on DB failure.
+    """
+    with get_cursor(conn) as cur:
+        cur.execute(
+            """
+            INSERT INTO audit_log
+                (ts, actor_username, actor_role, method, path,
+                 status_code, body_excerpt, prev_hmac, row_hmac)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                ts,
+                actor_username,
+                actor_role,
+                method,
+                path,
+                status_code,
+                body_excerpt,
+                prev_hmac,
+                row_hmac,
+            ),
+        )
+        return cur.lastrowid  # type: ignore[return-value]
+
+
+def list_audit_events(
+    conn: sqlite3.Connection,
+    limit: int = 100,
+    since_id: Optional[int] = None,
+    actor: Optional[str] = None,
+) -> list[sqlite3.Row]:
+    """Return audit_log rows, newest-first by id.
+
+    Args:
+        limit:    Maximum number of rows to return (default 100, max 500).
+        since_id: If set, return only rows with id > since_id (pagination).
+        actor:    If set, filter by actor_username (exact match).
+
+    Returns:
+        List of sqlite3.Row objects in descending id order.
+    """
+    limit = min(limit, 500)
+    clauses = []
+    params: list = []
+
+    if since_id is not None:
+        clauses.append("id > ?")
+        params.append(since_id)
+    if actor is not None:
+        clauses.append("actor_username = ?")
+        params.append(actor)
+
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(limit)
+
+    return conn.execute(
+        f"SELECT * FROM audit_log {where} ORDER BY id DESC LIMIT ?",
+        params,
+    ).fetchall()
+
+
+def count_audit_events(conn: sqlite3.Connection) -> int:
+    """Return the total number of rows in audit_log."""
+    row = conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()
+    return row[0] if row else 0
