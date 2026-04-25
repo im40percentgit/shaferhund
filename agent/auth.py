@@ -78,6 +78,48 @@ log = logging.getLogger(__name__)
 VALID_ROLES: frozenset[str] = frozenset({"viewer", "operator", "admin"})
 
 # ---------------------------------------------------------------------------
+# Role hierarchy (DEC-AUTH-P6-005)
+#
+# @decision DEC-AUTH-P6-005
+# @title Ordered role tuple defines viewer < operator < admin hierarchy
+# @status accepted
+# @rationale _require_role(r) needs to answer "does user_role satisfy required_role?"
+#            An ordered tuple makes this a single index-comparison (O(1)) with
+#            no branching. Closed-default: any role not in the tuple returns
+#            False regardless of position — unknown roles never bypass auth.
+#            In single mode, LEGACY_ADMIN_USER carries role='admin' so it
+#            satisfies every role check (viewer, operator, admin) automatically,
+#            preserving Phase 1–5 backwards compatibility without special-casing.
+# ---------------------------------------------------------------------------
+
+ROLE_HIERARCHY: tuple[str, ...] = ("viewer", "operator", "admin")
+"""Ordered role tuple from least to most privileged.
+
+Index position encodes privilege: viewer=0, operator=1, admin=2.
+A user satisfies a required role iff their role's index >= the required
+role's index. Roles outside this tuple (including unknown/novel values)
+return False from role_satisfies — closed-default, no bypass via novel roles.
+"""
+
+
+def role_satisfies(user_role: str, required_role: str) -> bool:
+    """Return True iff user_role is at least required_role per ROLE_HIERARCHY.
+
+    Closed-default: roles outside ROLE_HIERARCHY return False (unknown roles
+    fail closed — no auth bypass via novel role values in the DB).
+
+    Examples:
+        role_satisfies('admin', 'viewer')   → True   (admin beats viewer)
+        role_satisfies('operator', 'admin') → False  (operator < admin)
+        role_satisfies('viewer', 'viewer')  → True   (exact match)
+        role_satisfies('hacker', 'viewer')  → False  (unknown user role)
+        role_satisfies('admin', 'hacker')   → False  (unknown required role)
+    """
+    if user_role not in ROLE_HIERARCHY or required_role not in ROLE_HIERARCHY:
+        return False
+    return ROLE_HIERARCHY.index(user_role) >= ROLE_HIERARCHY.index(required_role)
+
+# ---------------------------------------------------------------------------
 # Argon2id password hasher (DEC-AUTH-P6-001)
 #
 # argon2-cffi PasswordHasher defaults (as of 21.x):
