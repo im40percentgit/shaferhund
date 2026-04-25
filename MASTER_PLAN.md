@@ -826,8 +826,10 @@ shaferhund/
 
 ## Phase 5: Cloud Eyes (3 weeks after Phase 4)
 
-**Status:** planned
+**Status:** completed
 **Timebox:** 3 weeks
+**Landed:** 2026-04-25 across PRs #61, #62, #63, #64, #65 (all squash-merged from `feature/phase5-*` branches; final commit `9fe8158`)
+**Verified:** 2026-04-25 via Phase 5 zero-regression gate (issue #59): 308 passed / 1 skipped / 3 deselected / 0 failed; `/health` integrates all 6 keys (`status`, `poller_healthy`, `threat_intel`, `canary`, `posture` with 4 sub-keys, `recommendations.pending_count`, `cloudtrail` with 4 keys); DB migration Phase 4 → Phase 5 idempotent (adds `cloudtrail_progress` and `cloud_audit_findings` tables); orchestrator TOOLS=9; `compose.yaml` unchanged at 5 services; `compose.localstack.yaml` separate opt-in for integration tests; IAM policy read-only verified (zero write actions).
 
 ### Intent
 
@@ -1037,19 +1039,21 @@ shaferhund/
 
 | ID | Title | Status |
 |----|-------|--------|
-| DEC-CLOUD-001 | AWS CloudTrail as the first cloud provider; one-provider-only Phase 5; GCP/Azure deferred to Phase 6 with same pattern | planned |
-| DEC-CLOUD-002 | S3 polling (not EventBridge/Kinesis); 60s default cadence; cursor-in-DB via `cloudtrail_progress` table | planned |
-| DEC-CLOUD-003 | `source='cloudtrail'` reuses shared `alerts` table; clusterer/orchestrator/policy gate require zero changes | planned |
-| DEC-CLOUD-004 | Severity assigned by deterministic heuristic table at parse time; LLM does contextual triage downstream | planned |
-| DEC-CLOUD-005 | `cloud_audit_findings` is additive to clusters; deterministic detector runs synchronously after clusterer | planned |
-| DEC-CLOUD-006 | LocalStack for integration tests + moto for unit tests; real AWS validation manual before phase close | planned |
-| DEC-CLOUD-007 | `lookup_cloud_identity` is the 9th tool via existing `register_tool` API; no dispatch refactor | planned |
-| DEC-CLOUD-008 | Single IAM role / single-user auth retained; multi-user RBAC explicitly deferred to Phase 6 with rule fleet | planned |
-| DEC-CLOUD-009 | `finding_type` enum is a code-resident frozenset (per DEC-RECOMMEND-002 pattern); new types via PR, not config | planned |
-| DEC-CLOUD-010 | CloudTrail S3 key shape is time-ordered; `StartAfter` is sufficient; documented assumption + sanity test guards future drift | planned |
-| DEC-CLOUD-011 | New tables (`cloudtrail_progress`, `cloud_audit_findings`) follow DEC-SCHEMA-002 idempotent ALTER pattern | planned |
-| DEC-CLOUD-012 | `CLOUDTRAIL_ENABLED` defaults to `false`; the source is opt-in; absent AWS creds is a clean degraded mode, not a startup failure | planned |
+| DEC-CLOUD-001 | AWS CloudTrail as the first cloud provider; one-provider-only Phase 5; GCP/Azure deferred to Phase 6 with same pattern | accepted |
+| DEC-CLOUD-002 | S3 polling (not EventBridge/Kinesis); 60s default cadence; cursor-in-DB via `cloudtrail_progress` table | accepted |
+| DEC-CLOUD-003 | `source='cloudtrail'` reuses shared `alerts` table; clusterer/orchestrator/policy gate require zero changes | accepted |
+| DEC-CLOUD-004 | Severity assigned by deterministic heuristic table at parse time; LLM does contextual triage downstream | accepted |
+| DEC-CLOUD-005 | `cloud_audit_findings` is additive to clusters; deterministic detector runs synchronously after clusterer | accepted |
+| DEC-CLOUD-006 | LocalStack for integration tests + moto for unit tests; real AWS validation manual before phase close | accepted |
+| DEC-CLOUD-007 | `lookup_cloud_identity` is the 9th tool via existing `register_tool` API; no dispatch refactor | accepted |
+| DEC-CLOUD-008 | Single IAM role / single-user auth retained; multi-user RBAC explicitly deferred to Phase 6 with rule fleet | accepted |
+| DEC-CLOUD-009 | `finding_type` enum is a code-resident frozenset (per DEC-RECOMMEND-002 pattern); new types via PR, not config | accepted |
+| DEC-CLOUD-010 | CloudTrail S3 key shape is time-ordered; `StartAfter` is sufficient; documented assumption + sanity test guards future drift | accepted |
+| DEC-CLOUD-011 | New tables (`cloudtrail_progress`, `cloud_audit_findings`) follow DEC-SCHEMA-002 idempotent ALTER pattern | accepted |
+| DEC-CLOUD-012 | `CLOUDTRAIL_ENABLED` defaults to `false`; the source is opt-in; absent AWS creds is a clean degraded mode, not a startup failure | accepted |
+| DEC-CLOUD-013 | LocalStack integration tests use a skip-if-not-running pattern (`requests.get` health check on `:4566/_localstack/health`); CI stays green when LocalStack is absent, operators opt in via `compose.localstack.yaml`. Closes the long-standing "fixture-only testing is insufficient" loophole that was paused since Phase 2.5 — mocked boto3 cannot catch credential-flow bugs, endpoint-URL misconfigurations, or S3 pagination edge cases. Surfaced empirically by the V7 live-integration check during #54 verification, where 25 unit tests passed but a runtime `ImportError` from a function-local boto3 import only fired against real S3 — same DEC-SLO-004 pattern of unit-tests-pass-but-live-integration-catches-it, now applied as the standing rule for cloud sources | accepted |
 
 ## TODOs
 - [ ] Convert `hund` to `ROADMAP.md` (map 25 domains to phases) — DEFER: the per-phase plans now serve as the de facto roadmap; surface as a real backlog item or close. Recommend closing.
-- [ ] Phase 6+ scoping: GCP Audit Logs + Azure Monitor (multi-cloud, same source-pipeline pattern as Phase 5 CloudTrail); rule fleet distribution to remote Wazuh agents (signed pull, multi-agent rollout) paired with multi-user auth / RBAC / signed audit logs (REQ-NOGO-P2-006 / REQ-NOGO-P4-007 / REQ-NOGO-P5-003 carry-forward); containerised service honeypots (SSH/MySQL/Redis); STIX/TAXII threat-intel federation (multi-feed, indicator deconfliction); adversarial rule-effectiveness scoring (evasion variants, ART payload mutation); multi-tenant posture / per-team scoring; cloud-native rule deploy (push to AWS GuardDuty / Security Hub); real-time CloudTrail via EventBridge → SQS
+- [ ] Phase 6+ scoping: GCP Audit Logs + Azure Monitor (multi-cloud, same source-pipeline pattern as Phase 5 CloudTrail, REQ-NOGO-P5-001 carry-forward); rule fleet distribution to remote Wazuh agents (signed pull, multi-agent rollout) paired with multi-user auth / RBAC / signed audit logs (REQ-NOGO-P2-006 / REQ-NOGO-P4-007 / REQ-NOGO-P5-002 / REQ-NOGO-P5-003 carry-forward); CloudTrail Lake / Athena query backend for `lookup_cloud_identity` at scale (REQ-NOGO-P5-007 / REQ-P2-P5-004); real-time CloudTrail via EventBridge → SQS (REQ-NOGO-P5-008 / REQ-P2-P5-003); multi-account / Organization Trail support (REQ-P2-P5-006); containerised service honeypots (SSH/MySQL/Redis, REQ-NOGO-P5-005); STIX/TAXII threat-intel federation (REQ-NOGO-P5-004); adversarial rule-effectiveness scoring including cloud techniques T1078.004 / T1098.x (REQ-NOGO-P5-010); multi-tenant posture / per-team scoring (REQ-NOGO-P5-006); cloud-native rule deploy (push to AWS GuardDuty / Security Hub, REQ-NOGO-P5-009 / REQ-P2-P5-005)
+- [x] Backlog item #5 "fixture-only testing is insufficient" — CLOSED 2026-04-25 by Phase 5 Wave B2 (PR #65 / issue #58): LocalStack integration harness in `tests/integration/test_cloudtrail_localstack.py` exercises real boto3 against an AWS-API-compatible S3 service, gated by skip-if-not-running. Standing rule via DEC-CLOUD-013.
