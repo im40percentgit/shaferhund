@@ -150,7 +150,7 @@ def _make_config(max_calls: int = 5, wall_timeout: float = 10.0) -> SimpleNamesp
 
 
 def test_health_returns_only_liveness_fields(tmp_path):
-    """GET /health → exactly {status, poller_healthy, threat_intel, canary, posture, recommendations, cloudtrail}.
+    """GET /health → exactly {status, poller_healthy, threat_intel, canary, posture, recommendations, cloudtrail, auth, fleet}.
 
     Phase 3 (REQ-P0-P3-005) added threat_intel.record_count to /health.
     Phase 3 (REQ-P0-P3-004) added canary.trigger_count_24h to /health.
@@ -159,6 +159,7 @@ def test_health_returns_only_liveness_fields(tmp_path):
     Phase 4 (REQ-P0-P4-005) adds posture.slo_breach_open to /health.
     Phase 4 Wave B (REQ-P0-P4-001) adds recommendations.pending_count to /health.
     Phase 5 Wave A3 (REQ-P0-P5-006) adds cloudtrail block to /health.
+    Phase 6 Wave B3 (REQ-P1-P6-005) adds auth + fleet blocks to /health (9 keys total).
     All fields are minimal summary values that do not expose operational detail,
     consistent with DEC-HEALTH-002's "public liveness probe" intent.
     """
@@ -171,9 +172,9 @@ def test_health_returns_only_liveness_fields(tmp_path):
     data = resp.json()
     assert set(data.keys()) == {
         "status", "poller_healthy", "threat_intel", "canary", "posture",
-        "recommendations", "cloudtrail",
+        "recommendations", "cloudtrail", "auth", "fleet",
     }, (
-        f"Expected exactly 7 keys including 'cloudtrail' (Phase 5 Wave A3), "
+        f"Expected exactly 9 keys including 'auth' and 'fleet' (Phase 6 Wave B3), "
         f"got keys: {set(data.keys())}"
     )
     assert data["status"] == "ok"

@@ -184,6 +184,12 @@ from .models import (
     update_user_password,
 )
 from .auth import generate_token, hash_password, verify_password
+from .observability import (
+    build_health_auth_block,
+    build_health_fleet_block,
+    build_metrics_auth_block,
+    build_metrics_fleet_block,
+)
 
 log = logging.getLogger(__name__)
 
@@ -853,6 +859,14 @@ async def health() -> JSONResponse:
             "last_poll_at": _CT_STATS["last_poll_at"],
             "findings_count": ct_findings,
         },
+        # Phase 6 Wave B3 — REQ-P1-P6-005 / DEC-HEALTH-002
+        # Minimal auth + fleet counters. Per DEC-OBSERVABILITY-P6-001:
+        # - auth block: mode, users_count, last_login_at only (no per-role detail)
+        # - fleet block: manifest_fetches_24h + last_manifest_fetch_at only
+        # Rich operational stats (per-role counts, token buckets, tag totals)
+        # are auth-gated in /metrics per DEC-HEALTH-002.
+        "auth": build_health_auth_block(_db, _settings),
+        "fleet": build_health_fleet_block(_db),
     })
 
 
@@ -983,6 +997,12 @@ async def metrics() -> JSONResponse:
         # DEC-HEALTH-002: all error counters, cursor fields, and lifetime totals
         # live here behind auth, NOT in the public /health endpoint.
         "cloudtrail": _build_cloudtrail_metrics_block(_db, _settings),
+        # Phase 6 Wave B3 — per-role auth stats + fleet operational stats.
+        # (REQ-P1-P6-005, DEC-OBSERVABILITY-P6-001, DEC-HEALTH-002)
+        # Richer than the public /health blocks: per-role user counts, token
+        # buckets, tag totals, deployed rule counts, and manifest endpoint list.
+        "auth": build_metrics_auth_block(_db, _settings),
+        "fleet": build_metrics_fleet_block(_db),
     })
 
 

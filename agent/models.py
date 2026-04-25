@@ -2721,6 +2721,226 @@ def count_audit_events(conn: sqlite3.Connection) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Phase 6 Wave B3 — observability CRUD helpers (REQ-P1-P6-005)
+#
+# These helpers power /health auth.*/fleet.* and /metrics auth/fleet sections.
+# All read from existing tables — no new tables (DEC-SCHEMA-002).
+# ---------------------------------------------------------------------------
+
+
+def get_max_user_last_login(conn: sqlite3.Connection) -> Optional[str]:
+    """Return the most recent last_login_at value across all users, or None.
+
+    Used by /health auth block to report the latest login timestamp without
+    exposing per-user details (DEC-HEALTH-002).
+
+    Returns None when no user has ever logged in (last_login_at IS NULL for
+    all rows, or the table is empty).
+    """
+    row = conn.execute(
+        "SELECT MAX(last_login_at) FROM users WHERE last_login_at IS NOT NULL"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return row[0]
+
+
+def get_max_user_created_at(conn: sqlite3.Connection) -> Optional[str]:
+    """Return the most recent created_at value across all users, or None.
+
+    Used by /metrics auth block to report when the newest user was added.
+    """
+    row = conn.execute("SELECT MAX(created_at) FROM users").fetchone()
+    if row is None or row[0] is None:
+        return None
+    return row[0]
+
+
+def count_users_by_role(conn: sqlite3.Connection) -> dict:
+    """Return a dict mapping each role to its user count.
+
+    Only counts non-disabled users so disabled accounts do not inflate
+    operational role counters.  Returns a dict with 0-count entries for
+    roles that have no users (guaranteed keys: admin, operator, viewer).
+
+    Used by /metrics auth.users_by_role.
+    """
+    rows = conn.execute(
+        """
+        SELECT role, COUNT(*) AS cnt
+          FROM users
+         WHERE disabled = 0
+         GROUP BY role
+        """
+    ).fetchall()
+    counts: dict = {"admin": 0, "operator": 0, "viewer": 0}
+    for row in rows:
+        counts[row[0]] = row[1]
+    return counts
+
+
+def count_users_disabled(conn: sqlite3.Connection) -> int:
+    """Return the count of users with disabled=1.
+
+    Used by /metrics auth.users_disabled_count.
+    """
+    row = conn.execute("SELECT COUNT(*) FROM users WHERE disabled = 1").fetchone()
+    return row[0] if row else 0
+
+
+def count_tokens_by_status(conn: sqlite3.Connection) -> dict:
+    """Return token counts bucketed into active, revoked, and expired.
+
+    Definitions:
+      active  -- revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now)
+      revoked -- revoked_at IS NOT NULL
+      expired -- revoked_at IS NULL AND expires_at IS NOT NULL AND expires_at <= now
+
+    Used by /metrics auth.tokens_*.
+
+    Returns dict with keys: active, revoked, expired.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    row_active = conn.execute(
+        """
+        SELECT COUNT(*) FROM user_tokens
+         WHERE revoked_at IS NULL
+           AND (expires_at IS NULL OR expires_at > ?)
+        """,
+        (now_iso,),
+    ).fetchone()
+
+    row_revoked = conn.execute(
+        "SELECT COUNT(*) FROM user_tokens WHERE revoked_at IS NOT NULL"
+    ).fetchone()
+
+    row_expired = conn.execute(
+        """
+        SELECT COUNT(*) FROM user_tokens
+         WHERE revoked_at IS NULL
+           AND expires_at IS NOT NULL
+           AND expires_at <= ?
+        """,
+        (now_iso,),
+    ).fetchone()
+
+    return {
+        "active": row_active[0] if row_active else 0,
+        "revoked": row_revoked[0] if row_revoked else 0,
+        "expired": row_expired[0] if row_expired else 0,
+    }
+
+
+def count_audit_events_by_path_prefix(
+    conn: sqlite3.Connection,
+    prefix: str,
+    since_ts: str,
+) -> int:
+    """Return the number of audit_log rows whose path starts with *prefix* since *since_ts*.
+
+    Used by /health fleet.manifest_fetches_24h and /metrics fleet.manifest_fetches_24h.
+
+    Args:
+        conn:     Open SQLite connection.
+        prefix:   Path prefix to match (e.g. '/fleet/manifest/').
+        since_ts: ISO-8601 timestamp lower bound (inclusive, string comparison).
+
+    Returns:
+        Integer count, 0 if no matching rows.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) FROM audit_log WHERE path LIKE ? AND ts >= ?",
+        (prefix + "%", since_ts),
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def get_latest_audit_event_by_path_prefix(
+    conn: sqlite3.Connection,
+    prefix: str,
+) -> Optional[sqlite3.Row]:
+    """Return the most recent audit_log row whose path starts with *prefix*, or None.
+
+    Used by /health fleet.last_manifest_fetch_at and /metrics fleet.last_manifest_fetch_at.
+
+    Args:
+        conn:   Open SQLite connection.
+        prefix: Path prefix to match (e.g. '/fleet/manifest/').
+
+    Returns:
+        sqlite3.Row for the highest-id matching row, or None if no rows match.
+    """
+    return conn.execute(
+        """
+        SELECT * FROM audit_log
+         WHERE path LIKE ?
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (prefix + "%",),
+    ).fetchone()
+
+
+def count_rules_tagged(conn: sqlite3.Connection) -> int:
+    """Return the number of distinct rule_ids that have at least one tag.
+
+    Used by /metrics fleet.rules_tagged_total.
+    """
+    row = conn.execute(
+        "SELECT COUNT(DISTINCT rule_id) FROM rule_tags"
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def count_distinct_tags(conn: sqlite3.Connection) -> int:
+    """Return the number of distinct tag values in rule_tags.
+
+    Used by /metrics fleet.tags_total.
+    """
+    row = conn.execute("SELECT COUNT(DISTINCT tag) FROM rule_tags").fetchone()
+    return row[0] if row else 0
+
+
+def count_rules_deployed(conn: sqlite3.Connection) -> int:
+    """Return the number of rules with deployed=1.
+
+    Used by /metrics fleet.rules_deployed_count.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) FROM rules WHERE deployed = 1"
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def list_distinct_manifest_paths_24h(
+    conn: sqlite3.Connection,
+    since_ts: str,
+) -> list:
+    """Return distinct path values from audit_log matching /fleet/manifest/* in the last 24h.
+
+    Used by /metrics fleet.manifest_endpoints_seen.
+
+    Args:
+        conn:     Open SQLite connection.
+        since_ts: ISO-8601 timestamp lower bound (inclusive).
+
+    Returns:
+        Sorted list of distinct path strings (e.g. ['/fleet/manifest/edr-prod', ...]).
+    """
+    rows = conn.execute(
+        """
+        SELECT DISTINCT path FROM audit_log
+         WHERE path LIKE '/fleet/manifest/%'
+           AND ts >= ?
+         ORDER BY path ASC
+        """,
+        (since_ts,),
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
+# ---------------------------------------------------------------------------
 # Phase 6 Wave A4 — rule_tags CRUD helpers (REQ-P0-P6-001, DEC-FLEET-P6-002)
 # ---------------------------------------------------------------------------
 
