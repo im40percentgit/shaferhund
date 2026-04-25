@@ -20,8 +20,10 @@ See `archived-plans/2026-04-25_immune-system-and-cloud-eyes.md` for full Phase 1
 
 ## Phase 6: Fleet + Auth — Operational Maturity (3–4 weeks)
 
-**Status:** planned
+**Status:** completed
 **Timebox:** 3–4 weeks
+**Landed:** 2026-04-25 across PRs #79, #80, #81, #82, #83, #84, #85 (all squash-merged from `feature/phase6-*` branches; final commit `018486f`)
+**Verified:** 2026-04-25 via Phase 6 zero-regression gate (issue #76): 594 passed / 1 skipped / 6 deselected / 0 failed; `/health` integrates all 9 blocks (status, poller_healthy + 7 nested keys: threat_intel, canary, posture-with-4-sub-keys, recommendations, cloudtrail, auth, fleet); DB migration Phase 5 → Phase 6 idempotent (adds `users`, `user_tokens`, `audit_log`, `rule_tags` tables); TOOLS=9; compose stable (5 services in `compose.yaml` + 2 opt-in compose files: `compose.localstack.yaml` from #58, `compose.fleet.yaml` from #74); 4 critical safety properties verified end-to-end (audit chain tamper detection, fleet manifest signature verification, no `password_hash`/`token_hash` in API responses, closed-default on unknown roles); backwards compat preserved (legacy `SHAFERHUND_TOKEN` works on every Phase 1–5 route AND every Phase 6 admin route via synthetic admin).
 
 ### Intent
 
@@ -240,22 +242,26 @@ Wave A is fully parallel — four independent worktrees (auth schema, RBAC dep, 
 
 | Decision | Description | Status |
 |----------|-------------|--------|
-| DEC-AUTH-P6-001 | Argon2id over bcrypt for password hashing; `argon2-cffi` is a single drop-in dep with no system reqs | planned |
-| DEC-AUTH-P6-002 | Role enum (`viewer`, `operator`, `admin`) is a code-resident frozenset; users + tokens are DB config | planned |
-| DEC-AUTH-P6-003 | `_require_role(role)` as a parameterised FastAPI Depends; includes `_require_auth` transitively | planned |
-| DEC-AUTH-P6-004 | `SHAFERHUND_TOKEN` survives as admin-equivalent legacy fallback; multi mode is opt-in via `SHAFERHUND_AUTH_MODE=multi`; documented phase-out path | planned |
-| DEC-AUTH-P6-005 | Bootstrap admin reads `SHAFERHUND_BOOTSTRAP_ADMIN_*` once at first boot; idempotent; vars ignored after the row exists | planned |
-| DEC-AUDIT-P6-001 | Append-only `audit_log` table with chained HMAC (`row_hmac = HMAC(prev_hmac \|\| canonical_row)`); `GET /audit/verify` exposes chain integrity | planned |
-| DEC-AUDIT-P6-002 | Audit middleware records non-GET requests + admin-only GETs; readonly viewer/operator GETs are not audited (signal-to-noise) | planned |
-| DEC-AUDIT-P6-003 | `SHAFERHUND_AUDIT_KEY` is an env var, rotation is operator-driven (documented), no automatic rotation in Phase 6 | planned |
-| DEC-FLEET-P6-001 | HMAC-signed manifests over per-agent shared secret; real cryptographic signing (cosign/minisign) is REQ-P2-P6-002 | planned |
-| DEC-FLEET-P6-002 | Rule scoping via `group:*` tags on rules + per-agent group memberships; per-rule ACLs out of scope | planned |
-| DEC-FLEET-P6-003 | Fleet agent is a separate Docker image (`docker/shaferhund-fleet-agent`), not in `compose.yaml`; runs alongside remote Wazuh agent | planned |
-| DEC-FLEET-P6-004 | Cursor / state held in DB (`fleet_agents`, `fleet_checkins`, `cloudtrail_progress`-style); same shape as DEC-CLOUD-011 | planned |
-| DEC-FLEET-P6-005 | LocalStack-style integration test gated by `FLEET_INTEGRATION=1` env; honours DEC-CLOUD-013 standing rule | planned |
-| DEC-ORCH-P6-001 | No new orchestrator tools in Phase 6; tool count stays at 9; auth/audit/fleet are operator-facing routes, not Claude-facing tools | planned |
-| DEC-SCHEMA-P6-001 | Six new tables (`users`, `user_tokens`, `audit_log`, `fleet_agents`, `fleet_checkins`, `rule_tags`) — all idempotent ALTER per DEC-SCHEMA-002 | planned |
-| DEC-COMPAT-P6-001 | `single` mode is default; existing deployments are byte-identical at `/health` until they opt into `multi` mode | planned |
+| DEC-AUTH-P6-001 | Argon2id over bcrypt for password hashing; `argon2-cffi` is a single drop-in dep with no system reqs | accepted |
+| DEC-AUTH-P6-002 | Role enum (`viewer`, `operator`, `admin`) is a code-resident frozenset; users + tokens are DB config | accepted |
+| DEC-AUTH-P6-003 | `_require_role(role)` as a parameterised FastAPI Depends; includes `_require_auth` transitively | accepted |
+| DEC-AUTH-P6-004 | `SHAFERHUND_TOKEN` survives as admin-equivalent legacy fallback; multi mode is opt-in via `SHAFERHUND_AUTH_MODE=multi`; documented phase-out path | accepted |
+| DEC-AUTH-P6-005 | Bootstrap admin reads `SHAFERHUND_BOOTSTRAP_ADMIN_*` once at first boot; idempotent; vars ignored after the row exists | accepted |
+| DEC-AUTH-P6-006 | **(new — Wave A2 #80)** `_require_role(role)` factory raises `ValueError` at import time for unknown role names so typos surface at boot, not at first request; 401 always precedes 403 because the inner dep is `_require_auth`; codifies the runtime-shape promise of DEC-AUTH-P6-003 | accepted |
+| DEC-AUTH-P6-007 | **(new — Wave B1 #83)** Bootstrap admin runs once at startup when users table is empty + `SHAFERHUND_AUTH_MODE=multi` + bootstrap env set; idempotent and unconditionally skipped if any user exists; plaintext password lives only in env/memory at startup, only the Argon2id hash persists | accepted |
+| DEC-AUTH-P6-008 | **(new — Wave B1 #83)** Admin-only user/token CRUD surface; `POST /auth/login` is the sole public auth entry; password and token hashes are NEVER serialised into responses (enforced by explicit field projection in every handler); operators/viewers may only change their own password | accepted |
+| DEC-AUDIT-P6-001 | Append-only `audit_log` table with chained HMAC (`row_hmac = HMAC(prev_hmac \|\| canonical_row)`); `GET /audit/verify` exposes chain integrity | accepted |
+| DEC-AUDIT-P6-002 | Audit middleware records non-GET requests + admin-only GETs; readonly viewer/operator GETs are not audited (signal-to-noise) | accepted |
+| DEC-AUDIT-P6-003 | `SHAFERHUND_AUDIT_KEY` is an env var, rotation is operator-driven (documented), no automatic rotation in Phase 6 | accepted |
+| DEC-FLEET-P6-001 | HMAC-signed manifests over per-agent shared secret; real cryptographic signing (cosign/minisign) is REQ-P2-P6-002 | accepted |
+| DEC-FLEET-P6-002 | Rule scoping via `group:*` tags on rules + per-agent group memberships; per-rule ACLs out of scope | accepted |
+| DEC-FLEET-P6-003 | Fleet agent is a separate Docker image (`docker/shaferhund-fleet-agent`), not in `compose.yaml`; runs alongside remote Wazuh agent | accepted |
+| DEC-FLEET-P6-004 | Cursor / state held in DB (`fleet_agents`, `fleet_checkins`, `cloudtrail_progress`-style); same shape as DEC-CLOUD-011 | accepted |
+| DEC-FLEET-P6-005 | LocalStack-style integration test gated by `FLEET_INTEGRATION=1` env; honours DEC-CLOUD-013 standing rule | accepted |
+| DEC-ORCH-P6-001 | No new orchestrator tools in Phase 6; tool count stays at 9; auth/audit/fleet are operator-facing routes, not Claude-facing tools | accepted |
+| DEC-SCHEMA-P6-001 | Six new tables (`users`, `user_tokens`, `audit_log`, `fleet_agents`, `fleet_checkins`, `rule_tags`) — all idempotent ALTER per DEC-SCHEMA-002 | accepted |
+| DEC-COMPAT-P6-001 | `single` mode is default; existing deployments are byte-identical at `/health` until they opt into `multi` mode | accepted |
+| DEC-OBSERVABILITY-P6-001 | **(new — Wave B3 #85)** `audit_log` is the source-of-truth for fleet manifest-fetch counters (rejecting an in-memory `FLEET_STATS` dict that resets on restart and duplicates state); block builders extracted into `agent/observability.py` to keep `agent/main.py` under ~2k lines; `/health` keeps minimal counters + one timestamp per DEC-HEALTH-002, rich per-role/per-token stats live on auth-gated `/metrics` | accepted |
 
 ---
 
@@ -275,5 +281,9 @@ Wave A is fully parallel — four independent worktrees (auth schema, RBAC dep, 
       multi-account / Organization Trail (REQ-P2-P5-006 carry-forward);
       cloud-native rule deploy to GuardDuty / Security Hub (REQ-NOGO-P6-010 / REQ-NOGO-P5-009 / REQ-P2-P5-005 carry-forward);
       WebAuthn / hardware second factor (REQ-P2-P6-005).
-- [ ] Convert `hund` repo to ROADMAP.md form once Phase 6 lands — long-standing carry-forward from Phase 4 boundary precedent; recommend close after Phase 6 because the architecture is no longer in flux.
-- [ ] CONFIG-level harness todos surviving from Phase 5: backlog #2 (rule-test fixtures harness), backlog #4 (Wazuh integration test harness), backlog #6 (CI matrix for source pipelines). Backlog #5 was closed by DEC-CLOUD-013 in Phase 5.
+- [ ] Phase 6 Wave D — P1 polish, deferred to Phase 7 entry checklist (NOT shipped in Phase 6):
+      issue #77 (P1 dashboards: `/auth/users`, `/fleet/agents`, rule tag editor — REQ-P1-P6-001 / 002 / 003) and
+      issue #78 (`lookup_cloud_identity` operator-chain join — REQ-P1-P6-004) are still open.
+      Both are pure UI / lookup augmentation — no new safety surface. Recommend revisiting at Phase 7 kickoff: either fold into Phase 7 scope or recommend-close as nice-to-have-but-not-actually-needed-now.
+- [ ] Convert `hund` repo to ROADMAP.md form — long-standing carry-forward (recommended close at Phase 4 and Phase 5 boundaries). Phase 6 architecture is settled; recommend close at Phase 7 kickoff.
+- [ ] CONFIG-level harness todos surviving from Phase 5: backlog #2 (rule-test fixtures harness), backlog #4 (Wazuh integration test harness), backlog #6 (CI matrix for source pipelines). Backlog #5 was closed by DEC-CLOUD-013 in Phase 5. Phase 6 added no new harness debt — DEC-FLEET-P6-005 honours the standing `*_INTEGRATION=1` gate pattern.
