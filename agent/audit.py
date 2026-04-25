@@ -77,10 +77,16 @@ _BODY_EXCERPT_MAX = 200
 # HTTP methods that are audited unconditionally (mutating requests).
 _AUDITED_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
-# GET paths that are audited because they expose admin-only data.
-# These are exact-match strings.  The middleware checks startswith for
-# prefix-based routes (e.g. /audit is the prefix for /audit/verify).
-_AUDITED_GET_PREFIXES = frozenset({"/audit"})
+# GET paths that are audited because they expose admin-only data or
+# represent security-relevant distribution events.
+# The middleware checks startswith for prefix-based routes
+# (e.g. /audit is the prefix for /audit/verify).
+#
+# Phase 6 Wave B3 (REQ-P1-P6-005, DEC-OBSERVABILITY-P6-001): /fleet/manifest/
+# is added so every manifest fetch is recorded in audit_log.  The audit log
+# is the source of truth for fleet observability counters in /health and
+# /metrics — no separate in-memory counter is maintained (DEC-OBSERVABILITY-P6-001).
+_AUDITED_GET_PREFIXES = frozenset({"/audit", "/fleet/manifest/"})
 
 
 # ---------------------------------------------------------------------------
