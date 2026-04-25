@@ -623,8 +623,10 @@ shaferhund/
 
 ## Phase 4: Adaptive Immune System (3–4 weeks after Phase 3)
 
-**Status:** planned
+**Status:** completed
 **Timebox:** 3–4 weeks
+**Landed:** 2026-04-24/25 across PRs #48, #49, #50, #51 (all squash-merged from `feature/phase4-*` branches; final commit `0a43648`)
+**Verified:** 2026-04-25 via Phase 4 zero-regression gate (issue #46): 242 passed / 1 skipped / 0 failed; `/health` integrates all 5 keys (`threat_intel`, `canary`, `posture` with 4 sub-keys `last_score`/`last_run_at`/`last_weighted_score`/`slo_breach_open`, `recommendations.pending_count`); DB migration Phase 3 → Phase 4 idempotent; orchestrator TOOLS=8; 5 compose services unchanged.
 
 ### Intent
 
@@ -809,17 +811,18 @@ shaferhund/
 
 | ID | Title | Status |
 |----|-------|--------|
-| DEC-ORCH-006 | `register_tool(spec, handler, requires_conn)` API replaces direct `TOOLS`/`_TOOL_DISPATCH` mutation; preserves closure-factory pattern | planned |
-| DEC-RECOMMEND-001 | `recommend_attack` writes to `attack_recommendations` only; execution requires explicit operator approval HTTP POST | planned |
-| DEC-RECOMMEND-002 | Destructive technique allowlist as a code-resident frozenset; `force=true` is the only runtime path to bypass | planned |
-| DEC-RECOMMEND-003 | Priority defaults to 1/N normalisation when Claude returns malformed weights | planned |
-| DEC-POSTURE-003 | `weighted_score` is additive to flat `score`; both persisted; SQL-based calculation per DEC-POSTURE-001 pattern | planned |
-| DEC-SLO-001 | Generic webhook (not paging-vendor-specific); operators bridge externally | planned |
-| DEC-SLO-002 | Idempotency via `slo_breaches` table; one POST per breach window; recovery closes the row | planned |
-| DEC-SLO-003 | No retry on webhook failure; the next breach evaluation re-includes the missed run if still sub-threshold | planned |
-| DEC-RECOMMEND-004 | Posture-gap context injected into system prompt at loop start, not fetched via a tool — same reasoning as DEC-ORCH-004 | planned |
-| DEC-ORCH-007 | Migration of existing 7 tools to `register_tool` is mechanical 1:1; no behavioural changes; refactor invisible from outside `orchestrator.py` | planned |
-| DEC-RECOMMEND-005 | Cloud log + rule fleet + honeypots + STIX/TAXII + adversarial scoring all explicitly deferred to Phase 5+; Phase 4 stays scoped to one capability + one refactor + one SRE feature | planned |
+| DEC-ORCH-006 | `register_tool(spec, handler, requires_conn)` API replaces direct `TOOLS`/`_TOOL_DISPATCH` mutation; preserves closure-factory pattern | accepted |
+| DEC-RECOMMEND-001 | `recommend_attack` writes to `attack_recommendations` only; execution requires explicit operator approval HTTP POST | accepted |
+| DEC-RECOMMEND-002 | Destructive technique allowlist as a code-resident frozenset; `force=true` is the only runtime path to bypass | accepted |
+| DEC-RECOMMEND-003 | Priority defaults to 1/N normalisation when Claude returns malformed weights | accepted |
+| DEC-POSTURE-003 | `weighted_score` is additive to flat `score`; both persisted; SQL-based calculation per DEC-POSTURE-001 pattern | accepted |
+| DEC-SLO-001 | Generic webhook (not paging-vendor-specific); operators bridge externally | accepted |
+| DEC-SLO-002 | Idempotency via `slo_breaches` table; one POST per breach window; recovery closes the row | accepted |
+| DEC-SLO-003 | No retry on webhook failure; the next breach evaluation re-includes the missed run if still sub-threshold | accepted |
+| DEC-RECOMMEND-004 | Posture-gap context injected into system prompt at loop start, not fetched via a tool — same reasoning as DEC-ORCH-004 | accepted |
+| DEC-ORCH-007 | Migration of existing 7 tools to `register_tool` is mechanical 1:1; no behavioural changes; refactor invisible from outside `orchestrator.py` | accepted |
+| DEC-RECOMMEND-005 | Cloud log + rule fleet + honeypots + STIX/TAXII + adversarial scoring all explicitly deferred to Phase 5+; Phase 4 stays scoped to one capability + one refactor + one SRE feature | accepted |
+| DEC-SLO-004 | SLO evaluator dispatches raw connection vs. factory via `isinstance(conn, sqlite3.Connection)`, not `callable(conn)` — `sqlite3.Connection` exposes `__call__` from the C extension, so `callable()` returns True for a raw connection and the loop calls `conn()` which raises `TypeError`, silently swallowed by the broad `except`. In production (`agent/main.py:240` passes `_db` directly), the loop never evaluated. Surfaced via the V7 live-integration check during #44 verification — unit tests passed because they used a lambda factory. Fixed at `agent/slo.py:289` | accepted |
 
 ## TODOs
 - [ ] Convert `hund` to `ROADMAP.md` (map 25 domains to phases)
