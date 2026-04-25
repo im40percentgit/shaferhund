@@ -138,6 +138,7 @@ from typing import Any, Callable, Optional
 
 from .models import (
     get_alerts_by_src_ip,
+    get_cloudtrail_events_by_principal_since,
     get_cluster,
     get_cluster_with_alerts,
     get_recent_deploys,
@@ -652,7 +653,118 @@ def _handle_check_threat_intel(tool_input: dict, conn: sqlite3.Connection) -> st
     return json.dumps(result, default=str)
 
 
-# Register the three read tools (DEC-ORCH-006, DEC-ORCH-007).
+def _handle_lookup_cloud_identity(
+    tool_input: dict, conn: sqlite3.Connection
+) -> str:
+    """Return aggregated CloudTrail context for an AWS principal ARN.
+
+    Queries the shared alerts table (source='cloudtrail') for all events
+    attributed to the given principal within a lookback window, then
+    aggregates source IPs, event names, first/last seen timestamps, and
+    total event count.  Read-only — does NOT mutate any table.
+
+    Sanitizes ``principal_arn`` via sanitize_alert_field (DEC-ORCH-004) before
+    the DB query: the ARN originates from Claude's tool-use input which may
+    ultimately derive from attacker-influenced alert metadata.
+
+    Clamps ``lookback_hours`` to [1, 168] — 1 h minimum prevents zero/negative
+    windows; 168 h (7 days) caps the scan to a reasonable recent-history window.
+
+    @decision DEC-CLOUD-007
+    @title lookup_cloud_identity is the 9th tool — registered via register_tool() (REQ-P0-P5-007)
+    @status accepted
+    @rationale Phase 5 Wave B1 adds CloudTrail principal enrichment to the
+               orchestrator reasoning loop. The handler is read-only (no INSERT/
+               UPDATE anywhere), sanitizes the principal_arn input per DEC-ORCH-004,
+               and scopes the lookback window to [1, 168] hours. Registration via
+               register_tool() follows DEC-ORCH-006 — no direct mutation of _REGISTRY
+               or TOOLS. After this registration len(TOOLS) == 9.
+
+    Args:
+        tool_input: Dict with keys ``principal_arn`` (str, required) and
+                    ``lookback_hours`` (int, optional, default 24).
+        conn:       Open SQLite connection (injected by dispatch()).
+
+    Returns:
+        JSON string with aggregated context or an empty-result shape when
+        no events are found.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    raw_arn = tool_input.get("principal_arn", "")
+    # Sanitize per DEC-ORCH-004 — strips ANSI escapes, control bytes, truncates.
+    safe_arn = sanitize_alert_field(raw_arn)
+    if not safe_arn:
+        return json.dumps({"error": "principal_arn is required", "matches": 0, "context": None})
+
+    # Clamp lookback_hours to [1, 168].
+    raw_hours = tool_input.get("lookback_hours", 24)
+    try:
+        hours = int(raw_hours)
+    except (TypeError, ValueError):
+        hours = 24
+    hours = max(1, min(168, hours))
+
+    # Compute ISO-8601 cutoff timestamp in UTC.
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=hours)
+    since_ts = cutoff_dt.isoformat()
+
+    rows = get_cloudtrail_events_by_principal_since(conn, safe_arn, since_ts, limit=50)
+
+    if not rows:
+        log.debug("lookup_cloud_identity: no events for principal=%r", safe_arn)
+        return json.dumps({"matches": 0, "context": None})
+
+    # Aggregate across returned rows.
+    src_ips: list[str] = []
+    event_names: list[str] = []
+    seen_src_ips: set[str] = set()
+    seen_event_names: set[str] = set()
+    ingested_ats: list[str] = []
+
+    for row in rows:
+        src_ip = row.get("src_ip") or ""
+        if src_ip and src_ip not in seen_src_ips:
+            seen_src_ips.add(src_ip)
+            src_ips.append(src_ip)
+
+        # rule_id format: cloudtrail:{eventSource}:{eventName} — extract event name.
+        rule_id = row.get("rule_id", "")
+        parts = rule_id.split(":")
+        event_name = parts[-1] if len(parts) >= 3 else rule_id
+        if event_name and event_name not in seen_event_names:
+            seen_event_names.add(event_name)
+            event_names.append(event_name)
+
+        ts = row.get("ingested_at", "")
+        if ts:
+            ingested_ats.append(ts)
+
+    ingested_ats_sorted = sorted(ingested_ats)
+    first_seen_at = ingested_ats_sorted[0] if ingested_ats_sorted else None
+    last_seen_at = ingested_ats_sorted[-1] if ingested_ats_sorted else None
+
+    context = {
+        "principal_arn": safe_arn,
+        "lookback_hours": hours,
+        "total_events": len(rows),
+        "src_ips": src_ips,
+        "event_names": event_names,
+        "first_seen_at": first_seen_at,
+        "last_seen_at": last_seen_at,
+    }
+
+    log.debug(
+        "lookup_cloud_identity: principal=%r events=%d src_ips=%d",
+        safe_arn,
+        len(rows),
+        len(src_ips),
+    )
+    return json.dumps({"matches": len(rows), "context": context}, default=str)
+
+
+# Register the four read tools (DEC-ORCH-006, DEC-ORCH-007, DEC-CLOUD-007).
+# Each requires a DB connection; dispatch() injects it at call time.
 # Each requires a DB connection; dispatch() injects it at call time.
 register_tool(
     spec={
@@ -728,6 +840,39 @@ register_tool(
         },
     },
     handler=_handle_check_threat_intel,
+    requires_conn=True,
+    kind="read",
+)
+
+register_tool(
+    spec={
+        "name": "lookup_cloud_identity",
+        "description": (
+            "Look up recent CloudTrail activity for an AWS principal (IAM user, role, or root). "
+            "Use during triage to enrich an alert with the principal's recent context: "
+            "source IPs, API calls, last-seen timestamp, and total recent activity. Read-only."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "principal_arn": {
+                    "type": "string",
+                    "description": (
+                        "Full AWS principal ARN, e.g. "
+                        "arn:aws:iam::123456789012:user/alice or "
+                        "arn:aws:iam::123456789012:root"
+                    ),
+                },
+                "lookback_hours": {
+                    "type": "integer",
+                    "description": "How far back to look (default 24, max 168)",
+                    "default": 24,
+                },
+            },
+            "required": ["principal_arn"],
+        },
+    },
+    handler=_handle_lookup_cloud_identity,
     requires_conn=True,
     kind="read",
 )
