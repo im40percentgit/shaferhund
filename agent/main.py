@@ -102,8 +102,10 @@ from .canary import spawn_canary, record_hit, count_canary_triggers_since
 from . import red_team as _red_team
 from .models import (
     count_pending_attack_recommendations,
+    count_cloud_findings,
     get_attack_recommendation,
     get_latest_posture_run,
+    list_cloud_findings,
     get_open_slo_breach,
     insert_posture_run,
     list_pending_attack_recommendations,
@@ -943,6 +945,70 @@ async def execute_recommendation_route(
         "run_id": result["run_id"],
         "status": "executed",
     })
+
+
+# ---------------------------------------------------------------------------
+# Cloud findings route (Phase 5 Wave A2, REQ-P0-P5-005)
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/cloud/findings",
+    dependencies=[Depends(_require_auth)],
+)
+async def list_cloud_findings_route(
+    limit: int = 50,
+    severity: Optional[str] = None,
+) -> JSONResponse:
+    """List cloud audit findings for operator review.
+
+    Auth-gated via _require_auth — same bearer token scheme as /recommendations
+    and /metrics (DEC-AUTH-001, DEC-AUTH-002).
+
+    Query params:
+        limit    — Max rows to return. Default 50, capped at 200.
+        severity — Optional filter: Low | Medium | High | Critical.
+                   When absent, all severities are returned.
+
+    Returns:
+        JSON array of finding objects, newest-first. Each object includes
+        all cloud_audit_findings columns plus a derived ``event_age_seconds``
+        field (seconds since detected_at, for operator situational awareness).
+
+    Empty array when no findings exist.
+
+    @decision DEC-CLOUD-005
+    @title GET /cloud/findings exposes deterministic detector output; auth-gated
+    @status accepted
+    @rationale The findings table is fed exclusively by code-resident detector
+               rules (DEC-CLOUD-005). This route surfaces them for operator
+               review without any LLM involvement. Auth gate matches all
+               other operator-facing routes (DEC-AUTH-001).
+    """
+    if _db is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+
+    # Cap limit at 200 to prevent runaway queries
+    effective_limit = min(max(1, limit), 200)
+
+    rows = list_cloud_findings(_db, limit=effective_limit, severity=severity)
+
+    now_ts = datetime.now(timezone.utc)
+    result = []
+    for row in rows:
+        finding = dict(row)
+        # Derive event_age_seconds from detected_at
+        try:
+            detected_dt = datetime.fromisoformat(finding["detected_at"])
+            if detected_dt.tzinfo is None:
+                detected_dt = detected_dt.replace(tzinfo=timezone.utc)
+            age = max(0, int((now_ts - detected_dt).total_seconds()))
+        except (ValueError, TypeError):
+            age = 0
+        finding["event_age_seconds"] = age
+        result.append(finding)
+
+    return JSONResponse(result)
 
 
 async def _canary_enqueue(alert_obj) -> None:
