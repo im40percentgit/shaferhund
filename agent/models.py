@@ -2565,6 +2565,49 @@ def list_user_tokens(
     ).fetchall()
 
 
+def update_user_password(
+    conn: sqlite3.Connection,
+    user_id: int,
+    password_hash: str,
+) -> None:
+    """Replace the stored password hash for *user_id* (admin reset or self-service).
+
+    Phase 6 Wave B1 (REQ-P0-P6-006): used by both the admin password-reset
+    route (POST /auth/users/{id}/password) and the self-service change route
+    (POST /auth/me/password).  Only the hash is stored — callers must compute
+    the Argon2id hash via ``hash_password`` before calling this function.
+    """
+    with get_cursor(conn) as cur:
+        cur.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (password_hash, user_id),
+        )
+
+
+def count_users(conn: sqlite3.Connection) -> int:
+    """Return the total number of rows in the users table.
+
+    Phase 6 Wave B1 bootstrap: used at startup to determine whether the
+    bootstrap admin should be created (empty table → create; non-empty → skip).
+    """
+    row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+    return row[0] if row else 0
+
+
+def get_user_token_by_id(
+    conn: sqlite3.Connection,
+    token_id: int,
+) -> Optional[sqlite3.Row]:
+    """Return the ``user_tokens`` row for *token_id*, or None if not found.
+
+    Phase 6 Wave B1: used by the token-revoke route to look up the token
+    before setting revoked_at, so the route can return 404 for unknown ids.
+    """
+    return conn.execute(
+        "SELECT * FROM user_tokens WHERE id = ?", (token_id,)
+    ).fetchone()
+
+
 # ---------------------------------------------------------------------------
 # Phase 6 Wave A3 — audit_log CRUD helpers (REQ-P0-P6-005, DEC-AUDIT-P6-001)
 # ---------------------------------------------------------------------------

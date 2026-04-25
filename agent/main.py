@@ -169,6 +169,21 @@ from .models import (
     untag_rule,
 )
 from .canary import sanitize_alert_field as _sanitize
+from .models import (
+    count_users,
+    get_user_by_id,
+    get_user_by_username,
+    get_user_token_by_id,
+    insert_user,
+    insert_user_token,
+    list_users,
+    list_user_tokens,
+    revoke_user_token,
+    set_user_disabled,
+    update_user_last_login,
+    update_user_password,
+)
+from .auth import generate_token, hash_password, verify_password
 
 log = logging.getLogger(__name__)
 
@@ -285,6 +300,95 @@ def _resolve_audit_key(settings: Settings) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# Bootstrap admin (Phase 6 Wave B1, REQ-P0-P6-006)
+#
+# @decision DEC-AUTH-P6-007
+# @title Bootstrap admin created once at startup when users table is empty
+# @status accepted
+# @rationale Multi-user mode has a chicken-and-egg problem: you need an admin
+#            to create users, but no users exist on first boot. The bootstrap
+#            pattern (env-supplied creds, idempotent, startup-only) is the
+#            standard solution (same as Django's createsuperuser --no-input).
+#            The plaintext password is only present in env/memory at startup;
+#            only the Argon2id hash is written to the DB. If the users table
+#            already has rows, bootstrap is skipped unconditionally — no second
+#            admin is ever created by accident.  Single mode is a guaranteed
+#            no-op regardless of env vars set.
+# ---------------------------------------------------------------------------
+
+
+def _bootstrap_admin_if_needed() -> None:
+    """Create the initial admin user when multi mode + empty users table + env set.
+
+    Called once from lifespan startup after init_db.  Safe to call repeatedly
+    (idempotent via count_users check).  Never runs in single mode.
+
+    Behaviour matrix:
+      - single mode                 → DEBUG log, return
+      - multi + users exist         → DEBUG log, return
+      - multi + partial env (one var) → WARNING log, return (no user created)
+      - multi + both env + empty DB → INFO log, create admin, return
+    """
+    global _settings, _db
+    if _settings is None or _db is None:
+        return
+
+    auth_mode = getattr(_settings, "shaferhund_auth_mode", "single")
+    if auth_mode != "multi":
+        log.debug("Bootstrap skipped — auth_mode=%s (not multi)", auth_mode)
+        return
+
+    bootstrap_username = getattr(_settings, "shaferhund_bootstrap_admin_username", "") or ""
+    bootstrap_password = getattr(_settings, "shaferhund_bootstrap_admin_password", "") or ""
+
+    n = count_users(_db)
+    if n > 0:
+        log.debug("Bootstrap skipped — users table has %d entries", n)
+        return
+
+    # Table is empty — check env completeness.
+    has_user = bool(bootstrap_username)
+    has_pass = bool(bootstrap_password)
+
+    if has_user and not has_pass:
+        log.warning(
+            "Bootstrap admin not created — both SHAFERHUND_BOOTSTRAP_ADMIN_USERNAME "
+            "and SHAFERHUND_BOOTSTRAP_ADMIN_PASSWORD must be set "
+            "(username set, password missing)"
+        )
+        return
+
+    if has_pass and not has_user:
+        log.warning(
+            "Bootstrap admin not created — both SHAFERHUND_BOOTSTRAP_ADMIN_USERNAME "
+            "and SHAFERHUND_BOOTSTRAP_ADMIN_PASSWORD must be set "
+            "(password set, username missing)"
+        )
+        return
+
+    if not has_user and not has_pass:
+        log.debug(
+            "Bootstrap skipped — SHAFERHUND_BOOTSTRAP_ADMIN_USERNAME not set"
+        )
+        return
+
+    # Both set and table is empty — create the admin user.
+    safe_username = _sanitize(bootstrap_username)
+    try:
+        ph = hash_password(bootstrap_password)
+        insert_user(_db, safe_username, ph, "admin")
+        log.info(
+            "Bootstrap admin '%s' created. Set SHAFERHUND_AUTH_MODE=multi and "
+            "use this user's password to obtain a token via POST /auth/login.",
+            safe_username,
+        )
+    except Exception as exc:
+        log.error(
+            "Bootstrap admin creation failed for '%s': %s", safe_username, exc
+        )
+
+
+# ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
 
@@ -296,6 +400,7 @@ async def lifespan(app: FastAPI):
     _probe_sigmac(_settings)
     _audit_hmac_key = _resolve_audit_key(_settings)
     _db = init_db(_settings.db_path)
+    _bootstrap_admin_if_needed()
     _clusterer = AlertClusterer(
         window_seconds=_settings.cluster_window_seconds,
         max_alerts=_settings.cluster_max_alerts,
@@ -1603,6 +1708,481 @@ async def get_all_tags() -> JSONResponse:
     return JSONResponse({
         "tags": [{"tag": t, "rule_count": c} for t, c in tag_rows]
     })
+
+
+# ---------------------------------------------------------------------------
+# Auth routes — Phase 6 Wave B1 (REQ-P0-P6-006)
+#
+# @decision DEC-AUTH-P6-008
+# @title Admin-only user/token CRUD surface; login is the sole public auth entry
+# @status accepted
+# @rationale The admin route surface (POST /auth/users, GET /auth/users, etc.)
+#            is intentionally narrow: admins manage identities, operators/viewers
+#            only change their own password.  POST /auth/login is the sole public
+#            endpoint — it issues a raw token (shown once, DEC-AUTH-P6-003) and
+#            is disabled in single mode to preserve Phase 1-5 backwards compat.
+#            Password hashes and token hashes are NEVER serialised into responses
+#            (enforced by explicit field projection in every route handler here).
+#            The AuditMiddleware (DEC-AUDIT-P6-002) picks up all write routes
+#            automatically because they all call _require_auth/_require_role which
+#            set request.state.user.
+# ---------------------------------------------------------------------------
+
+
+@app.post("/auth/login")
+async def auth_login(request: Request) -> JSONResponse:
+    """Issue a bearer token for a username/password pair.
+
+    Public endpoint — no auth required.  Only enabled in ``multi`` mode;
+    returns 400 with a clear message in ``single`` mode.
+
+    Request body: ``{"username": str, "password": str}``
+
+    Response (200):
+        ``{"user_id": int, "username": str, "role": str, "token": str}``
+        The ``token`` field contains the RAW bearer token (DEC-AUTH-P6-003).
+        It is shown exactly once — not stored, not logged.
+
+    Response (401): invalid credentials or disabled user.
+    Response (400): called in single mode.
+    """
+    if _settings is None or _db is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
+    auth_mode = getattr(_settings, "shaferhund_auth_mode", "single")
+    if auth_mode != "multi":
+        raise HTTPException(
+            status_code=400,
+            detail="Login is multi-mode only. Set SHAFERHUND_AUTH_MODE=multi "
+                   "or use the legacy SHAFERHUND_TOKEN bearer.",
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid JSON body")
+
+    raw_username = body.get("username", "")
+    raw_password = body.get("password", "")
+
+    if not raw_username or not raw_password:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user_row = get_user_by_username(_db, _sanitize(raw_username))
+
+    # Constant-time: always call verify_password even when user not found
+    # to avoid username-enumeration via timing (DEC-AUTH-P6-003 lineage).
+    stored_hash = user_row["password_hash"] if user_row else ""
+    ok = verify_password(raw_password, stored_hash) if stored_hash else False
+
+    if not ok or user_row is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if user_row["disabled"]:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Issue a new session token (DEC-AUTH-P6-003: raw shown once, hash stored).
+    raw_token, token_hash = generate_token()
+    ts = datetime.now(timezone.utc).isoformat()
+    token_id = insert_user_token(
+        _db,
+        user_id=user_row["id"],
+        token_hash=token_hash,
+        name="session",
+        expires_at=None,
+    )
+    update_user_last_login(_db, user_row["id"], ts)
+
+    log.info(
+        "auth/login: user '%s' (id=%d role=%s) authenticated; token_id=%d issued",
+        user_row["username"], user_row["id"], user_row["role"], token_id,
+    )
+
+    return JSONResponse({
+        "user_id": user_row["id"],
+        "username": user_row["username"],
+        "role": user_row["role"],
+        "token": raw_token,  # RAW TOKEN — shown once (DEC-AUTH-P6-003)
+    })
+
+
+@app.get(
+    "/auth/users",
+    dependencies=[Depends(_require_role("admin"))],
+)
+async def list_users_route(limit: int = 100) -> JSONResponse:
+    """List all users (paginated). Requires admin role.
+
+    Returns an array of user objects. Password hashes are NEVER included
+    (DEC-AUTH-P6-008).
+
+    Query params:
+        limit — Max rows (default 100, capped at 500).
+    """
+    if _db is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+    limit = max(1, min(limit, 500))
+    rows = list_users(_db, limit=limit)
+    return JSONResponse([
+        {
+            "id": r["id"],
+            "username": r["username"],
+            "role": r["role"],
+            "created_at": r["created_at"],
+            "last_login_at": r["last_login_at"],
+            "disabled": bool(r["disabled"]),
+        }
+        for r in rows
+    ])
+
+
+@app.post(
+    "/auth/users",
+    dependencies=[Depends(_require_role("admin"))],
+)
+async def create_user_route(request: Request) -> JSONResponse:
+    """Create a new user. Requires admin role.
+
+    Request body: ``{"username": str, "password": str, "role": "viewer"|"operator"|"admin"}``
+
+    Response (201): ``{"id": int, "username": str, "role": str, "created_at": str}``
+
+    Password is hashed via Argon2id before storage. Password hash is NEVER
+    returned in the response (DEC-AUTH-P6-008).
+    """
+    if _db is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid JSON body")
+
+    raw_username = _sanitize(str(body.get("username", "") or ""))
+    raw_password = str(body.get("password", "") or "")
+    raw_role = str(body.get("role", "") or "")
+
+    if not raw_username:
+        raise HTTPException(status_code=422, detail="username is required")
+    if not raw_password:
+        raise HTTPException(status_code=422, detail="password is required")
+    if raw_role not in {"viewer", "operator", "admin"}:
+        raise HTTPException(
+            status_code=422,
+            detail="role must be one of: viewer, operator, admin",
+        )
+
+    try:
+        ph = hash_password(raw_password)
+        user_id = insert_user(_db, raw_username, ph, raw_role)
+    except Exception as exc:
+        import sqlite3 as _sqlite3
+        if isinstance(exc, _sqlite3.IntegrityError):
+            raise HTTPException(status_code=409, detail=f"Username '{raw_username}' already exists")
+        raise HTTPException(status_code=500, detail="Failed to create user")
+
+    user_row = get_user_by_id(_db, user_id)
+    return JSONResponse(
+        {
+            "id": user_row["id"],
+            "username": user_row["username"],
+            "role": user_row["role"],
+            "created_at": user_row["created_at"],
+        },
+        status_code=201,
+    )
+
+
+@app.post(
+    "/auth/users/{user_id}/disable",
+    dependencies=[Depends(_require_role("admin"))],
+)
+async def disable_user_route(user_id: int) -> JSONResponse:
+    """Disable a user account. Requires admin role.
+
+    Sets ``disabled=1`` — subsequent login attempts and token auth for this
+    user return 401. Idempotent (disabling an already-disabled user is a no-op).
+
+    Response (200): updated user object (without password_hash).
+    Response (404): user not found.
+    """
+    if _db is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+
+    user_row = get_user_by_id(_db, user_id)
+    if user_row is None:
+        raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+
+    set_user_disabled(_db, user_id, True)
+    user_row = get_user_by_id(_db, user_id)
+    return JSONResponse({
+        "id": user_row["id"],
+        "username": user_row["username"],
+        "role": user_row["role"],
+        "created_at": user_row["created_at"],
+        "last_login_at": user_row["last_login_at"],
+        "disabled": bool(user_row["disabled"]),
+    })
+
+
+@app.post(
+    "/auth/users/{user_id}/enable",
+    dependencies=[Depends(_require_role("admin"))],
+)
+async def enable_user_route(user_id: int) -> JSONResponse:
+    """Re-enable a disabled user account. Requires admin role.
+
+    Sets ``disabled=0``. Idempotent.
+
+    Response (200): updated user object (without password_hash).
+    Response (404): user not found.
+    """
+    if _db is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+
+    user_row = get_user_by_id(_db, user_id)
+    if user_row is None:
+        raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+
+    set_user_disabled(_db, user_id, False)
+    user_row = get_user_by_id(_db, user_id)
+    return JSONResponse({
+        "id": user_row["id"],
+        "username": user_row["username"],
+        "role": user_row["role"],
+        "created_at": user_row["created_at"],
+        "last_login_at": user_row["last_login_at"],
+        "disabled": bool(user_row["disabled"]),
+    })
+
+
+@app.post(
+    "/auth/users/{user_id}/password",
+    dependencies=[Depends(_require_role("admin"))],
+)
+async def admin_reset_password_route(user_id: int, request: Request) -> JSONResponse:
+    """Admin-driven password reset for any user. Requires admin role.
+
+    Request body: ``{"password": str}``
+
+    Hashes the new password via Argon2id and replaces the stored hash.
+    Does NOT require the current password (this is an admin override).
+    Password hash is NEVER returned in any response (DEC-AUTH-P6-008).
+
+    Response (200): ``{"ok": true, "user_id": int}``
+    Response (404): user not found.
+    """
+    if _db is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+
+    user_row = get_user_by_id(_db, user_id)
+    if user_row is None:
+        raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid JSON body")
+
+    raw_password = str(body.get("password", "") or "")
+    if not raw_password:
+        raise HTTPException(status_code=422, detail="password is required")
+
+    ph = hash_password(raw_password)
+    update_user_password(_db, user_id, ph)
+    return JSONResponse({"ok": True, "user_id": user_id})
+
+
+@app.post(
+    "/auth/users/{user_id}/tokens",
+    dependencies=[Depends(_require_role("admin"))],
+)
+async def issue_user_token_route(user_id: int, request: Request) -> JSONResponse:
+    """Issue a new named token for a user. Requires admin role.
+
+    Request body: ``{"name": str, "expires_at": str|null}``
+
+    Returns the RAW token exactly once (DEC-AUTH-P6-003). The token hash is
+    stored; the raw token is NOT retrievable after this response. ``expires_at``
+    is an ISO-8601 string or null for no-expiry.
+
+    Response (201): ``{"token_id": int, "raw_token": str, "name": str, "expires_at": str|null}``
+    Response (404): user not found.
+    """
+    if _db is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+
+    user_row = get_user_by_id(_db, user_id)
+    if user_row is None:
+        raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid JSON body")
+
+    raw_name = _sanitize(str(body.get("name", "") or ""))
+    expires_at = body.get("expires_at") or None
+    if not raw_name:
+        raise HTTPException(status_code=422, detail="name is required")
+
+    raw_token, token_hash = generate_token()
+    token_id = insert_user_token(
+        _db,
+        user_id=user_id,
+        token_hash=token_hash,
+        name=raw_name,
+        expires_at=expires_at,
+    )
+    log.info(
+        "admin issued token '%s' (id=%d) for user_id=%d",
+        raw_name, token_id, user_id,
+    )
+    # raw_token shown once (DEC-AUTH-P6-003); NOT logged here.
+    return JSONResponse(
+        {
+            "token_id": token_id,
+            "raw_token": raw_token,
+            "name": raw_name,
+            "expires_at": expires_at,
+        },
+        status_code=201,
+    )
+
+
+@app.get(
+    "/auth/users/{user_id}/tokens",
+    dependencies=[Depends(_require_role("admin"))],
+)
+async def list_user_tokens_route(user_id: int) -> JSONResponse:
+    """List all tokens for a user. Requires admin role.
+
+    Returns token metadata only. Token hashes are NEVER included in the
+    response (DEC-AUTH-P6-008, DEC-AUTH-P6-003).
+
+    Response (200): array of token objects.
+    Response (404): user not found.
+    """
+    if _db is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+
+    user_row = get_user_by_id(_db, user_id)
+    if user_row is None:
+        raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+
+    rows = list_user_tokens(_db, user_id)
+    return JSONResponse([
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "created_at": r["created_at"],
+            "last_used_at": r["last_used_at"],
+            "expires_at": r["expires_at"],
+            "revoked_at": r["revoked_at"],
+        }
+        for r in rows
+    ])
+
+
+@app.post(
+    "/auth/tokens/{token_id}/revoke",
+    dependencies=[Depends(_require_role("admin"))],
+)
+async def revoke_token_route(token_id: int) -> JSONResponse:
+    """Revoke a token by id. Requires admin role.
+
+    Sets ``revoked_at`` to the current UTC timestamp. The token immediately
+    becomes invalid for all subsequent requests. Idempotent (re-revoking an
+    already-revoked token updates revoked_at but is otherwise harmless).
+
+    Response (200): ``{"ok": true, "token_id": int, "revoked_at": str}``
+    Response (404): token not found.
+    """
+    if _db is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+
+    token_row = get_user_token_by_id(_db, token_id)
+    if token_row is None:
+        raise HTTPException(status_code=404, detail=f"Token {token_id} not found")
+
+    ts = datetime.now(timezone.utc).isoformat()
+    revoke_user_token(_db, token_id, ts)
+    log.info("token_id=%d revoked at %s", token_id, ts)
+    return JSONResponse({"ok": True, "token_id": token_id, "revoked_at": ts})
+
+
+@app.post("/auth/me/password")
+async def self_change_password_route(
+    request: Request,
+    user: dict = Depends(_require_auth),
+) -> JSONResponse:
+    """Self-service password change for the authenticated user.
+
+    Any authenticated user (viewer, operator, admin) may change their own
+    password. Requires the current password for verification — this is not
+    an admin override path.
+
+    Disabled in single mode: the legacy __legacy_token__ synthetic user has
+    no stored password, so changing it is meaningless (return 400).
+
+    Request body: ``{"current_password": str, "new_password": str}``
+
+    Response (200): ``{"ok": true}``
+    Response (400): called with the legacy token (single mode or SHAFERHUND_TOKEN admin).
+    Response (401): current_password does not match.
+    Response (422): missing fields.
+    """
+    if _db is None or _settings is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
+    # Legacy synthetic user cannot change password.
+    if user.get("username") == "__legacy_token__":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot change password in single mode.",
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid JSON body")
+
+    current_pw = str(body.get("current_password", "") or "")
+    new_pw = str(body.get("new_password", "") or "")
+
+    if not current_pw or not new_pw:
+        raise HTTPException(
+            status_code=422,
+            detail="current_password and new_password are required",
+        )
+
+    user_row = get_user_by_id(_db, user["id"])
+    if user_row is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if not verify_password(current_pw, user_row["password_hash"]):
+        raise HTTPException(
+            status_code=401,
+            detail="Current password is incorrect",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    new_hash = hash_password(new_pw)
+    update_user_password(_db, user["id"], new_hash)
+    log.info("user '%s' (id=%d) changed their password", user["username"], user["id"])
+    return JSONResponse({"ok": True})
 
 
 async def _canary_enqueue(alert_obj) -> None:
