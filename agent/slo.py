@@ -60,6 +60,7 @@ Key design decisions:
 
 import asyncio
 import logging
+import sqlite3
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -286,7 +287,13 @@ async def slo_evaluator_loop(
 
     while True:
         try:
-            conn = conn_factory() if callable(conn_factory) else conn_factory
+            # DEC-SLO-004: Use isinstance() not callable() to distinguish a raw
+            # sqlite3.Connection from a factory function. sqlite3.Connection has
+            # __call__ from the C extension, so callable(conn) returns True for
+            # a raw connection — calling conn() then raises TypeError every cycle,
+            # silently swallowed by the broad except. In production, main.py passes
+            # _db directly (a raw Connection), so the loop never evaluated anything.
+            conn = conn_factory if isinstance(conn_factory, sqlite3.Connection) else conn_factory()
             result = evaluate_slo(conn, settings)
 
             if result["action"] == "opened":

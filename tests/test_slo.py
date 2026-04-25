@@ -274,3 +274,64 @@ def test_fire_webhook_network_error_no_retry():
     assert len(err) > 0
     # Exactly one attempt — no retry (DEC-SLO-002)
     assert mock_post.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Regression test: DEC-SLO-004 — callable() misfire on sqlite3.Connection
+# ---------------------------------------------------------------------------
+
+def test_evaluator_loop_accepts_raw_connection(tmp_path):
+    """Regression for the callable(sqlite3.Connection) bug — DEC-SLO-004.
+
+    sqlite3.Connection has __call__ (C extension), so callable(conn) returns True
+    for a raw connection. The old dispatch called conn() and raised TypeError every
+    cycle, silently swallowed by the broad except. In production (main.py passes _db
+    directly) the SLO evaluator never inserted a breach row regardless of posture.
+
+    Fix: isinstance(conn_factory, sqlite3.Connection) distinguishes a raw connection
+    from a factory function without the false positive.
+
+    This test exercises the async loop with a raw connection (matching the production
+    wiring at agent/main.py) and asserts at least one breach row is created.
+    """
+    import asyncio
+    from agent.slo import slo_evaluator_loop
+
+    db_path = str(tmp_path / "test_regression.db")
+    conn = init_db(db_path)  # init_db creates the schema and returns a Connection
+
+    # Insert a posture run well below the 0.7 threshold to guarantee a breach
+    run_id = _insert_complete_run(conn, score=0.4)
+
+    class _Settings:
+        posture_slo_enabled = True
+        posture_slo_threshold = 0.7
+        posture_slo_webhook_url = ""
+        posture_slo_eval_interval_seconds = 1
+
+    settings = _Settings()
+
+    async def _run():
+        task = asyncio.create_task(
+            slo_evaluator_loop(conn, settings, interval_seconds=1)
+        )
+        await asyncio.sleep(2.5)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_run())
+
+    breaches = conn.execute(
+        "SELECT id, breach_score, resolved_at FROM slo_breaches"
+    ).fetchall()
+    conn.close()
+
+    assert len(breaches) == 1, (
+        f"Expected 1 breach row (loop must have evaluated), got {len(breaches)}. "
+        "This likely means the callable() misfire is still present."
+    )
+    assert breaches[0][1] == pytest.approx(0.4), f"Unexpected breach_score: {breaches[0][1]}"
+    assert breaches[0][2] is None, "Breach should be open (resolved_at NULL)"
