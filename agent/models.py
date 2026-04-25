@@ -520,9 +520,8 @@ CREATE INDEX IF NOT EXISTS idx_cloud_audit_findings_severity
 #   role           — CHECK constraint to (admin, operator, viewer). The set of
 #                    valid roles is code-resident (DEC-AUTH-P6-002).
 #   disabled       — integer boolean (0/1). Disabled users cannot authenticate
-#                    even with a valid token.
-#   is_active      — kept for plan compatibility (maps to NOT disabled). Stored
-#                    as INTEGER, 1=active.
+#                    even with a valid token. Single auth gate — is_active was
+#                    dropped (see #69 follow-up) to eliminate drift risk.
 #
 # user_tokens: one row per issued bearer token.
 #   token_hash     — SHA-256 hex of the raw bearer token. The raw token is
@@ -550,8 +549,7 @@ CREATE TABLE IF NOT EXISTS users (
                             CHECK(role IN ('admin','operator','viewer')),
     created_at      TEXT    NOT NULL,
     last_login_at   TEXT,
-    disabled        INTEGER NOT NULL DEFAULT 0,
-    is_active       INTEGER NOT NULL DEFAULT 1
+    disabled        INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
@@ -2321,8 +2319,8 @@ def insert_user(
     with get_cursor(conn) as cur:
         cur.execute(
             """
-            INSERT INTO users (username, password_hash, role, created_at, disabled, is_active)
-            VALUES (?, ?, ?, ?, 0, 1)
+            INSERT INTO users (username, password_hash, role, created_at, disabled)
+            VALUES (?, ?, ?, ?, 0)
             """,
             (username, password_hash, role, ts),
         )
@@ -2367,13 +2365,18 @@ def set_user_disabled(
     user_id: int,
     disabled: bool,
 ) -> None:
-    """Toggle the ``users.disabled`` flag (and keep ``is_active`` consistent)."""
+    """Toggle the ``users.disabled`` flag.
+
+    ``disabled`` is the single auth gate — ``is_active`` was dropped in the
+    #69 follow-up to eliminate drift risk where a caller could set
+    ``is_active=0`` without setting ``disabled=1`` and silently fail to block
+    auth. One toggle, no ambiguity (DEC-AUTH-P6-004).
+    """
     disabled_int = 1 if disabled else 0
-    is_active_int = 0 if disabled else 1
     with get_cursor(conn) as cur:
         cur.execute(
-            "UPDATE users SET disabled = ?, is_active = ? WHERE id = ?",
-            (disabled_int, is_active_int, user_id),
+            "UPDATE users SET disabled = ? WHERE id = ?",
+            (disabled_int, user_id),
         )
 
 

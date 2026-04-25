@@ -86,21 +86,18 @@ def test_get_user_by_username_missing(db):
 
 
 def test_set_user_disabled_toggles(db):
-    """set_user_disabled flips disabled and is_active fields consistently."""
+    """set_user_disabled flips the disabled field (single auth gate)."""
     uid = _insert_user(db, "alice")
     row = get_user_by_id(db, uid)
     assert row["disabled"] == 0
-    assert row["is_active"] == 1
 
     set_user_disabled(db, uid, True)
     row = get_user_by_id(db, uid)
     assert row["disabled"] == 1
-    assert row["is_active"] == 0
 
     set_user_disabled(db, uid, False)
     row = get_user_by_id(db, uid)
     assert row["disabled"] == 0
-    assert row["is_active"] == 1
 
 
 def test_update_user_last_login(db):
@@ -247,9 +244,33 @@ def test_users_table_columns(tmp_path):
     conn = init_db(str(tmp_path / "col.db"))
     cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
     required = {"id", "username", "password_hash", "role", "created_at",
-                "last_login_at", "disabled", "is_active"}
+                "last_login_at", "disabled"}
     assert required <= cols, f"Missing columns: {required - cols}"
     conn.close()
+
+
+def test_users_schema_has_no_is_active_column(tmp_path):
+    """Regression for the dropped is_active column (#69 follow-up).
+
+    Earlier in #69's lifecycle the users table had both ``disabled`` and
+    ``is_active`` columns, but ``authenticate_token()`` read only
+    ``disabled``. ``is_active`` was dead schema, drift-prone — a future
+    caller (e.g. Wave B1 #73 admin endpoints) could set ``is_active=0``
+    without setting ``disabled=1`` and silently fail to block auth.
+
+    The column was dropped; ``disabled`` is now the single auth gate
+    (DEC-AUTH-P6-004). This test prevents reintroduction.
+    """
+    conn = init_db(str(tmp_path / "schema.db"))
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()]
+    conn.close()
+
+    assert "is_active" not in cols, (
+        f"is_active reintroduced — auth path may drift; see #69 follow-up. cols={cols}"
+    )
+    assert "disabled" in cols, (
+        f"disabled column missing — auth path is broken. cols={cols}"
+    )
 
 
 def test_user_tokens_table_columns(tmp_path):
