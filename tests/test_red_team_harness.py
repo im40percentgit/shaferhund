@@ -307,3 +307,76 @@ def test_posture_run_route_requires_auth(tmp_path):
         f"Expected 401 for unauthenticated /posture/run, got {resp.status_code}"
     )
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: run_batch with mixed weights → both scores on posture_runs row
+# ---------------------------------------------------------------------------
+
+def test_run_batch_weighted_score_persisted():
+    """run_batch with mixed-weight fixture: both score and weighted_score end up correct.
+
+    Fixture has 3 tests: T1059.003(weight=3), T1053.003(weight=2), T1087.001(weight=1).
+    The fake executor always succeeds (exit_code=0), but no clusters or rules exist
+    in the DB, so the SQL scoring join finds no deployed rules → all tests fail scoring.
+
+    Expected: passes=0, score=0.0, weighted_score=0.0.
+
+    This verifies that run_batch writes weighted_score to the posture_runs row
+    (not just score), and that the column exists after Phase 4 migration. The
+    divergence scenarios are covered by test_posture_score.py W2/W3.
+    """
+    conn = init_db(":memory:")
+    tests = [
+        {"technique_id": "T1059.003", "test_name": "test-a",
+         "command_or_script_hint": "echo a", "weight": 3},
+        {"technique_id": "T1053.003", "test_name": "test-b",
+         "command_or_script_hint": "echo b", "weight": 2},
+        {"technique_id": "T1087.001", "test_name": "test-c",
+         "command_or_script_hint": "echo c", "weight": 1},
+    ]
+    executor = _make_fake_executor(exit_code=0, output="ok")
+
+    run_id = run_batch(conn, tests, "test-target", executor=executor)
+
+    row = dict(conn.execute(
+        "SELECT * FROM posture_runs WHERE id = ?", (run_id,)
+    ).fetchone())
+
+    # No clusters → scoring join returns 0 passes for both metrics
+    assert row["score"] == 0.0, f"Expected flat score=0.0, got {row['score']}"
+    assert "weighted_score" in row, "weighted_score column missing from posture_runs row"
+    assert row["weighted_score"] == 0.0, f"Expected weighted_score=0.0, got {row['weighted_score']}"
+
+    # Verify per-test weights were stored in posture_test_results
+    result_rows = conn.execute(
+        "SELECT technique_id, weight FROM posture_test_results WHERE run_id = ? ORDER BY id",
+        (run_id,),
+    ).fetchall()
+    weights_by_tech = {r["technique_id"]: r["weight"] for r in result_rows}
+    assert weights_by_tech.get("T1059.003") == 3, f"Expected weight=3, got {weights_by_tech}"
+    assert weights_by_tech.get("T1053.003") == 2, f"Expected weight=2, got {weights_by_tech}"
+    assert weights_by_tech.get("T1087.001") == 1, f"Expected weight=1, got {weights_by_tech}"
+
+    conn.close()
+
+
+def test_run_batch_weight_defaults_to_1_when_absent():
+    """run_batch defaults weight=1 when a test dict has no 'weight' key."""
+    conn = init_db(":memory:")
+    tests = [
+        {"technique_id": "T1059.003", "test_name": "no-weight",
+         "command_or_script_hint": "echo x"},  # no weight key
+    ]
+    executor = _make_fake_executor(exit_code=0, output="ok")
+
+    run_id = run_batch(conn, tests, "test-target", executor=executor)
+
+    result_rows = conn.execute(
+        "SELECT weight FROM posture_test_results WHERE run_id = ?", (run_id,)
+    ).fetchall()
+    assert len(result_rows) == 1
+    assert result_rows[0]["weight"] == 1, (
+        f"Expected default weight=1, got {result_rows[0]['weight']}"
+    )
+    conn.close()

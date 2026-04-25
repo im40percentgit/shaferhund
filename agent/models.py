@@ -10,6 +10,24 @@ Phase 2 additions: multi-source alert columns on `alerts` table
 (added via idempotent ALTER TABLE in init_db) and a new `deploy_events`
 table for the policy-gated auto-deploy audit trail.
 
+Phase 4 additions: weighted_score column on `posture_runs` and weight
+column on `posture_test_results`, both added via the idempotent
+_POSTURE_RUNS_PHASE4_COLUMNS pattern (DEC-SCHEMA-002). New helper
+compute_posture_weighted_score_for_run() computes the weighted average.
+
+@decision DEC-POSTURE-003
+@title Weighted posture score — declarative YAML weights, additive alongside flat score
+@status accepted
+@rationale The flat score (passes / total_tests) treats all MITRE techniques equally.
+           Phase 4 adds a parallel weighted score (sum(weight * passed) / sum(weight))
+           that reflects operator-assigned criticality from atomic_tests.yaml.
+           Both scores persist on posture_runs and expose on /health so Phase 3
+           callers are fully backwards-compatible. Weights are declared in YAML
+           (not judged by Claude at runtime) for determinism: the same test set
+           produces the same weighted score every run regardless of model version,
+           token availability, or hourly budget. Claude-judged adaptive weights
+           are a future enhancement (saves an LLM call per scoring run here).
+
 @decision DEC-CLUSTER-001
 @title In-memory clusterer with SQLite persistence
 @status accepted
@@ -264,6 +282,27 @@ CREATE INDEX IF NOT EXISTS idx_ptr_fired_at ON posture_test_results(fired_at);
 """
 
 
+# ---------------------------------------------------------------------------
+# Phase 4 schema additions — weighted posture score (REQ-P0-P4-003)
+# ---------------------------------------------------------------------------
+#
+# Both columns are added idempotently via PRAGMA table_info() gating
+# (DEC-SCHEMA-002) so a Phase 3 DB upgrades in place without data loss.
+#
+# posture_runs.weighted_score  — sum(weight * passed) / sum(weight), 0.0–1.0.
+#   DEFAULT 0.0 so existing rows remain valid after the ALTER TABLE.
+#
+# posture_test_results.weight  — per-test importance weight from atomic_tests.yaml.
+#   DEFAULT 1 so existing rows contribute equally until re-scored with real weights.
+_POSTURE_RUNS_PHASE4_COLUMNS: list[tuple[str, str]] = [
+    ("weighted_score", "REAL NOT NULL DEFAULT 0.0"),
+]
+
+_POSTURE_TEST_RESULTS_PHASE4_COLUMNS: list[tuple[str, str]] = [
+    ("weight", "INTEGER NOT NULL DEFAULT 1"),
+]
+
+
 def init_db(db_path: str) -> sqlite3.Connection:
     """Open (or create) the SQLite database and apply schema.
 
@@ -332,6 +371,30 @@ def init_db(db_path: str) -> sqlite3.Connection:
 
     # posture_test_results table (Phase 3, REQ-P0-P3-003) — idempotent.
     conn.executescript(_POSTURE_TEST_RESULTS_SQL)
+
+    # Phase 4: weighted_score column on posture_runs (REQ-P0-P4-003).
+    existing_posture_run_cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(posture_runs)").fetchall()
+    }
+    for col_name, col_def in _POSTURE_RUNS_PHASE4_COLUMNS:
+        if col_name not in existing_posture_run_cols:
+            conn.execute(
+                f"ALTER TABLE posture_runs ADD COLUMN {col_name} {col_def}"
+            )
+            log.info("posture_runs table: added column %s", col_name)
+
+    # Phase 4: weight column on posture_test_results (REQ-P0-P4-003).
+    existing_posture_tr_cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(posture_test_results)").fetchall()
+    }
+    for col_name, col_def in _POSTURE_TEST_RESULTS_PHASE4_COLUMNS:
+        if col_name not in existing_posture_tr_cols:
+            conn.execute(
+                f"ALTER TABLE posture_test_results ADD COLUMN {col_name} {col_def}"
+            )
+            log.info("posture_test_results table: added column %s", col_name)
 
     conn.commit()
     log.info("Database initialised at %s", db_path)
@@ -1085,30 +1148,36 @@ def update_posture_run(
     passes: int,
     score: float,
     status: str,
+    weighted_score: float = 0.0,
 ) -> None:
     """Update a posture_runs row with final results.
 
     Called after run_batch() completes (successfully or with failures).
+    Phase 4 adds weighted_score (REQ-P0-P4-003) alongside the existing flat
+    score. The parameter defaults to 0.0 for backwards compatibility with any
+    Phase 3 callers that don't supply it.
 
     Args:
-        conn:        Open SQLite connection.
-        run_id:      The posture_runs.id to update.
-        finished_at: ISO8601 timestamp when the run completed.
-        passes:      Number of tests that scored as a pass.
-        score:       passes / total_tests (0.0–1.0).
-        status:      'complete' or 'failed'.
+        conn:           Open SQLite connection.
+        run_id:         The posture_runs.id to update.
+        finished_at:    ISO8601 timestamp when the run completed.
+        passes:         Number of tests that scored as a pass.
+        score:          passes / total_tests (flat, 0.0–1.0).
+        status:         'complete' or 'failed'.
+        weighted_score: sum(weight*passed)/sum(weight) (0.0–1.0). Default 0.0.
     """
     with get_cursor(conn) as cur:
         cur.execute(
             """
             UPDATE posture_runs
-               SET finished_at = ?,
-                   passes      = ?,
-                   score       = ?,
-                   status      = ?
+               SET finished_at    = ?,
+                   passes         = ?,
+                   score          = ?,
+                   weighted_score = ?,
+                   status         = ?
              WHERE id = ?
             """,
-            (finished_at, passes, score, status, run_id),
+            (finished_at, passes, score, weighted_score, status, run_id),
         )
 
 
@@ -1244,6 +1313,70 @@ def compute_posture_score_for_run(
     return {"run_id": run_id, "total_tests": total_tests, "passes": passes, "score": score}
 
 
+def compute_posture_weighted_score_for_run(
+    conn: sqlite3.Connection,
+    run_id: int,
+) -> float:
+    """Compute the weighted posture score for a completed run.
+
+    Weighted scoring rule (REQ-P0-P4-003, DEC-POSTURE-003):
+      weighted_score = SUM(ptr.weight * pass_flag) / SUM(ptr.weight)
+
+    where pass_flag=1 when the test's fired_at falls inside a cluster window
+    that has at least one deployed rule (same join condition as the flat score),
+    and pass_flag=0 otherwise.
+
+    The weight per test is stored in posture_test_results.weight at insert time
+    (from atomic_tests.yaml, default 1). The SQL aggregation is done entirely
+    in SQL to avoid pulling rowsets into Python (DEC-POSTURE-001 pattern).
+
+    Divide-by-zero guard: returns 0.0 when SUM(weight) == 0 (e.g. all tests
+    have weight=0, or no test_results rows exist for this run_id).
+
+    This function does NOT update posture_runs — the caller (run_batch via
+    compute_posture_score_for_run flow) controls persistence. Call
+    update_posture_run(..., weighted_score=...) after this returns.
+
+    Args:
+        conn:   Open SQLite connection.
+        run_id: The posture_runs.id to score.
+
+    Returns:
+        Float in [0.0, 1.0]. Returns 0.0 on divide-by-zero.
+    """
+    # SUM(weight * 1) for passing tests / SUM(weight) for all tests in run.
+    # A test passes when fired_at is inside a cluster window AND that cluster
+    # has a deployed rule. Tests with no matching cluster/rule contribute 0
+    # to the numerator but their weight still appears in the denominator.
+    row = conn.execute(
+        """
+        SELECT
+            SUM(ptr.weight)                       AS total_weight,
+            SUM(CASE
+                WHEN EXISTS (
+                    SELECT 1
+                      FROM clusters cl
+                      JOIN rules r ON r.cluster_id = cl.id AND r.deployed = 1
+                     WHERE ptr.fired_at >= cl.window_start
+                       AND ptr.fired_at <= cl.window_end
+                ) THEN ptr.weight
+                ELSE 0
+            END)                                  AS weighted_passes
+          FROM posture_test_results ptr
+         WHERE ptr.run_id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+
+    if row is None:
+        return 0.0
+    total_weight = row["total_weight"] or 0
+    weighted_passes = row["weighted_passes"] or 0
+    if total_weight == 0:
+        return 0.0
+    return float(weighted_passes) / float(total_weight)
+
+
 # ---------------------------------------------------------------------------
 # Posture Test Results CRUD  (Phase 3 — REQ-P0-P3-003)
 # ---------------------------------------------------------------------------
@@ -1260,8 +1393,14 @@ def insert_posture_test_result(
     fired_at: str,
     exit_code: Optional[int] = None,
     output: Optional[str] = None,
+    weight: int = 1,
 ) -> int:
     """Insert a per-test result row and return its id.
+
+    Phase 4 (REQ-P0-P4-003): weight is now persisted on the row so that
+    compute_posture_weighted_score_for_run can aggregate directly in SQL
+    without re-joining to atomic_tests.yaml. Defaults to 1 for backwards
+    compatibility with Phase 3 callers that don't supply it.
 
     Args:
         conn:         Open SQLite connection.
@@ -1271,6 +1410,7 @@ def insert_posture_test_result(
         fired_at:     ISO8601 timestamp when the test command was launched.
         exit_code:    Shell exit code of the test command (None if not yet run).
         output:       Captured stdout/stderr (truncated to 4096 chars).
+        weight:       Importance weight from atomic_tests.yaml (default 1).
 
     Returns:
         The new row's INTEGER PRIMARY KEY.
@@ -1280,9 +1420,9 @@ def insert_posture_test_result(
         cur.execute(
             """
             INSERT INTO posture_test_results
-                (run_id, technique_id, test_name, fired_at, exit_code, output, passed)
-            VALUES (?, ?, ?, ?, ?, ?, 0)
+                (run_id, technique_id, test_name, fired_at, exit_code, output, passed, weight)
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?)
             """,
-            (run_id, technique_id, test_name, fired_at, exit_code, safe_output),
+            (run_id, technique_id, test_name, fired_at, exit_code, safe_output, weight),
         )
         return cur.lastrowid
