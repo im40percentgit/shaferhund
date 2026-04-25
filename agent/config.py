@@ -55,6 +55,17 @@ class Settings(BaseSettings):
     # Default is 'single' so existing deployments are byte-identical until opt-in.
     shaferhund_auth_mode: str = "single"
 
+    # Phase 6 Wave B1 — Bootstrap admin credentials (REQ-P0-P6-006, DEC-AUTH-P6-007)
+    # When SHAFERHUND_AUTH_MODE=multi AND the users table is empty, these two env
+    # vars seed the first admin user at startup (idempotent — skipped if users
+    # table has any rows).  Both must be set together; a partial set logs a WARNING
+    # and takes no action.  The password is never persisted in plaintext — only the
+    # Argon2id hash survives startup.
+    #
+    # Env vars: SHAFERHUND_BOOTSTRAP_ADMIN_USERNAME / SHAFERHUND_BOOTSTRAP_ADMIN_PASSWORD
+    shaferhund_bootstrap_admin_username: str = ""
+    shaferhund_bootstrap_admin_password: str = ""  # plaintext, used only at startup
+
     # Phase 6 Wave A3 — Audit log HMAC key (REQ-P0-P6-005, DEC-AUDIT-P6-001)
     # Operator-supplied hex string (recommend 32 bytes = 64 hex chars) used to
     # key the HMAC-SHA256 chain over audit_log rows.  The same key is reused by
