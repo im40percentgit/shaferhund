@@ -136,13 +136,14 @@ def _make_config(max_calls: int = 5, wall_timeout: float = 10.0) -> SimpleNamesp
 
 
 def test_health_returns_only_liveness_fields(tmp_path):
-    """GET /health → exactly {status, poller_healthy, threat_intel, canary, posture}.
+    """GET /health → exactly {status, poller_healthy, threat_intel, canary, posture, recommendations}.
 
     Phase 3 (REQ-P0-P3-005) added threat_intel.record_count to /health.
     Phase 3 (REQ-P0-P3-004) added canary.trigger_count_24h to /health.
     Phase 3 (REQ-P0-P3-001) added posture.last_score + posture.last_run_at to /health.
     Phase 4 (REQ-P0-P4-003) adds posture.last_weighted_score to /health.
     Phase 4 (REQ-P0-P4-005) adds posture.slo_breach_open to /health.
+    Phase 4 Wave B (REQ-P0-P4-001) adds recommendations.pending_count to /health.
     All fields are minimal summary values that do not expose operational detail,
     consistent with DEC-HEALTH-002's "public liveness probe" intent.
     """
@@ -153,8 +154,10 @@ def test_health_returns_only_liveness_fields(tmp_path):
     assert resp.status_code == 200
 
     data = resp.json()
-    assert set(data.keys()) == {"status", "poller_healthy", "threat_intel", "canary", "posture"}, (
-        f"Expected exactly {{status, poller_healthy, threat_intel, canary, posture}}, "
+    assert set(data.keys()) == {
+        "status", "poller_healthy", "threat_intel", "canary", "posture", "recommendations"
+    }, (
+        f"Expected exactly 6 keys including 'recommendations', "
         f"got keys: {set(data.keys())}"
     )
     assert data["status"] == "ok"
@@ -178,6 +181,19 @@ def test_health_returns_only_liveness_fields(tmp_path):
     assert posture["last_run_at"] is None
     assert posture["last_weighted_score"] is None
     assert posture["slo_breach_open"] is False
+
+    # Phase 4 Wave B (REQ-P0-P4-001) — recommendations.pending_count
+    recs = data["recommendations"]
+    assert "pending_count" in recs, (
+        "recommendations.pending_count missing — Phase 4 Wave B REQ-P0-P4-001"
+    )
+    assert isinstance(recs["pending_count"], int), (
+        f"recommendations.pending_count must be int, got {type(recs['pending_count'])}"
+    )
+    # Fresh DB — no pending recommendations
+    assert recs["pending_count"] == 0, (
+        f"Fresh DB must have pending_count=0, got {recs['pending_count']}"
+    )
 
     conn.close()
 

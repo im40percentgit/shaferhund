@@ -142,6 +142,7 @@ from .models import (
     get_cluster_with_alerts,
     get_recent_deploys,
     get_rules_for_cluster,
+    insert_attack_recommendation,
     insert_deploy_event,
     insert_rule,
     mark_rule_deployed,
@@ -1107,6 +1108,124 @@ register_tool(
     allows_no_conn=True,  # produces TriageResult even without DB (no-DB unit test path)
     kind="write",
 )
+
+
+# ---------------------------------------------------------------------------
+# 8th tool handler — recommend_attack (REQ-P0-P4-001, DEC-RECOMMEND-001)
+# ---------------------------------------------------------------------------
+
+
+def _handle_recommend_attack(
+    tool_input: dict,
+    conn: sqlite3.Connection,
+    cluster_id: str = "",
+) -> str:
+    """Record an ART technique recommendation for operator review.
+
+    This handler ONLY writes a status='pending' row to attack_recommendations.
+    It does NOT execute any technique. Execution requires an explicit operator
+    HTTP POST to /recommendations/{id}/execute (DEC-RECOMMEND-001).
+
+    The reason field is sanitized via sanitize_alert_field() before storage
+    because Claude's recommendation text ultimately derives from alert content
+    that may be attacker-influenced — the same injection boundary as other
+    write handlers (DEC-ORCH-004).
+
+    Args:
+        tool_input:  Dict with keys technique_id (str), reason (str),
+                     severity (str: Low|Medium|High|Critical).
+        conn:        Open SQLite connection (injected by dispatch()).
+        cluster_id:  The cluster being triaged (injected by dispatch()).
+
+    Returns:
+        JSON string confirming the recommendation_id and that operator action
+        is required before execution.
+    """
+    technique_id = tool_input.get("technique_id", "").strip()
+    reason = sanitize_alert_field(tool_input.get("reason", ""))
+    severity = tool_input.get("severity", "Medium")
+
+    if not technique_id:
+        return json.dumps({"error": "technique_id is required"})
+
+    valid_severities = {"Low", "Medium", "High", "Critical"}
+    if severity not in valid_severities:
+        return json.dumps({
+            "error": f"severity must be one of {sorted(valid_severities)}, got {severity!r}"
+        })
+
+    # cluster_id may be empty string when called outside a cluster context.
+    cluster_id_stored = cluster_id if cluster_id else None
+
+    rec_id = insert_attack_recommendation(
+        conn=conn,
+        technique_id=technique_id,
+        reason=reason,
+        severity=severity,
+        cluster_id=cluster_id_stored,
+    )
+
+    log.info(
+        "recommend_attack: recommendation_id=%d technique=%s severity=%s cluster=%s",
+        rec_id,
+        technique_id,
+        severity,
+        cluster_id_stored,
+    )
+
+    return json.dumps({
+        "recommendation_id": rec_id,
+        "technique_id": technique_id,
+        "severity": severity,
+        "status": "pending",
+        "message": (
+            "Recommendation queued for operator review. "
+            "Execute via POST /recommendations/{id}/execute — "
+            "Claude does NOT run this automatically."
+        ),
+    })
+
+
+# Register the 8th tool (DEC-RECOMMEND-001, REQ-P0-P4-001).
+# requires_cluster_id=True so dispatch() injects the triaging cluster —
+# the recommendation is contextually linked to the cluster that triggered it.
+register_tool(
+    spec={
+        "name": "recommend_attack",
+        "description": (
+            "Recommend an Atomic Red Team technique to run based on observed posture gaps. "
+            "The recommendation is queued for operator approval, NOT executed automatically. "
+            "Use this when posture analysis reveals a gap that a specific ART technique would expose."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "technique_id": {
+                    "type": "string",
+                    "description": "MITRE ATT&CK technique ID like T1059.003",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": (
+                        "Why this technique is being recommended (1-3 sentences). "
+                        "Reference observed posture gaps, cluster history, or threat intel."
+                    ),
+                },
+                "severity": {
+                    "type": "string",
+                    "enum": ["Low", "Medium", "High", "Critical"],
+                    "description": "Operator-actionability priority for this recommendation.",
+                },
+            },
+            "required": ["technique_id", "reason", "severity"],
+        },
+    },
+    handler=_handle_recommend_attack,
+    requires_conn=True,
+    requires_cluster_id=True,
+    kind="write",
+)
+
 
 # Default verdict returned when the loop exits without finalize_triage.
 _FAILSAFE_RESULT = TriageResult(

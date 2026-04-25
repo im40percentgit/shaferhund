@@ -101,11 +101,15 @@ from . import canary as _canary
 from .canary import spawn_canary, record_hit, count_canary_triggers_since
 from . import red_team as _red_team
 from .models import (
+    count_pending_attack_recommendations,
+    get_attack_recommendation,
     get_latest_posture_run,
     get_open_slo_breach,
     insert_posture_run,
+    list_pending_attack_recommendations,
 )
 from . import slo as _slo
+from . import recommendations as _recommendations
 
 log = logging.getLogger(__name__)
 
@@ -376,6 +380,11 @@ async def health() -> JSONResponse:
     slo_breach_open = (
         get_open_slo_breach(_db) is not None if _db is not None else False
     )
+    # Phase 4 Wave B (REQ-P0-P4-001): pending_count only — no row detail.
+    # Public, minimal: operators poll /recommendations for the full list.
+    pending_recs = (
+        count_pending_attack_recommendations(_db) if _db is not None else 0
+    )
     return JSONResponse({
         "status": "ok",
         "poller_healthy": _poller_healthy,
@@ -390,6 +399,9 @@ async def health() -> JSONResponse:
             "last_run_at": posture_last_run_at,
             "last_weighted_score": posture_last_weighted_score,
             "slo_breach_open": slo_breach_open,
+        },
+        "recommendations": {
+            "pending_count": pending_recs,
         },
     })
 
@@ -793,6 +805,116 @@ async def posture_run() -> JSONResponse:
     asyncio.create_task(_run_in_background(), name=f"posture-run-{run_id}")
     log.info("POST /posture/run: started run_id=%d (%d tests)", run_id, len(tests))
     return JSONResponse({"run_id": run_id, "status": "running"})
+
+
+# ---------------------------------------------------------------------------
+# Attack recommendation routes (Phase 4 Wave B, REQ-P0-P4-001/002)
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/recommendations",
+    dependencies=[Depends(_require_auth)],
+)
+async def list_recommendations() -> JSONResponse:
+    """List pending attack recommendations for operator review.
+
+    Auth-gated — same SHAFERHUND_TOKEN bearer scheme as all write routes.
+    Returns only status='pending' rows. Each row includes a 'destructive'
+    boolean derived from the code-resident DESTRUCTIVE_TECHNIQUES frozenset
+    (DEC-RECOMMEND-002) so operators can see at a glance which recommendations
+    require force=true to execute.
+
+    Returns:
+        JSON array of recommendation objects, newest first (max 50).
+        Empty array when no pending recommendations exist.
+    """
+    if _db is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+
+    rows = list_pending_attack_recommendations(_db, limit=50)
+    result = []
+    for row in rows:
+        rec = dict(row)
+        rec["destructive"] = _recommendations.is_destructive(rec.get("technique_id", ""))
+        result.append(rec)
+
+    return JSONResponse(result)
+
+
+@app.post(
+    "/recommendations/{recommendation_id}/execute",
+    dependencies=[Depends(_require_auth)],
+)
+async def execute_recommendation_route(
+    recommendation_id: int,
+    request: Request,
+) -> JSONResponse:
+    """Execute an approved attack recommendation via the ART harness.
+
+    Auth-gated — this endpoint execs commands inside a container. Auth is
+    non-negotiable (DEC-RECOMMEND-001; same rationale as /posture/run).
+
+    Request body (optional JSON):
+        force (bool): If true, bypass the destructive technique check.
+                      Default: false. This is the ONLY runtime bypass path
+                      for destructive techniques — there is no env-var
+                      equivalent (DEC-RECOMMEND-002).
+
+    Returns:
+        200  {"recommendation_id": id, "run_id": int, "status": "executed"}
+        400  {"detail": "..."}  — not pending, or destructive without force
+        404  {"detail": "..."}  — recommendation not found
+
+    The actual run_batch call runs synchronously (via asyncio.create_task in
+    a thread) for the same reason as /posture/run: subprocess calls would
+    block the event loop. The run_id is returned immediately; the posture_runs
+    row is updated to 'complete' or 'failed' when the batch finishes.
+
+    @decision DEC-RECOMMEND-001
+    @title Operator HTTP POST is the sole execution trigger
+    @status accepted
+    @rationale See recommendations.py module docstring.
+    """
+    if _db is None or _settings is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+
+    # Parse optional request body for force flag
+    force = False
+    try:
+        body = await request.json()
+        force = bool(body.get("force", False))
+    except Exception:
+        pass  # Empty or non-JSON body → force stays False
+
+    result = _recommendations.execute_recommendation(
+        conn=_db,
+        recommendation_id=recommendation_id,
+        force=force,
+        target_container=_settings.redteam_target_container,
+        executor=None,  # use default podman exec in production
+    )
+
+    exec_status = result.get("status")
+
+    if exec_status == "not_found":
+        raise HTTPException(status_code=404, detail=result["error"])
+
+    if exec_status in ("rejected", "already_executed"):
+        raise HTTPException(status_code=400, detail=result["error"])
+
+    # status == "executed"
+    log.info(
+        "POST /recommendations/%d/execute: run_id=%s force=%s",
+        recommendation_id,
+        result.get("run_id"),
+        force,
+    )
+    return JSONResponse({
+        "recommendation_id": recommendation_id,
+        "run_id": result["run_id"],
+        "status": "executed",
+    })
 
 
 async def _canary_enqueue(alert_obj) -> None:
