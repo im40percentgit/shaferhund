@@ -2134,3 +2134,63 @@ def get_cloud_finding(
         "SELECT * FROM cloud_audit_findings WHERE id = ?",
         (finding_id,),
     ).fetchone()
+
+
+# ---------------------------------------------------------------------------
+# CloudTrail principal lookup — Phase 5 Wave B1 (REQ-P0-P5-007)
+# ---------------------------------------------------------------------------
+
+
+def get_cloudtrail_events_by_principal_since(
+    conn: sqlite3.Connection,
+    principal_arn: str,
+    since_ts: str,
+    limit: int = 50,
+) -> list[dict]:
+    """Return up to ``limit`` recent CloudTrail alerts for the given principal ARN.
+
+    The principal ARN is stored inside the ``raw_json`` column of
+    ``alert_details`` (the full CloudTrail event JSON, including
+    ``userIdentity.arn``).  We extract it via SQLite's ``json_extract()``
+    rather than adding a dedicated column to the shared ``alerts`` table —
+    consistent with DEC-CLOUD-003 / DEC-CLUSTER-002: source-specific fields
+    stay out of the shared schema.  The query cost is acceptable because
+    this is only called during operator-initiated triage (not in a tight loop).
+
+    Args:
+        conn:          Open SQLite connection.
+        principal_arn: Full AWS principal ARN, e.g.
+                       ``arn:aws:iam::123456789012:user/alice``.
+                       Caller is responsible for sanitizing this value before
+                       passing it here (see _handle_lookup_cloud_identity in
+                       orchestrator.py which applies sanitize_alert_field).
+        since_ts:      ISO-8601 cutoff timestamp.  Only alerts with
+                       ``ingested_at >= since_ts`` are returned.
+        limit:         Maximum rows to return (default 50).
+
+    Returns:
+        List of dicts with keys: id, rule_id, src_ip, severity, source,
+        cluster_id, ingested_at, raw_json.  Ordered newest-first.
+        Returns an empty list when no alerts match.
+    """
+    rows = conn.execute(
+        """
+        SELECT a.id,
+               a.rule_id,
+               a.src_ip,
+               a.severity,
+               a.source,
+               a.cluster_id,
+               a.ingested_at,
+               d.raw_json
+          FROM alerts a
+          JOIN alert_details d ON d.alert_id = a.id
+         WHERE a.source = 'cloudtrail'
+           AND json_extract(d.raw_json, '$.userIdentity.arn') = ?
+           AND a.ingested_at >= ?
+         ORDER BY a.ingested_at DESC
+         LIMIT ?
+        """,
+        (principal_arn, since_ts, limit),
+    ).fetchall()
+    return [dict(row) for row in rows]

@@ -106,9 +106,10 @@ def _make_mock_client(responses: list) -> MagicMock:
 # ---------------------------------------------------------------------------
 
 def test_tool_schema_has_7_tools():
-    """TOOLS list must contain exactly 8 tools after Phase 4 Wave B addition."""
+    """TOOLS list must contain exactly 9 tools after Phase 5 Wave B1 addition."""
     # Phase 4 Wave B (REQ-P0-P4-001) added recommend_attack as the 8th tool.
-    assert len(TOOLS) == 8, f"Expected 8 tools, got {len(TOOLS)}: {[t['name'] for t in TOOLS]}"
+    # Phase 5 Wave B1 (REQ-P0-P5-007) added lookup_cloud_identity as the 9th tool.
+    assert len(TOOLS) == 9, f"Expected 9 tools, got {len(TOOLS)}: {[t['name'] for t in TOOLS]}"
 
 
 # ---------------------------------------------------------------------------

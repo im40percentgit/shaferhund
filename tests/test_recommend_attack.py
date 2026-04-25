@@ -81,8 +81,8 @@ def test_recommend_attack_tool_registered():
 
     The 8th entry must be recommend_attack (issue #45 acceptance criterion).
     """
-    assert len(TOOLS) == 8, (
-        f"Expected 8 registered tools, got {len(TOOLS)}. "
+    assert len(TOOLS) == 9, (
+        f"Expected 9 registered tools, got {len(TOOLS)}. "
         f"Tool names: {[t['name'] for t in TOOLS]}"
     )
     tool_names = [t["name"] for t in TOOLS]
