@@ -1,0 +1,42 @@
+# LocalStack compose overlay — opt-in service for integration testing.
+#
+# This file extends compose.yaml with a LocalStack 3.x service that provides
+# an AWS-API-compatible S3 endpoint for running the CloudTrail integration
+# tests (tests/integration/test_cloudtrail_localstack.py, REQ-P0-P5-004).
+#
+# Usage:
+#   Start with LocalStack:
+#     podman compose -f compose.yaml -f compose.localstack.yaml up
+#   OR start LocalStack only:
+#     podman compose -f compose.localstack.yaml up localstack
+#
+#   Default `podman compose up` (compose.yaml only) is UNCHANGED — LocalStack
+#   is never started unless this file is explicitly included.
+#
+# Run integration tests once LocalStack is up:
+#   pytest -m integration tests/integration/
+#
+# @decision DEC-CLOUD-013
+# @title LocalStack as opt-in compose overlay for S3 integration tests
+# @status accepted
+# @rationale Separate file keeps the default compose stack unchanged (Phase 5
+#   Wave A contract: compose.yaml must not be modified). Operators who need
+#   the integration test harness opt in explicitly. LocalStack 3.4 is pinned
+#   for reproducibility; SERVICES=s3,iam,sts limits the surface to what
+#   shaferhund actually uses.
+
+services:
+  localstack:
+    image: localstack/localstack:3.4
+    ports:
+      - "127.0.0.1:4566:4566"
+    environment:
+      SERVICES: "s3,iam,sts"
+      DEBUG: "0"
+      PERSISTENCE: "0"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
