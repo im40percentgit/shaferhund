@@ -94,6 +94,12 @@ try:
 except ImportError:  # pragma: no cover — only absent in stripped CI environments
     boto3 = None  # type: ignore[assignment]
 
+from ..models import (  # noqa: E402 — after conditional boto3 import
+    get_cloudtrail_cursor,
+    insert_cloudtrail_alert,
+    update_cloudtrail_cursor,
+)
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -404,8 +410,6 @@ async def cloudtrail_poll_loop(
             # DEC-SLO-004 fix: use isinstance, not callable()
             conn = conn_factory if isinstance(conn_factory, sqlite3.Connection) else conn_factory()
 
-            from .models import get_cloudtrail_cursor, update_cloudtrail_cursor  # type: ignore[attr-defined]
-
             cursor_row = await asyncio.to_thread(
                 get_cloudtrail_cursor, conn, bucket, prefix
             )
@@ -417,8 +421,6 @@ async def cloudtrail_poll_loop(
             )
 
             if events:
-                from .models import insert_cloudtrail_alert  # type: ignore[attr-defined]
-
                 new_last_key: Optional[str] = None
                 last_event_ts: Optional[str] = None
                 for obj_key, raw_event in events:

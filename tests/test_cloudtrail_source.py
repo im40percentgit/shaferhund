@@ -484,3 +484,87 @@ async def test_poll_loop_handles_aws_error_gracefully(mem_db):
 
     # If we reach here without exception the loop handled the error gracefully
     assert True
+
+
+# ---------------------------------------------------------------------------
+# Regression: broken relative import in cloudtrail_poll_loop
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_poll_loop_one_cycle_with_real_db_and_mocked_s3(tmp_path):
+    """Regression for the broken single-dot relative import in cloudtrail_poll_loop.
+
+    Prior to fix, 'from .models import ...' inside the loop body resolved to
+    agent.sources.models (does not exist). The ModuleNotFoundError was caught by
+    the broad except and silently swallowed every cycle, leaving the feature
+    inert at runtime despite all unit tests passing (boto3 mocking sidestepped
+    the broken path).
+
+    This test runs ONE poll cycle with a real in-process SQLite connection
+    (Sacred Practice #5) + a mocked S3 client that returns one .json.gz
+    containing one event, then asserts both the alert row and the cursor row
+    landed in the DB. It would have FAILED on the buggy code.
+
+    Same lesson as DEC-SLO-004 (#44): unit tests miss integration bugs when
+    they mock too much.
+    """
+    import asyncio
+    from agent.models import init_db
+    from agent.sources.cloudtrail import cloudtrail_poll_loop
+
+    # Real SQLite DB backed by a tmp file (not :memory: so conn is shareable
+    # across threads used by asyncio.to_thread inside the poll loop).
+    db_path = str(tmp_path / "regression.db")
+    conn = init_db(db_path)
+
+    # Build one fake CloudTrail event matching the fixture shape
+    fake_event = {
+        "eventID": "regression-test-event-id-001",
+        "eventName": "DescribeInstances",
+        "eventSource": "ec2.amazonaws.com",
+        "eventTime": "2026-04-25T10:00:00Z",
+        "userIdentity": {"type": "IAMUser", "userName": "alice"},
+        "sourceIPAddress": "203.0.113.10",
+        "awsRegion": "us-east-1",
+    }
+    gz_bytes = _make_gz_object([fake_event])
+    obj_key = "AWSLogs/123/CloudTrail/us-east-1/2026/04/25/file.json.gz"
+
+    class _Settings:
+        cloudtrail_poll_interval_seconds = 0
+        cloudtrail_s3_bucket = "fake-bucket"
+        cloudtrail_s3_prefix = "AWSLogs/123/CloudTrail/"
+        cloudtrail_aws_region = "us-east-1"
+
+    with patch("agent.sources.cloudtrail.boto3") as mock_boto3:
+        mock_s3 = _make_mock_s3([(obj_key, gz_bytes)])
+        mock_boto3.client.return_value = mock_s3
+
+        task = asyncio.create_task(
+            cloudtrail_poll_loop(conn, _Settings(), interval_seconds=0)
+        )
+        await asyncio.sleep(0.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    # Alert must have landed — this fails when the import is broken
+    alerts = conn.execute(
+        "SELECT source, src_ip FROM alerts WHERE source='cloudtrail'"
+    ).fetchall()
+    assert len(alerts) == 1, (
+        f"expected 1 cloudtrail alert, got {len(alerts)}. "
+        "If 0 alerts landed this is likely the broken-import regression."
+    )
+    assert alerts[0]["src_ip"] == "203.0.113.10"
+
+    # Cursor must have advanced — proves the full happy path ran
+    cursor = conn.execute(
+        "SELECT last_object_key FROM cloudtrail_progress WHERE bucket='fake-bucket'"
+    ).fetchone()
+    assert cursor is not None, "cursor row missing — poll loop did not advance"
+    assert obj_key in cursor["last_object_key"]
+
+    conn.close()
