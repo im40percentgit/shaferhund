@@ -161,6 +161,14 @@ from .models import (
     count_audit_events,
     list_audit_events,
 )
+from . import fleet as _fleet
+from .models import (
+    list_all_tags,
+    list_tags_for_rule,
+    tag_rule,
+    untag_rule,
+)
+from .canary import sanitize_alert_field as _sanitize
 
 log = logging.getLogger(__name__)
 
@@ -1447,6 +1455,154 @@ async def verify_audit_chain() -> JSONResponse:
 
     result = _audit.verify_chain(_db, _audit_hmac_key)
     return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
+# Fleet manifest routes (Phase 6 Wave A4, REQ-P0-P6-001)
+#
+# @decision DEC-FLEET-P6-001
+# @title HMAC-signed fleet manifest endpoint; operator role required
+# @status accepted
+# @rationale Fleet agents need to pull a scoped, tamper-evident list of rules
+#            without individual per-rule credentials. The manifest is signed
+#            with the operator HMAC key (SHAFERHUND_AUDIT_KEY) so fleet agents
+#            can verify integrity without a DB connection. operator role is the
+#            minimum required because reading manifests reveals deployed rule
+#            content — this is operational data, not a public health check.
+#            Tag CRUD routes also require operator so viewers cannot modify
+#            rule scoping, which is a write-side operation.
+#
+# Route RBAC for fleet routes (extends Wave A2 table, REQ-P0-P6-004):
+#   GET  /fleet/manifest/{tag}        — operator  (reveals deployed rule content)
+#   POST /rules/{rule_id}/tag         — operator  (write: scoping change)
+#   DELETE /rules/{rule_id}/tag/{tag} — operator  (write: scoping change)
+#   GET  /rules/{rule_id}/tags        — viewer    (read-only metadata)
+#   GET  /tags                        — viewer    (read-only metadata)
+# ---------------------------------------------------------------------------
+
+
+@app.get(
+    "/fleet/manifest/{tag}",
+    dependencies=[Depends(_require_role("operator"))],
+)
+async def get_fleet_manifest(tag: str) -> JSONResponse:
+    """Return a signed fleet manifest for all deployed rules tagged with *tag*.
+
+    The manifest JSON includes: version, manifest_id (SHA-256 of body),
+    tag, generated_at, rules list, and an HMAC-SHA256 signature over the
+    canonical body.  Only rules with deployed=1 appear (DEC-FLEET-P6-002).
+
+    Fleet agents (Wave B2) call this endpoint, verify the signature against
+    their pre-shared secret (SHAFERHUND_AUDIT_KEY), and apply the rules.
+    An empty rules list is a valid response — it means no deployed rules
+    carry this tag.
+
+    Auth: operator or admin token required.
+    """
+    if _db is None or not _audit_hmac_key:
+        raise HTTPException(status_code=503, detail="Database or audit key not ready")
+
+    safe_tag = _sanitize(tag)
+    if not safe_tag:
+        raise HTTPException(status_code=400, detail="tag must not be empty")
+
+    manifest = _fleet.build_manifest(_db, safe_tag, _audit_hmac_key)
+    return JSONResponse(manifest)
+
+
+@app.post(
+    "/rules/{rule_id}/tag",
+    dependencies=[Depends(_require_role("operator"))],
+)
+async def add_rule_tag(rule_id: str, request: Request) -> JSONResponse:
+    """Attach a scoping tag to a rule.  Idempotent — tagging twice is a no-op.
+
+    Request body: ``{"tag": "group:web"}``
+
+    Returns the updated list of tags for the rule.
+
+    Auth: operator or admin token required.
+    """
+    if _db is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Request body must be valid JSON")
+
+    raw_tag = body.get("tag", "") if isinstance(body, dict) else ""
+    safe_tag = _sanitize(str(raw_tag)) if raw_tag else ""
+    if not safe_tag:
+        raise HTTPException(status_code=400, detail="'tag' field is required and must not be empty")
+
+    safe_rule_id = _sanitize(rule_id)
+    tag_rule(_db, safe_rule_id, safe_tag)
+    tags = list_tags_for_rule(_db, safe_rule_id)
+    return JSONResponse({"rule_id": safe_rule_id, "tags": tags})
+
+
+@app.delete(
+    "/rules/{rule_id}/tag/{tag}",
+    dependencies=[Depends(_require_role("operator"))],
+)
+async def remove_rule_tag(rule_id: str, tag: str) -> JSONResponse:
+    """Remove a scoping tag from a rule.
+
+    Returns the updated list of tags.  If the tag was not present, returns
+    the current tag list without error (idempotent DELETE).
+
+    Auth: operator or admin token required.
+    """
+    if _db is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+
+    safe_rule_id = _sanitize(rule_id)
+    safe_tag = _sanitize(tag)
+    untag_rule(_db, safe_rule_id, safe_tag)
+    tags = list_tags_for_rule(_db, safe_rule_id)
+    return JSONResponse({"rule_id": safe_rule_id, "tags": tags})
+
+
+@app.get(
+    "/rules/{rule_id}/tags",
+    dependencies=[Depends(_require_role("viewer"))],
+)
+async def get_rule_tags(rule_id: str) -> JSONResponse:
+    """List all scoping tags currently applied to a rule.
+
+    Returns ``{"rule_id": "...", "tags": [...]}`` where tags is alphabetically
+    sorted.  Returns an empty list for a rule with no tags (or an unknown rule).
+
+    Auth: viewer or higher token required.
+    """
+    if _db is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+
+    safe_rule_id = _sanitize(rule_id)
+    tags = list_tags_for_rule(_db, safe_rule_id)
+    return JSONResponse({"rule_id": safe_rule_id, "tags": tags})
+
+
+@app.get(
+    "/tags",
+    dependencies=[Depends(_require_role("viewer"))],
+)
+async def get_all_tags() -> JSONResponse:
+    """List all distinct rule tags with their rule counts.
+
+    Returns ``{"tags": [{"tag": "group:web", "rule_count": 3}, ...]}``
+    ordered alphabetically by tag name.
+
+    Auth: viewer or higher token required.
+    """
+    if _db is None:
+        raise HTTPException(status_code=503, detail="Database not ready")
+
+    tag_rows = list_all_tags(_db)
+    return JSONResponse({
+        "tags": [{"tag": t, "rule_count": c} for t, c in tag_rows]
+    })
 
 
 async def _canary_enqueue(alert_obj) -> None:

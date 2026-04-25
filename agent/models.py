@@ -619,6 +619,48 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor_username);
 """
 
 
+# ---------------------------------------------------------------------------
+# Phase 6 Wave A4 schema additions — rule_tags table
+# (REQ-P0-P6-001, DEC-FLEET-P6-002, DEC-SCHEMA-P6-001)
+# ---------------------------------------------------------------------------
+#
+# rule_tags: join table linking rules to scoping tags (e.g. 'group:web').
+#
+# A "tag" is a short operator-assigned string that scopes which fleet agents
+# receive a rule.  The fleet manifest endpoint (GET /fleet/manifest/{tag})
+# returns all deployed rules that carry the requested tag, signed with the
+# operator HMAC key.  Rule scoping by tags (rather than per-rule ACLs) was
+# chosen per DEC-FLEET-P6-002 — coarse tag-based scoping matches real field
+# usage ('web tier', 'db tier') and is far simpler to operate than per-rule
+# ACL tables.
+#
+# Columns:
+#   rule_id    — FK into rules.id (TEXT UUID primary key).
+#   tag        — operator-supplied scoping tag; sanitized before insert.
+#   created_at — ISO-8601 UTC timestamp when the tag was applied.
+#
+# UNIQUE(rule_id, tag): same tag applied twice to the same rule is a no-op
+# via INSERT OR IGNORE (idempotent / upsert-style).
+#
+# Indexes on both tag and rule_id for efficient manifest queries.
+#
+# DEC-SCHEMA-P6-001: CREATE TABLE IF NOT EXISTS — idempotent for Phase 6
+#   Wave A1/A2/A3-baseline DBs.
+
+_RULE_TAGS_SQL = """
+CREATE TABLE IF NOT EXISTS rule_tags (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id     TEXT    NOT NULL REFERENCES rules(id),
+    tag         TEXT    NOT NULL,
+    created_at  TEXT    NOT NULL,
+    UNIQUE(rule_id, tag)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rule_tags_tag     ON rule_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_rule_tags_rule_id ON rule_tags(rule_id);
+"""
+
+
 def init_db(db_path: str) -> sqlite3.Connection:
     """Open (or create) the SQLite database and apply schema.
 
@@ -732,6 +774,9 @@ def init_db(db_path: str) -> sqlite3.Connection:
 
     # Phase 6 Wave A3: audit_log table (REQ-P0-P6-005, DEC-AUDIT-P6-001).
     conn.executescript(_AUDIT_LOG_SQL)
+
+    # Phase 6 Wave A4: rule_tags table (REQ-P0-P6-001, DEC-SCHEMA-P6-001).
+    conn.executescript(_RULE_TAGS_SQL)
 
     conn.commit()
     log.info("Database initialised at %s", db_path)
@@ -2630,3 +2675,129 @@ def count_audit_events(conn: sqlite3.Connection) -> int:
     """Return the total number of rows in audit_log."""
     row = conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()
     return row[0] if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 Wave A4 — rule_tags CRUD helpers (REQ-P0-P6-001, DEC-FLEET-P6-002)
+# ---------------------------------------------------------------------------
+
+
+def tag_rule(conn: sqlite3.Connection, rule_id: str, tag: str) -> int:
+    """Associate *tag* with *rule_id*; idempotent via INSERT OR IGNORE.
+
+    Returns the number of rows inserted (1 on first tag application,
+    0 if the tag was already present — INSERT OR IGNORE behaviour).
+
+    Args:
+        conn:    Open SQLite connection.
+        rule_id: TEXT UUID of the rule (rules.id).
+        tag:     Operator-assigned scoping tag (e.g. 'group:web').
+                 Caller is responsible for sanitizing via sanitize_alert_field
+                 before passing here.
+
+    Returns:
+        Rows affected (1 if newly inserted, 0 if already present).
+    """
+    ts = datetime.now(timezone.utc).isoformat()
+    with get_cursor(conn) as cur:
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO rule_tags (rule_id, tag, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (rule_id, tag, ts),
+        )
+        return cur.rowcount
+
+
+def untag_rule(conn: sqlite3.Connection, rule_id: str, tag: str) -> int:
+    """Remove *tag* from *rule_id*.
+
+    Returns rows deleted (1 if the tag was present, 0 if it was not).
+
+    Args:
+        conn:    Open SQLite connection.
+        rule_id: TEXT UUID of the rule.
+        tag:     Tag string to remove.
+    """
+    with get_cursor(conn) as cur:
+        cur.execute(
+            "DELETE FROM rule_tags WHERE rule_id = ? AND tag = ?",
+            (rule_id, tag),
+        )
+        return cur.rowcount
+
+
+def list_tags_for_rule(conn: sqlite3.Connection, rule_id: str) -> list[str]:
+    """Return all tags associated with *rule_id*, ordered alphabetically.
+
+    Returns an empty list if the rule has no tags or does not exist.
+    """
+    rows = conn.execute(
+        "SELECT tag FROM rule_tags WHERE rule_id = ? ORDER BY tag ASC",
+        (rule_id,),
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
+def list_rules_for_tag(
+    conn: sqlite3.Connection,
+    tag: str,
+    deployed_only: bool = False,
+) -> list[sqlite3.Row]:
+    """Return all rules rows that carry *tag*, joined with rule_tags.
+
+    Args:
+        conn:          Open SQLite connection.
+        tag:           Tag string to filter by.
+        deployed_only: If True, only return rules with deployed=1.
+                       Fleet manifest uses deployed_only=True so undeployed
+                       rules are never leaked to fleet agents (DEC-FLEET-P6-002).
+
+    Returns:
+        List of rules sqlite3.Row objects (all columns from the rules table).
+        Ordered by rules.created_at ASC for deterministic manifest ordering.
+    """
+    if deployed_only:
+        rows = conn.execute(
+            """
+            SELECT r.*
+              FROM rules r
+              JOIN rule_tags rt ON rt.rule_id = r.id
+             WHERE rt.tag = ?
+               AND r.deployed = 1
+             ORDER BY r.created_at ASC
+            """,
+            (tag,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT r.*
+              FROM rules r
+              JOIN rule_tags rt ON rt.rule_id = r.id
+             WHERE rt.tag = ?
+             ORDER BY r.created_at ASC
+            """,
+            (tag,),
+        ).fetchall()
+    return rows
+
+
+def list_all_tags(conn: sqlite3.Connection) -> list[tuple[str, int]]:
+    """Return all distinct tags with rule_count, ordered by tag name.
+
+    Returns a list of (tag, rule_count) tuples where rule_count is the
+    number of rules (deployed or not) carrying that tag.
+
+    Returns an empty list when no tags exist.
+    """
+    rows = conn.execute(
+        """
+        SELECT tag, COUNT(*) AS rule_count
+          FROM rule_tags
+         GROUP BY tag
+         ORDER BY tag ASC
+        """
+    ).fetchall()
+    return [(row[0], row[1]) for row in rows]
