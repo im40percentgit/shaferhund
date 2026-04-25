@@ -1,0 +1,51 @@
+# Shaferhund Fleet Client — minimal standalone container (REQ-P0-P6-002)
+#
+# @decision DEC-FLEET-P6-003
+# @title Fleet client is a separate minimal image; not in compose.yaml
+# @status accepted
+# @rationale The fleet client runs on *remote* hosts alongside the operator's Wazuh agent,
+#   not inside the local manager-side stack. It only needs httpx + the HMAC verification
+#   logic from agent/fleet.py. We copy only the four files required (agent/__init__.py,
+#   agent/models.py, agent/fleet.py, agent/fleet_client.py, agent/fleet_client_main.py)
+#   so the image contains no FastAPI, no SQLite write paths, no argon2, no orchestrator
+#   code. Smaller image = smaller attack surface. See compose.fleet.yaml for deployment.
+#
+# Build:
+#   podman build -f docker/Dockerfile.fleet-client -t shaferhund-fleet-client:latest .
+#
+# Run (standalone):
+#   podman run --rm \
+#     -e FLEET_MANIFEST_URL=http://manager:8000/fleet/manifest/edr-prod \
+#     -e FLEET_HMAC_KEY=$(cat /etc/shaferhund/fleet.key) \
+#     -e FLEET_BEARER_TOKEN=<operator-token> \
+#     -v /var/ossec/etc/rules:/rules \
+#     shaferhund-fleet-client:latest
+
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+# Only the runtime dependency the client needs — httpx for manifest fetch.
+# agent/fleet.py and agent/models.py are stdlib-only (no extra deps required).
+RUN pip install --no-cache-dir "httpx>=0.28,<1"
+
+# Copy only the files needed — no FastAPI, no argon2, no orchestrator code.
+COPY agent/__init__.py /app/agent/__init__.py
+COPY agent/models.py   /app/agent/models.py
+COPY agent/fleet.py    /app/agent/fleet.py
+COPY agent/fleet_client.py      /app/agent/fleet_client.py
+COPY agent/fleet_client_main.py /app/agent/fleet_client_main.py
+
+# Non-root user for container security best practice.
+# The /rules mount is owned by fleet so the process can write rule files.
+RUN useradd -m -u 1000 fleet && \
+    mkdir -p /rules && chown fleet:fleet /rules
+
+USER fleet
+
+# Default poll interval — override via FLEET_POLL_INTERVAL_SECONDS env var.
+ENV FLEET_POLL_INTERVAL_SECONDS=300
+ENV FLEET_RULES_DIR=/rules
+
+CMD ["python", "-m", "agent.fleet_client_main"]
