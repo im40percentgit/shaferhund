@@ -2117,6 +2117,29 @@ def count_cloud_findings(conn: sqlite3.Connection) -> int:
     return row[0] if row else 0
 
 
+def count_cloudtrail_alerts_since(conn: sqlite3.Connection, since_iso: str) -> int:
+    """Return the count of cloudtrail-source alerts ingested since since_iso.
+
+    Used by /health to show events_ingested_24h without relying on in-memory
+    counters (which reset on restart).  DB-backed count survives restarts and
+    stays accurate regardless of how many poller instances ran.
+
+    Args:
+        conn:       Open SQLite connection.
+        since_iso:  ISO-8601 timestamp string (e.g. from
+                    ``datetime.now(timezone.utc) - timedelta(days=1)``).
+                    Rows with ``ingested_at >= since_iso`` are counted.
+
+    Returns:
+        Integer count of matching rows in the alerts table.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) FROM alerts WHERE source='cloudtrail' AND ingested_at >= ?",
+        (since_iso,),
+    ).fetchone()
+    return row[0] if row else 0
+
+
 def get_cloud_finding(
     conn: sqlite3.Connection,
     finding_id: int,

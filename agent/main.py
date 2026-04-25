@@ -101,9 +101,11 @@ from . import canary as _canary
 from .canary import spawn_canary, record_hit, count_canary_triggers_since
 from . import red_team as _red_team
 from .models import (
+    count_cloudtrail_alerts_since,
     count_pending_attack_recommendations,
     count_cloud_findings,
     get_attack_recommendation,
+    get_cloudtrail_cursor,
     get_latest_posture_run,
     list_cloud_findings,
     get_open_slo_breach,
@@ -415,6 +417,22 @@ async def health() -> JSONResponse:
     pending_recs = (
         count_pending_attack_recommendations(_db) if _db is not None else 0
     )
+
+    # Phase 5 Wave A3 (REQ-P0-P5-006) — CloudTrail minimal block.
+    # DEC-HEALTH-002: only counters and a boolean here; operational stats
+    # (error counts, cursor fields) belong in /metrics.
+    ct_enabled = bool(getattr(_settings, "cloudtrail_enabled", False)) if _settings else False
+    if _db is not None and ct_enabled:
+        from datetime import timedelta
+        _since_24h = (
+            datetime.now(timezone.utc) - timedelta(days=1)
+        ).isoformat()
+        ct_events_24h = count_cloudtrail_alerts_since(_db, _since_24h)
+    else:
+        ct_events_24h = 0
+    from .sources.cloudtrail import CLOUDTRAIL_STATS as _CT_STATS
+    ct_findings = count_cloud_findings(_db) if _db is not None else 0
+
     return JSONResponse({
         "status": "ok",
         "poller_healthy": _poller_healthy,
@@ -433,7 +451,82 @@ async def health() -> JSONResponse:
         "recommendations": {
             "pending_count": pending_recs,
         },
+        # Phase 5 Wave A3 — REQ-P0-P5-006 / DEC-HEALTH-002
+        "cloudtrail": {
+            "enabled": ct_enabled,
+            "events_ingested_24h": ct_events_24h,
+            "last_poll_at": _CT_STATS["last_poll_at"],
+            "findings_count": ct_findings,
+        },
     })
+
+
+def _build_cloudtrail_metrics_block(db, settings) -> dict:
+    """Build the cloudtrail section of /metrics.
+
+    Reads in-memory CLOUDTRAIL_STATS for ephemeral counters (error counts,
+    lifetime totals, last-poll status) and queries the DB for the cursor row
+    and the findings count.  Returns safe zero/null defaults when cloudtrail
+    is disabled or the DB is not yet initialised.
+
+    DEC-HEALTH-002: this block is /metrics-only (auth-gated).  The public
+    /health endpoint carries only enabled, events_ingested_24h, last_poll_at,
+    and findings_count.
+
+    Args:
+        db:       sqlite3.Connection or None.
+        settings: Settings-like object or None.
+
+    Returns:
+        A dict with all CloudTrail operational stats fields.
+    """
+    from .sources.cloudtrail import CLOUDTRAIL_STATS as _CT_STATS
+    from datetime import timedelta
+
+    ct_enabled = bool(getattr(settings, "cloudtrail_enabled", False)) if settings else False
+
+    if not ct_enabled or db is None:
+        return {
+            "enabled": ct_enabled,
+            "events_ingested_total": 0,
+            "events_ingested_24h": 0,
+            "last_poll_at": None,
+            "last_poll_status": None,
+            "s3_list_errors_total": 0,
+            "parse_errors_total": 0,
+            "objects_processed_total": 0,
+            "cursor_bucket": None,
+            "cursor_prefix": None,
+            "cursor_last_object_key": None,
+            "cursor_last_event_ts": None,
+            "findings_count_total": 0,
+        }
+
+    # DB-backed 24h count — accurate after restart
+    since_iso = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    events_24h = count_cloudtrail_alerts_since(db, since_iso)
+    findings_total = count_cloud_findings(db)
+
+    # Cursor row for bucket/prefix from settings
+    bucket = getattr(settings, "cloudtrail_s3_bucket", "") or ""
+    prefix = getattr(settings, "cloudtrail_s3_prefix", "") or ""
+    cursor_row = get_cloudtrail_cursor(db, bucket, prefix) if bucket else None
+
+    return {
+        "enabled": True,
+        "events_ingested_total": _CT_STATS["events_ingested_total"],
+        "events_ingested_24h": events_24h,
+        "last_poll_at": _CT_STATS["last_poll_at"],
+        "last_poll_status": _CT_STATS["last_poll_status"],
+        "s3_list_errors_total": _CT_STATS["s3_list_errors_total"],
+        "parse_errors_total": _CT_STATS["parse_errors_total"],
+        "objects_processed_total": _CT_STATS["objects_processed_total"],
+        "cursor_bucket": dict(cursor_row)["bucket"] if cursor_row else None,
+        "cursor_prefix": dict(cursor_row)["prefix"] if cursor_row else None,
+        "cursor_last_object_key": dict(cursor_row)["last_object_key"] if cursor_row else None,
+        "cursor_last_event_ts": dict(cursor_row)["last_event_ts"] if cursor_row else None,
+        "findings_count_total": findings_total,
+    }
 
 
 @app.get("/metrics", dependencies=[Depends(_require_auth)])
@@ -491,6 +584,10 @@ async def metrics() -> JSONResponse:
             "available": getattr(_settings, "sigmac_available", False) if _settings else False,
             "version": getattr(_settings, "sigmac_version", None) if _settings else None,
         },
+        # Phase 5 Wave A3 — CloudTrail rich operational stats (REQ-P0-P5-006).
+        # DEC-HEALTH-002: all error counters, cursor fields, and lifetime totals
+        # live here behind auth, NOT in the public /health endpoint.
+        "cloudtrail": _build_cloudtrail_metrics_block(_db, _settings),
     })
 
 

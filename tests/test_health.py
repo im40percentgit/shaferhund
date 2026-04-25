@@ -41,6 +41,7 @@ from fastapi.testclient import TestClient
 
 import agent.main as main_module
 import agent.orchestrator as orch_module
+import agent.sources.cloudtrail as ct_module
 from agent.models import init_db, record_deploy_event, upsert_cluster
 from agent.orchestrator import run_triage_loop
 
@@ -63,6 +64,10 @@ def _make_settings(rules_dir: str, token: str = "") -> SimpleNamespace:
         # Sigma-cli probe fields (REQ-P0-P25-003) — default False (not probed in tests)
         sigmac_available=False,
         sigmac_version=None,
+        # Phase 5 Wave A3 (REQ-P0-P5-006) — CloudTrail off by default in health tests
+        cloudtrail_enabled=False,
+        cloudtrail_s3_bucket="",
+        cloudtrail_s3_prefix="",
     )
 
 
@@ -79,6 +84,15 @@ def _make_client(tmp_path, token: str = ""):
     main_module._triage_queue = None  # not needed for /health or /metrics
     main_module._poller_healthy = False
     main_module._last_poll_at = None
+
+    # Reset CloudTrail in-memory stats so /health last_poll_at is always None
+    # at the start of each test regardless of prior test module ordering.
+    ct_module.CLOUDTRAIL_STATS["last_poll_at"] = None
+    ct_module.CLOUDTRAIL_STATS["last_poll_status"] = None
+    ct_module.CLOUDTRAIL_STATS["events_ingested_total"] = 0
+    ct_module.CLOUDTRAIL_STATS["s3_list_errors_total"] = 0
+    ct_module.CLOUDTRAIL_STATS["parse_errors_total"] = 0
+    ct_module.CLOUDTRAIL_STATS["objects_processed_total"] = 0
 
     client = TestClient(main_module.app, raise_server_exceptions=True)
     return client, conn
@@ -136,7 +150,7 @@ def _make_config(max_calls: int = 5, wall_timeout: float = 10.0) -> SimpleNamesp
 
 
 def test_health_returns_only_liveness_fields(tmp_path):
-    """GET /health → exactly {status, poller_healthy, threat_intel, canary, posture, recommendations}.
+    """GET /health → exactly {status, poller_healthy, threat_intel, canary, posture, recommendations, cloudtrail}.
 
     Phase 3 (REQ-P0-P3-005) added threat_intel.record_count to /health.
     Phase 3 (REQ-P0-P3-004) added canary.trigger_count_24h to /health.
@@ -144,6 +158,7 @@ def test_health_returns_only_liveness_fields(tmp_path):
     Phase 4 (REQ-P0-P4-003) adds posture.last_weighted_score to /health.
     Phase 4 (REQ-P0-P4-005) adds posture.slo_breach_open to /health.
     Phase 4 Wave B (REQ-P0-P4-001) adds recommendations.pending_count to /health.
+    Phase 5 Wave A3 (REQ-P0-P5-006) adds cloudtrail block to /health.
     All fields are minimal summary values that do not expose operational detail,
     consistent with DEC-HEALTH-002's "public liveness probe" intent.
     """
@@ -155,9 +170,10 @@ def test_health_returns_only_liveness_fields(tmp_path):
 
     data = resp.json()
     assert set(data.keys()) == {
-        "status", "poller_healthy", "threat_intel", "canary", "posture", "recommendations"
+        "status", "poller_healthy", "threat_intel", "canary", "posture",
+        "recommendations", "cloudtrail",
     }, (
-        f"Expected exactly 6 keys including 'recommendations', "
+        f"Expected exactly 7 keys including 'cloudtrail' (Phase 5 Wave A3), "
         f"got keys: {set(data.keys())}"
     )
     assert data["status"] == "ok"
@@ -194,6 +210,17 @@ def test_health_returns_only_liveness_fields(tmp_path):
     assert recs["pending_count"] == 0, (
         f"Fresh DB must have pending_count=0, got {recs['pending_count']}"
     )
+
+    # Phase 5 Wave A3 (REQ-P0-P5-006) — cloudtrail block safe defaults
+    ct = data["cloudtrail"]
+    assert "enabled" in ct, "cloudtrail.enabled missing"
+    assert "events_ingested_24h" in ct, "cloudtrail.events_ingested_24h missing"
+    assert "last_poll_at" in ct, "cloudtrail.last_poll_at missing"
+    assert "findings_count" in ct, "cloudtrail.findings_count missing"
+    # Default settings have cloudtrail_enabled=False
+    assert ct["enabled"] is False, f"Expected enabled=False by default, got {ct['enabled']}"
+    assert ct["events_ingested_24h"] == 0
+    assert ct["last_poll_at"] is None
 
     conn.close()
 

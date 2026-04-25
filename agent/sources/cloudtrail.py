@@ -104,6 +104,24 @@ from ..cloud_findings import evaluate_event as _evaluate_event  # noqa: E402
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Operational counters — REQ-P0-P5-006 / DEC-HEALTH-002
+#
+# Incremented by cloudtrail_poll_loop; read by /health and /metrics in
+# agent/main.py.  In-memory only — resets on restart by design (matches the
+# URLhaus stats pattern).  Persistent counts (events_ingested_24h) are served
+# from the DB so they survive restarts (see count_cloudtrail_alerts_since in
+# agent/models.py).
+# ---------------------------------------------------------------------------
+CLOUDTRAIL_STATS: dict = {
+    "events_ingested_total": 0,
+    "last_poll_at": None,         # ISO timestamp string, None until first poll
+    "last_poll_status": None,     # 'success' | 'error' | None
+    "s3_list_errors_total": 0,
+    "parse_errors_total": 0,
+    "objects_processed_total": 0,
+}
+
+# ---------------------------------------------------------------------------
 # CloudTrail event names that signal IAM mutations (DEC-CLOUD-004).
 # Any eventName starting with these prefixes on iam.amazonaws.com is High.
 # ---------------------------------------------------------------------------
@@ -424,19 +442,35 @@ async def cloudtrail_poll_loop(
             if events:
                 new_last_key: Optional[str] = None
                 last_event_ts: Optional[str] = None
+                current_obj_key: Optional[str] = None
                 for obj_key, raw_event in events:
                     parsed = parse_cloudtrail_event(raw_event)
-                    alert_id = await asyncio.to_thread(
-                        insert_cloudtrail_alert, conn, parsed
-                    )
-                    # Run deterministic finding detector synchronously in the
-                    # thread pool (DEC-CLOUD-007). evaluate_event writes
-                    # cloud_audit_findings rows for any matching rules.
-                    await asyncio.to_thread(
-                        _evaluate_event, conn, alert_id, raw_event
-                    )
+                    try:
+                        alert_id = await asyncio.to_thread(
+                            insert_cloudtrail_alert, conn, parsed
+                        )
+                        # Run deterministic finding detector synchronously in the
+                        # thread pool (DEC-CLOUD-007). evaluate_event writes
+                        # cloud_audit_findings rows for any matching rules.
+                        await asyncio.to_thread(
+                            _evaluate_event, conn, alert_id, raw_event
+                        )
+                        CLOUDTRAIL_STATS["events_ingested_total"] += 1
+                    except Exception as parse_exc:  # noqa: BLE001
+                        CLOUDTRAIL_STATS["parse_errors_total"] += 1
+                        log.warning(
+                            "CloudTrail: failed to insert/evaluate event: %s", parse_exc
+                        )
+                    # Track object key transitions for objects_processed counter
+                    if current_obj_key is not None and obj_key != current_obj_key:
+                        CLOUDTRAIL_STATS["objects_processed_total"] += 1
+                    current_obj_key = obj_key
                     new_last_key = obj_key
                     last_event_ts = parsed["timestamp"]
+
+                # Count the final object
+                if current_obj_key is not None:
+                    CLOUDTRAIL_STATS["objects_processed_total"] += 1
 
                 if new_last_key:
                     await asyncio.to_thread(
@@ -447,12 +481,19 @@ async def cloudtrail_poll_loop(
                         "CloudTrail: processed %d events, cursor advanced to %s",
                         len(events), new_last_key,
                     )
-            else:
+
+            # Mark poll successful (done after S3 list + processing — no exception raised)
+            CLOUDTRAIL_STATS["last_poll_at"] = datetime.now(timezone.utc).isoformat()
+            CLOUDTRAIL_STATS["last_poll_status"] = "success"
+
+            if not events:
                 log.debug("CloudTrail: no new objects after cursor=%s", last_key)
 
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
+            CLOUDTRAIL_STATS["s3_list_errors_total"] += 1
+            CLOUDTRAIL_STATS["last_poll_status"] = "error"
             log.warning("CloudTrail poller error (continuing): %s", exc, exc_info=True)
 
         await asyncio.sleep(eff_interval)
