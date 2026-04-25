@@ -99,6 +99,7 @@ from ..models import (  # noqa: E402 — after conditional boto3 import
     insert_cloudtrail_alert,
     update_cloudtrail_cursor,
 )
+from ..cloud_findings import evaluate_event as _evaluate_event  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -425,8 +426,14 @@ async def cloudtrail_poll_loop(
                 last_event_ts: Optional[str] = None
                 for obj_key, raw_event in events:
                     parsed = parse_cloudtrail_event(raw_event)
-                    await asyncio.to_thread(
+                    alert_id = await asyncio.to_thread(
                         insert_cloudtrail_alert, conn, parsed
+                    )
+                    # Run deterministic finding detector synchronously in the
+                    # thread pool (DEC-CLOUD-007). evaluate_event writes
+                    # cloud_audit_findings rows for any matching rules.
+                    await asyncio.to_thread(
+                        _evaluate_event, conn, alert_id, raw_event
                     )
                     new_last_key = obj_key
                     last_event_ts = parsed["timestamp"]

@@ -37,6 +37,16 @@ insert_cloudtrail_alert.
            one cursor row per configured (bucket, prefix) pair regardless of
            how many times init_db runs.
 
+@decision DEC-CLOUD-005
+@title cloud_audit_findings detector rules are code-resident, not DB/env-loaded
+@status accepted
+@rationale The set of detected patterns (root login, MFA disable, IAM user
+           create, etc.) is reviewed at code-review time in agent/cloud_findings.py.
+           Storing rules in DB or .env would let an attacker who compromises
+           the environment silently disable detections. Code-resident rules
+           are immutable at runtime — same reasoning as DEC-RECOMMEND-002 for
+           DESTRUCTIVE_TECHNIQUES. New patterns require a PR, which is auditable.
+
 @decision DEC-POSTURE-003
 @title Weighted posture score — declarative YAML weights, additive alongside flat score
 @status accepted
@@ -439,6 +449,56 @@ CREATE TABLE IF NOT EXISTS cloudtrail_progress (
 """
 
 
+# ---------------------------------------------------------------------------
+# Phase 5 Wave A2 schema additions — cloud_audit_findings table
+# (REQ-P0-P5-005, DEC-CLOUD-005)
+# ---------------------------------------------------------------------------
+#
+# cloud_audit_findings captures deterministic detector hits on CloudTrail
+# events. One row per (alert_id, rule_name) finding — alert_id is the FK
+# to alerts.id (a TEXT UUID from insert_cloudtrail_alert).
+#
+# DEC-CLOUD-005: detection rules are code-resident in agent/cloud_findings.py,
+#   not loaded from env or DB. Same rationale as DEC-RECOMMEND-002 for
+#   DESTRUCTIVE_TECHNIQUES — reviewers see what fires; env-var compromise
+#   cannot disable detections.
+# DEC-SCHEMA-002: CREATE TABLE IF NOT EXISTS — idempotent for all prior DBs.
+#
+# Columns:
+#   alert_id     — FK to alerts.id (TEXT UUID from insert_cloudtrail_alert).
+#   rule_name    — Detector rule that fired (e.g. 'root_console_login').
+#   rule_severity — 'Low'|'Medium'|'High'|'Critical' — CHECK constraint.
+#   title        — Human-readable title with interpolated fields.
+#   description  — Free-form description of why this finding matters.
+#   principal    — ARN or username of the IAM principal involved.
+#   src_ip       — Source IP from the CloudTrail event.
+#   event_name   — CloudTrail eventName (e.g. 'ConsoleLogin').
+#   event_source — CloudTrail eventSource (e.g. 'signin.amazonaws.com').
+#   detected_at  — UTC ISO-8601 timestamp when the finding was created.
+#   raw_event    — Full raw CloudTrail event JSON (for operator drill-down).
+_CLOUD_AUDIT_FINDINGS_SQL = """
+CREATE TABLE IF NOT EXISTS cloud_audit_findings (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_id        TEXT    REFERENCES alerts(id),
+    rule_name       TEXT    NOT NULL,
+    rule_severity   TEXT    NOT NULL CHECK(rule_severity IN ('Low','Medium','High','Critical')),
+    title           TEXT    NOT NULL,
+    description     TEXT    NOT NULL,
+    principal       TEXT,
+    src_ip          TEXT,
+    event_name      TEXT,
+    event_source    TEXT,
+    detected_at     TEXT    NOT NULL,
+    raw_event       TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_cloud_audit_findings_detected_at
+    ON cloud_audit_findings(detected_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cloud_audit_findings_severity
+    ON cloud_audit_findings(rule_severity);
+"""
+
+
 def init_db(db_path: str) -> sqlite3.Connection:
     """Open (or create) the SQLite database and apply schema.
 
@@ -540,6 +600,9 @@ def init_db(db_path: str) -> sqlite3.Connection:
 
     # Phase 5 Wave A1: cloudtrail_progress table (REQ-P0-P5-001, DEC-CLOUD-011).
     conn.executescript(_CLOUDTRAIL_PROGRESS_SQL)
+
+    # Phase 5 Wave A2: cloud_audit_findings table (REQ-P0-P5-005, DEC-CLOUD-005).
+    conn.executescript(_CLOUD_AUDIT_FINDINGS_SQL)
 
     conn.commit()
     log.info("Database initialised at %s", db_path)
@@ -1933,3 +1996,141 @@ def insert_cloudtrail_alert(
         )
 
     return alert_id
+
+
+# ---------------------------------------------------------------------------
+# Cloud Audit Findings CRUD  (Phase 5 Wave A2 — REQ-P0-P5-005)
+# ---------------------------------------------------------------------------
+
+
+def insert_cloud_finding(
+    conn: sqlite3.Connection,
+    alert_id: Optional[str],
+    rule_name: str,
+    rule_severity: str,
+    title: str,
+    description: str,
+    principal: Optional[str],
+    src_ip: Optional[str],
+    event_name: Optional[str],
+    event_source: Optional[str],
+    raw_event: Optional[str],
+) -> int:
+    """Insert a cloud audit finding row and return its integer id.
+
+    Sets detected_at to the current UTC ISO-8601 timestamp.
+
+    Args:
+        conn:          Open SQLite connection.
+        alert_id:      FK to alerts.id (TEXT UUID), or None for standalone findings.
+        rule_name:     Name of the detector rule that fired.
+        rule_severity: One of 'Low', 'Medium', 'High', 'Critical'.
+        title:         Human-readable title (interpolated with event fields).
+        description:   Free-form description of the finding.
+        principal:     IAM principal ARN or username.
+        src_ip:        Source IP from the CloudTrail event.
+        event_name:    CloudTrail eventName.
+        event_source:  CloudTrail eventSource.
+        raw_event:     Full raw CloudTrail event as a JSON string.
+
+    Returns:
+        The integer primary key of the newly inserted row.
+    """
+    detected_at = datetime.now(timezone.utc).isoformat()
+    with get_cursor(conn) as cur:
+        cur.execute(
+            """
+            INSERT INTO cloud_audit_findings
+                (alert_id, rule_name, rule_severity, title, description,
+                 principal, src_ip, event_name, event_source, detected_at, raw_event)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                alert_id,
+                rule_name,
+                rule_severity,
+                title,
+                description,
+                principal,
+                src_ip,
+                event_name,
+                event_source,
+                detected_at,
+                raw_event,
+            ),
+        )
+        return cur.lastrowid
+
+
+def list_cloud_findings(
+    conn: sqlite3.Connection,
+    limit: int = 50,
+    severity: Optional[str] = None,
+) -> list:
+    """Return cloud_audit_findings rows, newest first.
+
+    Args:
+        conn:     Open SQLite connection.
+        limit:    Maximum number of rows to return (default 50).
+        severity: Optional severity filter — one of 'Low', 'Medium', 'High',
+                  'Critical'. When None, all severities are returned.
+
+    Returns:
+        List of sqlite3.Row objects ordered by detected_at DESC.
+    """
+    if severity is not None:
+        rows = conn.execute(
+            """
+            SELECT * FROM cloud_audit_findings
+            WHERE rule_severity = ?
+            ORDER BY detected_at DESC
+            LIMIT ?
+            """,
+            (severity, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT * FROM cloud_audit_findings
+            ORDER BY detected_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return rows
+
+
+def count_cloud_findings(conn: sqlite3.Connection) -> int:
+    """Return the total number of cloud_audit_findings rows.
+
+    Used by Wave A3 (#56) for /health/metrics. Included here since A3 is the
+    next issue and this helper belongs in models alongside the other count_*
+    helpers.
+
+    Args:
+        conn: Open SQLite connection.
+
+    Returns:
+        Integer count of all rows in cloud_audit_findings.
+    """
+    row = conn.execute("SELECT COUNT(*) FROM cloud_audit_findings").fetchone()
+    return row[0] if row else 0
+
+
+def get_cloud_finding(
+    conn: sqlite3.Connection,
+    finding_id: int,
+) -> Optional[sqlite3.Row]:
+    """Fetch a single cloud_audit_findings row by primary key.
+
+    Args:
+        conn:       Open SQLite connection.
+        finding_id: The INTEGER PRIMARY KEY of the finding.
+
+    Returns:
+        sqlite3.Row if found, None otherwise.
+    """
+    return conn.execute(
+        "SELECT * FROM cloud_audit_findings WHERE id = ?",
+        (finding_id,),
+    ).fetchone()
