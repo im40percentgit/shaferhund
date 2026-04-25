@@ -1,3 +1,9 @@
+> **Archived 2026-04-25** — This plan covered Phases 1 through 5 (Alert Triage through Cloud Eyes). All phases shipped end-to-end. See `MASTER_PLAN.md` (new) for Phase 6+ work.
+>
+> **Final state:** 5/5 implementation phases completed via 16 PRs. Project at commit `e3ae8a0`. Archived via PR `docs/archive-master-plan-phases-1-5`. Original intent and decision log preserved below verbatim.
+
+---
+
 # Shaferhund — Master Plan
 
 ## Original Intent
