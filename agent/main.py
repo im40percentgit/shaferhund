@@ -62,6 +62,34 @@ Auth:
            the same severity_min_level filter applies to both sources:
            sev 1 → 7 (Critical), sev 2 → 6 (High), sev 3 → 5 (Medium).
            Only sev 1 and 2 pass the default threshold of 7.
+
+Wave A2 additions (REQ-P0-P6-004):
+
+@decision DEC-AUTH-P6-006
+@title _require_role factory composes on _require_auth; role tags at registration time
+@status accepted
+@rationale Every auth-gated route now carries an explicit minimum role tag via
+           Depends(_require_role('viewer|operator|admin')). The factory raises
+           ValueError at import/startup for unknown role names (typos surface at
+           boot, not at first request). 401 (auth failure) always precedes 403
+           (role failure) because _require_role's inner dep is _require_auth.
+           Single-mode SHAFERHUND_TOKEN deployments are unaffected: LEGACY_ADMIN_USER
+           carries role='admin', satisfying every role check (DEC-AUTH-P6-005).
+
+Route RBAC table (Wave A2, REQ-P0-P6-004):
+  GET  /health              — public (DEC-HEALTH-002)
+  GET  /canary/hit/{token}  — public (trap endpoint)
+  GET  /metrics             — viewer
+  GET  /                    — viewer
+  GET  /deploy-events       — viewer
+  GET  /clusters/{id}       — viewer
+  GET  /recommendations     — viewer
+  GET  /cloud/findings      — viewer
+  POST /rules/{id}/deploy       — operator
+  POST /rules/{id}/undo-deploy  — operator
+  POST /canary/spawn            — operator
+  POST /posture/run             — operator
+  POST /recommendations/{id}/execute — operator
 """
 
 import asyncio
@@ -107,7 +135,7 @@ from .models import (
 from .orchestrator import get_orchestrator_stats
 from .triage import TriageResult, TriageQueue
 from . import threat_intel as _threat_intel
-from .auth import authenticate_token, LEGACY_ADMIN_USER
+from .auth import authenticate_token, LEGACY_ADMIN_USER, ROLE_HIERARCHY, role_satisfies
 from .models import count_threat_intel_records
 from . import canary as _canary
 from .canary import spawn_canary, record_hit, count_canary_triggers_since
@@ -435,6 +463,48 @@ def _require_auth(
     return user
 
 
+def _require_role(required_role: str):
+    """FastAPI dependency factory that requires the authenticated user to
+    have at least ``required_role`` per the role hierarchy.
+
+    Usage::
+
+        @app.post("/posture/run", dependencies=[Depends(_require_role("operator"))])
+
+    Closed-default: unknown user roles or unknown required_role values → 403.
+    Auth failure (missing/bad token) still returns 401 first — the inner
+    ``_require_auth`` dependency runs before the role check.
+
+    The factory raises ``ValueError`` at route-registration time if
+    ``required_role`` is not in ROLE_HIERARCHY, surfacing typos at boot
+    rather than at first request.
+
+    @decision DEC-AUTH-P6-006
+    @title _require_role factory composes on top of _require_auth; ValueError at boot for bad role names
+    @status accepted
+    @rationale Parameterised Depends factory keeps route decorators declarative
+               ("operator-required" is visible in the route signature) without
+               per-handler boilerplate. ValueError at registration time means a
+               typo like _require_role('opeator') fails during import/startup,
+               not silently at the first request that hits the bad route.
+               Unknown user roles in the DB fail closed (403) per DEC-AUTH-P6-005.
+    """
+    if required_role not in ROLE_HIERARCHY:
+        raise ValueError(
+            f"Unknown required_role: {required_role!r}; expected one of {ROLE_HIERARCHY}"
+        )
+
+    def _dep(user: dict = Depends(_require_auth)) -> dict:
+        if not role_satisfies(user.get("role", ""), required_role):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"role '{user.get('role')}' insufficient (need '{required_role}' or higher)",
+            )
+        return user
+
+    return _dep
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -597,7 +667,7 @@ def _build_cloudtrail_metrics_block(db, settings) -> dict:
     }
 
 
-@app.get("/metrics", dependencies=[Depends(_require_auth)])
+@app.get("/metrics", dependencies=[Depends(_require_role("viewer"))])
 async def metrics() -> JSONResponse:
     """Authenticated operational stats. Migration from /health per CSO F5.
 
@@ -659,7 +729,7 @@ async def metrics() -> JSONResponse:
     })
 
 
-@app.get("/", response_class=HTMLResponse, dependencies=[Depends(_require_auth)])
+@app.get("/", response_class=HTMLResponse, dependencies=[Depends(_require_role("viewer"))])
 async def index(request: Request, source: Optional[str] = None):
     """Dashboard: cluster list with HTMX auto-refresh every 10 seconds.
 
@@ -682,7 +752,7 @@ async def index(request: Request, source: Optional[str] = None):
 @app.get(
     "/deploy-events",
     response_class=HTMLResponse,
-    dependencies=[Depends(_require_auth)],
+    dependencies=[Depends(_require_role("viewer"))],
 )
 async def deploy_events_page(request: Request, offset: int = 0):
     """Audit log page: paginated deploy events, 50 rows per page.
@@ -713,7 +783,7 @@ async def deploy_events_page(request: Request, offset: int = 0):
 @app.get(
     "/clusters/{cluster_id}",
     response_class=HTMLResponse,
-    dependencies=[Depends(_require_auth)],
+    dependencies=[Depends(_require_role("viewer"))],
 )
 async def cluster_detail(request: Request, cluster_id: str):
     """Cluster detail: alert list, AI analysis, YARA and Sigma rules with deploy status."""
@@ -745,7 +815,7 @@ async def cluster_detail(request: Request, cluster_id: str):
 
 @app.post(
     "/rules/{rule_id}/deploy",
-    dependencies=[Depends(_require_auth)],
+    dependencies=[Depends(_require_role("operator"))],
 )
 async def deploy_rule(rule_id: str):
     """Write a validated YARA rule to the /rules/ volume.
@@ -782,7 +852,7 @@ async def deploy_rule(rule_id: str):
 
 @app.post(
     "/rules/{rule_id}/undo-deploy",
-    dependencies=[Depends(_require_auth)],
+    dependencies=[Depends(_require_role("operator"))],
 )
 async def undo_deploy_rule(rule_id: str):
     """Delete a deployed rule file and mark its audit row as reverted.
@@ -840,7 +910,7 @@ async def undo_deploy_rule(rule_id: str):
 
 @app.post(
     "/canary/spawn",
-    dependencies=[Depends(_require_auth)],
+    dependencies=[Depends(_require_role("operator"))],
 )
 async def canary_spawn(request: Request) -> JSONResponse:
     """Spawn a new DNS or HTTP canary token.
@@ -936,7 +1006,7 @@ async def canary_hit(token: str, request: Request) -> JSONResponse:
 
 @app.post(
     "/posture/run",
-    dependencies=[Depends(_require_auth)],
+    dependencies=[Depends(_require_role("operator"))],
 )
 async def posture_run() -> JSONResponse:
     """Fire an ad-hoc Atomic Red Team posture batch and return immediately.
@@ -1009,7 +1079,7 @@ async def posture_run() -> JSONResponse:
 
 @app.get(
     "/recommendations",
-    dependencies=[Depends(_require_auth)],
+    dependencies=[Depends(_require_role("viewer"))],
 )
 async def list_recommendations() -> JSONResponse:
     """List pending attack recommendations for operator review.
@@ -1039,7 +1109,7 @@ async def list_recommendations() -> JSONResponse:
 
 @app.post(
     "/recommendations/{recommendation_id}/execute",
-    dependencies=[Depends(_require_auth)],
+    dependencies=[Depends(_require_role("operator"))],
 )
 async def execute_recommendation_route(
     recommendation_id: int,
@@ -1119,7 +1189,7 @@ async def execute_recommendation_route(
 
 @app.get(
     "/cloud/findings",
-    dependencies=[Depends(_require_auth)],
+    dependencies=[Depends(_require_role("viewer"))],
 )
 async def list_cloud_findings_route(
     limit: int = 50,
