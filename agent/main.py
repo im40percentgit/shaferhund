@@ -125,6 +125,7 @@ _suricata_tailer_task: Optional[asyncio.Task] = None
 _urlhaus_task: Optional[asyncio.Task] = None
 _posture_task: Optional[asyncio.Task] = None
 _slo_task: Optional[asyncio.Task] = None
+_cloudtrail_task: Optional[asyncio.Task] = None
 _poller_healthy: bool = False
 _last_poll_at: Optional[str] = None
 
@@ -184,7 +185,7 @@ def _probe_sigmac(settings: Settings) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _settings, _db, _triage_queue, _clusterer, _tailer_task, _suricata_tailer_task, _urlhaus_task, _posture_task, _slo_task
+    global _settings, _db, _triage_queue, _clusterer, _tailer_task, _suricata_tailer_task, _urlhaus_task, _posture_task, _slo_task, _cloudtrail_task
 
     _settings = get_settings()
     _probe_sigmac(_settings)
@@ -253,6 +254,33 @@ async def lifespan(app: FastAPI):
             _settings.posture_slo_eval_interval_seconds,
         )
 
+    # Phase 5 — CloudTrail S3 poller (REQ-P0-P5-001, DEC-CLOUD-002/012)
+    # Starts only when CLOUDTRAIL_ENABLED=true. Missing bucket/prefix logs a
+    # warning and the task starts anyway — the loop will degrade gracefully
+    # (DEC-CLOUD-012). boto3 picks up AWS credentials from the standard env
+    # (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN / IAM role).
+    if _settings.cloudtrail_enabled:
+        from .sources.cloudtrail import cloudtrail_poll_loop as _cloudtrail_poll_loop
+        if not _settings.cloudtrail_s3_bucket:
+            log.warning(
+                "CLOUDTRAIL_ENABLED=true but CLOUDTRAIL_S3_BUCKET is empty — "
+                "poller will produce no results until bucket is configured"
+            )
+        _cloudtrail_task = asyncio.create_task(
+            _cloudtrail_poll_loop(
+                _db,
+                _settings,
+                interval_seconds=_settings.cloudtrail_poll_interval_seconds,
+            ),
+            name="cloudtrail-poller",
+        )
+        log.info(
+            "CloudTrail poller started (bucket=%s prefix=%s interval=%ds)",
+            _settings.cloudtrail_s3_bucket,
+            _settings.cloudtrail_s3_prefix,
+            _settings.cloudtrail_poll_interval_seconds,
+        )
+
     log.info(
         "Shaferhund agent started (wazuh-tailer + suricata-tailer + urlhaus-poller running)"
     )
@@ -260,7 +288,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown — cancel all background tasks
-    for task in (_tailer_task, _suricata_tailer_task, _urlhaus_task, _posture_task, _slo_task):
+    for task in (_tailer_task, _suricata_tailer_task, _urlhaus_task, _posture_task, _slo_task, _cloudtrail_task):
         if task:
             task.cancel()
             try:

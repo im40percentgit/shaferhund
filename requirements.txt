@@ -19,3 +19,7 @@ httpx==0.28.1
 # Also resolves the pre-existing test_write_sigma_rule_persists_valid failure
 # which required yaml but it was absent from requirements.txt.
 pyyaml>=6.0
+# boto3: AWS SDK for CloudTrail S3 poller (REQ-P0-P5-001, DEC-CLOUD-002).
+# Picked up from standard env (AWS_ACCESS_KEY_ID etc.) or IAM role — no
+# explicit credential fields in config.py (DEC-CLOUD-008).
+boto3>=1.34,<2
