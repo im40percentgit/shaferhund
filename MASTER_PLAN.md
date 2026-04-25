@@ -824,6 +824,232 @@ shaferhund/
 | DEC-RECOMMEND-005 | Cloud log + rule fleet + honeypots + STIX/TAXII + adversarial scoring all explicitly deferred to Phase 5+; Phase 4 stays scoped to one capability + one refactor + one SRE feature | accepted |
 | DEC-SLO-004 | SLO evaluator dispatches raw connection vs. factory via `isinstance(conn, sqlite3.Connection)`, not `callable(conn)` — `sqlite3.Connection` exposes `__call__` from the C extension, so `callable()` returns True for a raw connection and the loop calls `conn()` which raises `TypeError`, silently swallowed by the broad `except`. In production (`agent/main.py:240` passes `_db` directly), the loop never evaluated. Surfaced via the V7 live-integration check during #44 verification — unit tests passed because they used a lambda factory. Fixed at `agent/slo.py:289` | accepted |
 
+## Phase 5: Cloud Eyes (3 weeks after Phase 4)
+
+**Status:** planned
+**Timebox:** 3 weeks
+
+### Intent
+
+Phase 1–4 built a self-evaluating immune system over **on-prem** signals — Wazuh HIDS on hosts, Suricata NIDS on the wire, canary tokens on the perimeter, Atomic Red Team against `redteam-target`. The platform measures, decides, and recommends. But the modern attacker rarely starts on a host. They start in IAM — a stolen access key, an over-privileged role, an OAuth grant abused on a Sunday. Those attacks live in **cloud audit logs**, not on `eve.json` or `alerts.json`. The Original Intent (line 5) calls out "cloud security" as one of the 25 capability domains; every prior phase has explicitly deferred it (`REQ-NOGO-P2-001` → `REQ-NOGO-P25-001` → `REQ-NOGO-P4-001`). Phase 5 ends that deferral.
+
+The phase adds **AWS CloudTrail** as a third source pipeline, slotting in alongside Wazuh and Suricata using the same shape: a poller that writes to the shared `alerts` table with `source='cloudtrail'`, a parser that emits the common alert dict (per `agent/sources/suricata.py:54`), and zero changes to the clusterer, orchestrator, or policy gate. The clean architecture proven over four phases pays its first big dividend here — a third source costs ~600 LOC of new code and zero refactor of the existing 8-tool / SLO / posture surface. CloudTrail unlocks five of the 25 `hund` domains in one hit: cloud security, IAM (anomalous role assumption), DLP (S3 download spikes), compliance evidence (audit log retention), and threat intelligence (cross-correlation of cloud IOCs against URLhaus). It also opens the door to multi-cloud (GCP Audit, Azure Monitor) as a Phase 6+ extension that follows the same pattern.
+
+This is deliberately **one provider only**, and deliberately **without** rule fleet distribution or auth/RBAC tightening. CloudTrail is enough scope for three weeks if we do it right — real-footprint validation, S3 polling semantics, eventual-consistency handling, IAM-least-privilege for the agent's read role, and a cloud-aware orchestrator tool that lets Claude pivot from a Wazuh host alert to "what did this user's IAM identity do in the last hour?". Multi-cloud, fleet distribution, multi-user auth, and honeypots stay deferred — each is its own real week and forcing them into Phase 5 would produce the kind of fused, never-closing phase Phase 4 explicitly avoided.
+
+### Goals
+- AWS CloudTrail S3 polling adds a third source pipeline alongside Wazuh + Suricata, using the existing source-pipeline pattern (REQ-P0-P5-001)
+- CloudTrail events normalise into the shared `alerts` table with `source='cloudtrail'`; clusterer + orchestrator + policy gate require zero changes (REQ-P0-P5-002)
+- A new `lookup_cloud_identity` orchestrator tool lets Claude correlate on-prem alerts with cloud IAM activity by user/role ARN (REQ-P0-P5-003)
+- Shaferhund operates in real AWS with IAM-least-privilege — no fixture-only theatre; integration tests run against LocalStack (REQ-P0-P5-004)
+- A `cloud_audit_findings` table captures detections specific to cloud audit signals (anomalous role assumption, root-account use, MFA disable, etc.) for operator review (REQ-P0-P5-005)
+- `/health` exposes CloudTrail poller status, lag, and event count; `/metrics` exposes per-event-type breakdown (REQ-P0-P5-006)
+- All Phase 1 / Phase 2 / Phase 2.5 / Phase 3 / Phase 4 tests pass unchanged (REQ-P0-P5-007)
+
+### Non-Goals
+- REQ-NOGO-P5-001: GCP Audit Logs / Azure Monitor / multi-cloud — Phase 6; same pipeline pattern, but each provider is its own real integration week
+- REQ-NOGO-P5-002: Rule fleet distribution to remote Wazuh agents — Phase 6; pairs better with auth/RBAC tightening
+- REQ-NOGO-P5-003: Multi-user auth / RBAC / signed audit logs — Phase 6 (REQ-NOGO-P2-006 / REQ-NOGO-P4-007 carry-forward); CloudTrail polling uses the existing `SHAFERHUND_TOKEN` single-user model
+- REQ-NOGO-P5-004: STIX/TAXII threat-intel federation (multi-feed, indicator deconfliction) — Phase 7
+- REQ-NOGO-P5-005: Containerised service honeypots (SSH/MySQL/Redis) — Phase 7
+- REQ-NOGO-P5-006: Multi-tenant posture (per-team scores, per-AWS-account isolation) — Phase 7
+- REQ-NOGO-P5-007: CloudTrail Lake / Athena query backend — Phase 5 polls raw S3 objects; advanced query is a follow-up
+- REQ-NOGO-P5-008: Real-time CloudTrail via EventBridge / Kinesis — Phase 5 uses S3-poll only (5-15 min lag) for solo-dev cost profile
+- REQ-NOGO-P5-009: Cloud-native rule deploy (deploying a CloudTrail-derived YARA/Sigma rule back to AWS GuardDuty / Security Hub) — Phase 7; Phase 5 keeps the rule output local-file-drop per DEC-YARA-001
+- REQ-NOGO-P5-010: Adversarial rule-effectiveness scoring against cloud techniques (T1078.004 cloud accounts, T1098.001 etc.) — Phase 7; depends on stable Phase 4 `recommend_attack` baseline first
+
+### Requirements
+
+**Must-Have (P0)**
+
+- REQ-P0-P5-001: `agent/sources/cloudtrail.py` implements an S3 poller that lists new objects under a configured prefix, downloads, gunzips, parses CloudTrail's nested `Records[]` JSON, and yields `(s3_key, parsed_event)` tuples. Mirrors the `tail_eve_json` pattern at `agent/sources/suricata.py:98` — incremental progress tracked via `cloudtrail_progress` table (last-seen `s3_key` per prefix), not byte offsets.
+  - Acceptance: a unit test seeds 3 gzipped CloudTrail JSON objects in a `moto`/LocalStack S3 bucket; calling the poller once yields all 3, calling it again yields 0; a 4th object added between calls is yielded on the second call.
+- REQ-P0-P5-002: `parse_cloudtrail_event(event)` emits the shared alert dict shape (`source='cloudtrail'`, `src_ip`, `dest_ip=None`, `protocol='https'`, `rule_id`, `rule_description`, `normalized_severity`, `timestamp`, `raw_json`) for every CloudTrail event. `rule_id` is synthesised as `cloudtrail:{eventSource}:{eventName}` (e.g. `cloudtrail:iam.amazonaws.com:AssumeRole`). Severity is computed by a small heuristic table (root-account use → Critical, MFA disable → High, console login from new IP → Medium, default → Low).
+  - Acceptance: a unit test feeds a fixture `AssumeRole` event and a fixture `ConsoleLogin` event; both produce well-formed alert dicts indistinguishable at the clusterer boundary from Wazuh/Suricata alerts of the same shape; the resulting clusters use key `('cloudtrail', src_ip, rule_id)`.
+- REQ-P0-P5-003: 9th orchestrator tool `lookup_cloud_identity(user_or_role_arn)` registered via `register_tool()` (per DEC-ORCH-006). Returns the last 25 CloudTrail events for the given principal across the last 24 hours, summarising event names + counts. Read-only; queries the shared `alerts` table filtered by `source='cloudtrail'` and the principal pulled out of the raw event during parse.
+  - Acceptance: a unit test seeds 30 CloudTrail alerts for `arn:aws:iam::123:role/admin`, drives a triage loop where Claude calls `lookup_cloud_identity`, and verifies the response contains exactly 25 events grouped by event name with correct counts. The tool transcript shows `lookup_cloud_identity` appears alongside the existing 8 tools.
+- REQ-P0-P5-004: Integration tests against **LocalStack** (free, runnable in CI) cover end-to-end: poller writes to S3 → poller picks up → parser normalises → clusterer clusters → orchestrator triages → `cloud_audit_findings` row appears for at least one finding type. The IAM policy required for the poller is documented in `docs/cloudtrail-iam-policy.json` and minimised to `s3:ListBucket` + `s3:GetObject` on the configured prefix only — no `s3:*`, no wildcard buckets.
+  - Acceptance: `tests/integration/test_cloudtrail_localstack.py` boots a LocalStack container, seeds CloudTrail-shaped events, and runs the full pipeline to a `cloud_audit_findings` row; CI green; the IAM policy file passes `aws iam validate-policy` (or `cfn-lint` equivalent) shape check.
+- REQ-P0-P5-005: New `cloud_audit_findings` table (`id, alert_id, finding_type, principal, source_ip, severity, raw_summary, created_at, status`) — populated by a small detector module `agent/cloud_findings.py` that runs **after** the clusterer, on `source='cloudtrail'` alerts only, and emits findings for the deterministic patterns (root-account use, MFA disable, anomalous AssumeRole — defined as a role assumption from an IP not seen for that role in the last 7 days). New `/cloud/findings` route lists pending findings; `/health` adds `cloud.pending_findings`.
+  - Acceptance: a unit test seeds an MFA-disable event → a row appears in `cloud_audit_findings` with `finding_type='mfa_disable'`, `severity='High'`, `status='pending'`. Same fixture replayed produces no duplicates (idempotent on `alert_id`).
+- REQ-P0-P5-006: `/health` JSON adds `cloudtrail.poller_running` (bool), `cloudtrail.last_poll_at`, `cloudtrail.lag_seconds` (now − newest event timestamp), `cloudtrail.events_24h`, `cloud.pending_findings`. `/metrics` (auth-gated per DEC-HEALTH-002) adds per-event-type counts and a poll-error counter.
+  - Acceptance: hit `/health` after a poller run; lag matches DB calculation; before any polls, fields are null/false and the route still returns 200.
+- REQ-P0-P5-007: All Phase 1–4 tests pass unchanged. ≥1 new unit test per P0 capability above. The Phase 4 8-tool transcript test continues to pass; the Phase 5 transcript test asserts 9 tools.
+
+**Nice-to-Have (P1)**
+
+- REQ-P1-P5-001: `/cloud/findings` HTML dashboard — pending findings list with principal, finding_type, severity, raw_summary, and an "ack" action (HTMX, no SPA). Mirrors `/redteam/recommendations` from Phase 4.
+- REQ-P1-P5-002: `lookup_cloud_identity` consults `threat_intel` to flag any cloud principal whose recent source IPs appear in URLhaus. Surfaces in the tool response so Claude can incorporate.
+- REQ-P1-P5-003: `recommend_attack` (Phase 4 tool) gains awareness of cloud techniques — when posture gaps include T1078.004 / T1098.x, it can suggest cloud-relevant ART tests instead of host-only ones (no schema change; just a system-prompt augmentation referencing `cloud_audit_findings`).
+- REQ-P1-P5-004: `agent/sources/cloudtrail.py` supports a `from_timestamp` cursor in addition to `last_s3_key`, so a fresh deploy can backfill from a chosen point rather than from the bucket's start.
+- REQ-P1-P5-005: Source filter chip on `/` extended with `cloudtrail`.
+
+**Future Consideration (P2)**
+
+- REQ-P2-P5-001: GCP Audit Logs as a 4th source — Phase 6
+- REQ-P2-P5-002: Azure Monitor / Activity Logs — Phase 6
+- REQ-P2-P5-003: Real-time ingestion via EventBridge → SQS → poller — Phase 7 (S3-poll is sufficient for solo-dev scale)
+- REQ-P2-P5-004: CloudTrail Lake / Athena query backend for `lookup_cloud_identity` at scale — Phase 7
+- REQ-P2-P5-005: Cloud-native rule deploy (push rules to AWS GuardDuty / Security Hub) — Phase 7
+- REQ-P2-P5-006: Multi-account / Organization Trail support (assume-role chain) — Phase 6
+
+### Architecture
+
+```
+[Phase 4 surface, unchanged: Wazuh + Suricata + canary + threat_intel + ART + recommend_attack + SLO]
+                                          |
+                                          |  (NEW source pipeline, slot-in)
+                                          v
+                          [AWS S3 bucket: <trail-prefix>/AWSLogs/...]
+                                          |
+                                          v
+                          [CloudTrail Poller]    every CLOUDTRAIL_POLL_SECONDS (default 60s)
+                          (list_objects_v2 with StartAfter=last_s3_key
+                           gunzip + parse Records[]
+                           cursor in cloudtrail_progress table)
+                                          |
+                                          v
+                          [parse_cloudtrail_event]      (agent/sources/cloudtrail.py)
+                          (event → shared alert dict, source='cloudtrail',
+                           rule_id = "cloudtrail:{eventSource}:{eventName}",
+                           severity heuristic table)
+                                          |
+                                          v
+                          [Alert Normaliser → existing clusterer]      (zero changes)
+                          key = ('cloudtrail', src_ip, rule_id)
+                                          |
+                          +---------------+---------------+
+                          |                               |
+                          v                               v
+                 [Triage Queue]                 [Cloud Findings Detector]
+                 (existing Phase 1)             (agent/cloud_findings.py)
+                          |                     deterministic patterns:
+                          v                       - root_account_use
+                 [Orchestrator: 9 tools]          - mfa_disable
+                  (8 prior + lookup_cloud_         - anomalous_assume_role
+                  identity, registered via          - console_login_new_ip
+                  register_tool per DEC-ORCH-006) |
+                          |                       v
+                          v                  [cloud_audit_findings table]
+                 [Policy Gate → /rules/]         (status: pending|ack|investigating)
+                          |                       |
+                          v                       v
+                 [posture_runs join]      [GET /cloud/findings — operator review]
+                  (existing Phase 4
+                   weighted_score)               |
+                          |                      v
+                          v               [POST /cloud/findings/{id}/ack]
+                 [Posture SLO + webhook]    (operator gating; no auto-action in P5)
+                          |
+                          v
+                 [/health adds cloud.* keys; /metrics adds per-event-type breakdown]
+```
+
+### Stack Delta vs Phase 4
+
+- **No new containers in production.** CloudTrail is an external AWS surface, not a sidecar. The `shaferhund-agent` container gains an AWS SDK client and a new asyncio task in `lifespan`.
+- **New container in test only:** `localstack/localstack:3` for integration tests under `tests/integration/` (free; ~200MB image; runs only in CI/local dev, never in `compose.yaml`).
+- **New Python libraries:** `boto3` (AWS SDK), `aiobotocore` (async S3 client to fit the existing asyncio model), `moto` (test-only fake S3 for unit tests; LocalStack for integration). No new system packages.
+- **New env vars:** `CLOUDTRAIL_ENABLED` (default `false` — fail-closed; the source is opt-in), `CLOUDTRAIL_S3_BUCKET`, `CLOUDTRAIL_S3_PREFIX` (default `AWSLogs/`), `CLOUDTRAIL_POLL_SECONDS` (default 60), `CLOUDTRAIL_AWS_REGION` (default `us-east-1`), `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` (standard SDK env; document the IAM policy in `docs/cloudtrail-iam-policy.json`).
+- **New tables:** `cloudtrail_progress (id, prefix, last_s3_key, updated_at)` and `cloud_audit_findings (id, alert_id, finding_type, principal, source_ip, severity, raw_summary, created_at, status)`. Both via idempotent `ALTER TABLE` per DEC-SCHEMA-002.
+
+### Eng Review Decisions
+
+1. **S3 polling, not EventBridge / Kinesis Firehose.** S3 polling is dirt-cheap (LIST + GET on new objects only), survives operator restarts trivially via the `cloudtrail_progress` cursor, and matches the file-tail pattern that runs Wazuh and Suricata. Real-time ingestion adds operational surface (Kinesis stream, EventBridge rule, Lambda) that is unjustified for a solo-dev tool with a 60-second poll cadence — the 5-15 min CloudTrail-to-S3 lag dominates anyway. EventBridge stays deferred to Phase 7 if ever.
+2. **One cloud provider only.** AWS CloudTrail is the most-deployed cloud audit source by an enormous margin and the only one with a stable, public, well-documented log shape since 2014. Forcing GCP Audit + Azure Monitor into the same phase doubles the schema-shape and IAM-policy work without doubling the value. Phase 6 picks up the next provider using the exact same pattern — the source-pipeline abstraction is now battle-tested.
+3. **`source='cloudtrail'` reuses the shared `alerts` table.** No `cloud_alerts` table, no new clusterer key extension. `rule_id = "cloudtrail:{eventSource}:{eventName}"` is unique enough to keep clusters disjoint from Wazuh rule_id integers and Suricata signature_ids; the `source` column is the actual disambiguator. This continues the Phase 2 pattern (REQ-P0-P2-003 / DEC-CLUSTER-002) and is why a third source costs <600 LOC.
+4. **Severity heuristic table, not Claude.** The CloudTrail parser assigns `normalized_severity` deterministically via a small lookup table (root-account use → Critical, MFA disable → High, etc.). Claude does the *contextual* triage downstream — but the *initial* severity has to be deterministic so the clusterer's ordering and the policy gate's thresholds work without an LLM in the hot path. Same reasoning as Phase 1's `level >= 7` Wazuh prefilter — the LLM is for nuance, not for priority queue ordering.
+5. **`cloud_audit_findings` is additive to `clusters`, not a replacement.** The same CloudTrail event populates both: a row in `clusters` (so Claude triages it like any other alert) and possibly a row in `cloud_audit_findings` (when it matches a deterministic pattern). The findings table is operator-facing, lossless, and idempotent on `alert_id`. This is the same shape as Phase 4's `attack_recommendations` — a side channel for human review that does not interfere with the automated loop.
+6. **LocalStack for integration tests, `moto` for unit tests.** `moto` runs in-process and is fast (sub-second); LocalStack runs as a container and is slow (~30s spin-up) but covers the realistic IAM evaluation. Unit tests use `moto`; the single integration test that asserts the end-to-end pipeline uses LocalStack and is gated by an `AWS_INTEGRATION=1` env var so contributors without Docker can still run unit tests. Real AWS validation happens manually in the operator's actual account before P5 closes — this is what unblocks the "fixture-only testing is insufficient" concern that has been paused since Phase 2.5.
+7. **`lookup_cloud_identity` is the 9th tool, registered via `register_tool` per DEC-ORCH-006.** No dynamic-loading change, no schema change to `register_tool` — Phase 4's API was designed for exactly this. The tool reads from the existing `alerts` table (no new index needed; the existing `alerts(source, rule_id)` index covers the common case; we add `alerts(source, raw_json -> '$.userIdentity.arn')` only if benchmarks show the need — measure first).
+8. **Auth/RBAC stays single-user; CloudTrail uses one IAM role.** Multi-user auth is REQ-NOGO-P5-003. The Phase 5 agent uses one AWS IAM role (`s3:ListBucket` + `s3:GetObject` on a single prefix). Multi-account / Organization Trail support is REQ-P2-P5-006. Pairing auth with rule-fleet-distribution in Phase 6 keeps Phase 5 scoped — operators sharing the manager today already share the `SHAFERHUND_TOKEN`; CloudTrail does not change that calculus.
+9. **Cursor in DB, not in memory.** `cloudtrail_progress` table holds `last_s3_key` per prefix. Restart-safe, audit-friendly, operator-debuggable (`SELECT * FROM cloudtrail_progress`). Same shape as the in-DB state used for `slo_breaches` and `deploy_events` in Phase 4 — consistency over convenience.
+10. **CloudTrail S3 keys are time-ordered; `StartAfter` is sufficient.** AWS publishes CloudTrail objects with keys like `AWSLogs/<account>/CloudTrail/<region>/<YYYY>/<MM>/<DD>/<account>_CloudTrail_<region>_<YYYYMMDDTHHMMZ>_<uuid>.json.gz`. `list_objects_v2(StartAfter=last_s3_key)` returns objects strictly after the cursor in lex order — which is also chronological order for this key shape. No need for an inventory or a manifest. We document this assumption in `agent/sources/cloudtrail.py` and add a sanity test that breaks if AWS ever changes the key format (the CI test fixtures are real captured paths from the operator's account, redacted).
+11. **Cloud findings detector runs in-process after the clusterer, not as a separate task.** Cloud findings are deterministic (no LLM), cheap (single-row DB lookup for the "anomalous AssumeRole" pattern), and benefit from running synchronously so a finding is visible by the time the cluster lands. Pulling them into a background task would add complexity without reducing latency — the clusterer already runs on the same loop. `agent/cloud_findings.py` exposes one pure function `evaluate(alert: dict, conn) -> Optional[Finding]`; called once per CloudTrail-source alert from `_persist_and_enqueue`.
+12. **`finding_type` enum is a code-resident frozenset, not a config table.** Same reasoning as Phase 4's `DESTRUCTIVE_TECHNIQUES` (DEC-RECOMMEND-002): the set of detected patterns is reviewed at code-review time, not runtime. Operators add a finding type via PR. New patterns are intentional, audited, and migration-free.
+
+### Files to Create / Update
+
+```
+shaferhund/
+  compose.yaml                          # (UPDATE) document CLOUDTRAIL_* env vars in agent service block; no new containers in prod
+  requirements.txt                      # (UPDATE) add boto3, aiobotocore, moto (dev-only)
+  .env.example                          # (UPDATE) document Phase 5 env vars + IAM policy reference
+  docs/
+    cloudtrail-iam-policy.json          # (NEW) least-privilege IAM policy for the agent's read role
+    PHASE5_OPERATOR_GUIDE.md            # (NEW) operator setup: trail config, IAM role, env vars
+  agent/
+    sources/
+      cloudtrail.py                     # (NEW) S3 poller + parse_cloudtrail_event + severity heuristic
+    cloud_findings.py                   # (NEW) deterministic finding detector + frozenset of finding_type values
+    orchestrator.py                     # (UPDATE) register lookup_cloud_identity tool via existing register_tool API
+    models.py                           # (UPDATE) cloudtrail_progress + cloud_audit_findings tables; CRUD helpers
+    main.py                             # (UPDATE) /cloud/findings, /cloud/findings/{id}/ack routes; CloudTrail poller task in lifespan; /health additions
+    config.py                           # (UPDATE) CLOUDTRAIL_* env fields + AWS credential resolution
+    triage.py                           # (no change expected — verify integration)
+    templates/
+      cloud_findings.html               # (NEW, P1) pending findings list + ack action
+  tests/
+    test_cloudtrail_parser.py           # (NEW) parse_cloudtrail_event matrix (AssumeRole, ConsoleLogin, malformed)
+    test_cloudtrail_poller.py           # (NEW) moto-backed S3 poller unit tests + cursor advancement
+    test_cloud_findings.py              # (NEW) deterministic detector matrix per finding_type
+    test_lookup_cloud_identity.py       # (NEW) tool transcript + DB filter + 25-event cap
+    test_orchestrator_9_tools.py        # (NEW) regression: 9 tools registered, all dispatchable
+    integration/
+      test_cloudtrail_localstack.py     # (NEW) end-to-end pipeline behind AWS_INTEGRATION=1 env gate
+    fixtures/
+      cloudtrail_assume_role.json       # (NEW) golden CloudTrail event
+      cloudtrail_console_login.json     # (NEW) golden CloudTrail event
+      cloudtrail_mfa_disable.json       # (NEW) triggers cloud_audit_finding
+      cloudtrail_root_account.json      # (NEW) triggers cloud_audit_finding
+      cloudtrail_malformed.json         # (NEW) parser-resilience fixture
+```
+
+### Success Criteria
+
+- `podman compose up` with `CLOUDTRAIL_ENABLED=true` and valid AWS creds brings up the existing 5-service stack; container logs show `cloudtrail-poller` task running alongside `wazuh-tailer` / `suricata-tailer` / `urlhaus-poller`
+- A real (or LocalStack-backed) CloudTrail bucket with an AssumeRole + MFA-disable event produces: a row in `alerts` with `source='cloudtrail'`, a cluster with key `('cloudtrail', src_ip, 'cloudtrail:iam.amazonaws.com:DeactivateMFADevice')`, a `cloud_audit_findings` row with `finding_type='mfa_disable'`, a triage result with Claude-assigned severity and ai_analysis
+- Orchestrator transcript on a synthetic CloudTrail cluster shows `lookup_cloud_identity` called and returns 25-event-grouped principal history
+- `/health` reports `cloudtrail.poller_running=true`, non-null `last_poll_at`, plausible `lag_seconds`; `/cloud/findings` lists the pending finding
+- `grep -rn "_REGISTRY\|register_tool" agent/orchestrator.py | wc -l` shows the 9th tool registered with no manual mutation of `_REGISTRY` or `TOOLS`
+- LocalStack integration test passes locally and in CI (gated by `AWS_INTEGRATION=1`); IAM policy file passes shape validation
+- Phase 1 / Phase 2 / Phase 2.5 / Phase 3 / Phase 4 tests pass unchanged; all new Phase 5 tests pass
+
+### GitHub Issues
+
+- **Wave A (parallel — no inter-dependencies):**
+  - REQ-P0-P5-001 + REQ-P0-P5-002 — `agent/sources/cloudtrail.py`: S3 poller + `parse_cloudtrail_event` + severity heuristic + `cloudtrail_progress` table (`feature/phase5-cloudtrail-source`) — issue #53
+  - REQ-P0-P5-005 — `cloud_audit_findings` table + `agent/cloud_findings.py` deterministic detector + `/cloud/findings` route (`feature/phase5-cloud-findings`) — issue #54
+  - REQ-P0-P5-006 — `/health` and `/metrics` additions for CloudTrail observability (`feature/phase5-cloudtrail-observability`) — issue #55
+- **Wave B (depends on Wave A `cloudtrail.py`):**
+  - REQ-P0-P5-003 — `lookup_cloud_identity` 9th orchestrator tool registered via `register_tool` (`feature/phase5-lookup-cloud-identity`) — issue #56
+  - REQ-P0-P5-004 — LocalStack integration test + IAM policy file + operator guide (`feature/phase5-cloudtrail-integration`) — issue #57
+- **Wave C (gate, blocked by Wave A + B):**
+  - REQ-P0-P5-007 — zero-regression gate across all prior phases; final integration smoke (`feature/phase5-regression-gate`) — issue #58
+- **Wave D (P1, parallelizable after Wave B; only if timebox allows):**
+  - REQ-P1-P5-001 — `/cloud/findings` HTMX dashboard (`feature/phase5-findings-dashboard`)
+  - REQ-P1-P5-002 — `lookup_cloud_identity` consults threat_intel for IOC overlap (`feature/phase5-lookup-threat-intel`)
+  - REQ-P1-P5-003 — `recommend_attack` cloud-technique awareness (`feature/phase5-recs-cloud`)
+  - REQ-P1-P5-004 — `from_timestamp` cursor backfill mode (`feature/phase5-poller-backfill`)
+  - REQ-P1-P5-005 — Source filter chip on `/` extended with `cloudtrail` (`feature/phase5-source-chip-cloud`)
+
+### Decision Log
+
+| ID | Title | Status |
+|----|-------|--------|
+| DEC-CLOUD-001 | AWS CloudTrail as the first cloud provider; one-provider-only Phase 5; GCP/Azure deferred to Phase 6 with same pattern | planned |
+| DEC-CLOUD-002 | S3 polling (not EventBridge/Kinesis); 60s default cadence; cursor-in-DB via `cloudtrail_progress` table | planned |
+| DEC-CLOUD-003 | `source='cloudtrail'` reuses shared `alerts` table; clusterer/orchestrator/policy gate require zero changes | planned |
+| DEC-CLOUD-004 | Severity assigned by deterministic heuristic table at parse time; LLM does contextual triage downstream | planned |
+| DEC-CLOUD-005 | `cloud_audit_findings` is additive to clusters; deterministic detector runs synchronously after clusterer | planned |
+| DEC-CLOUD-006 | LocalStack for integration tests + moto for unit tests; real AWS validation manual before phase close | planned |
+| DEC-CLOUD-007 | `lookup_cloud_identity` is the 9th tool via existing `register_tool` API; no dispatch refactor | planned |
+| DEC-CLOUD-008 | Single IAM role / single-user auth retained; multi-user RBAC explicitly deferred to Phase 6 with rule fleet | planned |
+| DEC-CLOUD-009 | `finding_type` enum is a code-resident frozenset (per DEC-RECOMMEND-002 pattern); new types via PR, not config | planned |
+| DEC-CLOUD-010 | CloudTrail S3 key shape is time-ordered; `StartAfter` is sufficient; documented assumption + sanity test guards future drift | planned |
+| DEC-CLOUD-011 | New tables (`cloudtrail_progress`, `cloud_audit_findings`) follow DEC-SCHEMA-002 idempotent ALTER pattern | planned |
+| DEC-CLOUD-012 | `CLOUDTRAIL_ENABLED` defaults to `false`; the source is opt-in; absent AWS creds is a clean degraded mode, not a startup failure | planned |
+
 ## TODOs
-- [ ] Convert `hund` to `ROADMAP.md` (map 25 domains to phases)
-- [ ] Phase 5+ scoping: cloud log source ingestion (first provider, likely AWS CloudTrail) + multi-cloud coverage; rule fleet distribution to remote Wazuh agents; containerised service honeypots (SSH/MySQL/Redis); STIX/TAXII threat-intel federation; adversarial rule-effectiveness scoring (evasion variants); multi-tenant posture + RBAC + signed audit logs (REQ-NOGO-P2-006 carry-forward)
+- [ ] Convert `hund` to `ROADMAP.md` (map 25 domains to phases) — DEFER: the per-phase plans now serve as the de facto roadmap; surface as a real backlog item or close. Recommend closing.
+- [ ] Phase 6+ scoping: GCP Audit Logs + Azure Monitor (multi-cloud, same source-pipeline pattern as Phase 5 CloudTrail); rule fleet distribution to remote Wazuh agents (signed pull, multi-agent rollout) paired with multi-user auth / RBAC / signed audit logs (REQ-NOGO-P2-006 / REQ-NOGO-P4-007 / REQ-NOGO-P5-003 carry-forward); containerised service honeypots (SSH/MySQL/Redis); STIX/TAXII threat-intel federation (multi-feed, indicator deconfliction); adversarial rule-effectiveness scoring (evasion variants, ART payload mutation); multi-tenant posture / per-team scoring; cloud-native rule deploy (push to AWS GuardDuty / Security Hub); real-time CloudTrail via EventBridge → SQS
