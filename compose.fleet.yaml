@@ -1,0 +1,62 @@
+# compose.fleet.yaml — opt-in fleet client service
+#
+# Run alongside the default compose stack:
+#
+#   podman compose -f compose.yaml -f compose.fleet.yaml up
+#
+# The fleet client polls the manager's manifest endpoint, verifies the HMAC
+# signature, and writes rule files to a shared volume that the host's Wazuh
+# or Suricata agent can pick up.
+#
+# Required env vars (set in .env or pass -e):
+#   FLEET_MANIFEST_URL   — full URL to the manifest endpoint
+#                          default: http://shaferhund-agent:8000/fleet/manifest/edr-prod
+#   FLEET_HMAC_KEY       — hex-encoded HMAC key (same key configured on the manager
+#                          as SHAFERHUND_AUDIT_KEY). Generate: openssl rand -hex 32
+#   FLEET_BEARER_TOKEN   — bearer token for the manager's auth-gated endpoint
+#                          (omit only if the manager is in single-token mode and the
+#                           token is already handled by FLEET_MANIFEST_URL)
+#
+# Optional:
+#   FLEET_TAG                    — tag segment of the manifest URL (informational)
+#   FLEET_RULES_DIR              — path inside the container (default /rules)
+#   FLEET_POLL_INTERVAL_SECONDS  — seconds between manifest polls (default 300)
+#
+# The shaferhund_rules_fleet volume is a named volume scoped to this compose
+# project. In production, replace it with a bind mount to the Wazuh rules
+# directory on the host:
+#
+#   volumes:
+#     - /var/ossec/etc/rules:/rules
+#
+# @decision DEC-FLEET-P6-003
+# @title Fleet client in separate compose.fleet.yaml; not in compose.yaml
+# @status accepted
+# @rationale The fleet client runs on remote hosts alongside the remote Wazuh agent.
+#   The main compose.yaml stays at 5 services (unchanged from Phase 5). compose.fleet.yaml
+#   is an opt-in overlay for operators who want to test the full fleet pull locally.
+#   Precedent: compose.localstack.yaml from Phase 5 (DEC-CLOUD-013).
+
+services:
+  fleet-client:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.fleet-client
+    image: shaferhund-fleet-client:latest
+    container_name: shaferhund-fleet-client
+    restart: unless-stopped
+    environment:
+      - FLEET_MANIFEST_URL=${FLEET_MANIFEST_URL:-http://shaferhund-agent:8000/fleet/manifest/edr-prod}
+      - FLEET_TAG=${FLEET_TAG:-edr-prod}
+      - FLEET_HMAC_KEY=${FLEET_HMAC_KEY:-}
+      - FLEET_RULES_DIR=${FLEET_RULES_DIR:-/rules}
+      - FLEET_POLL_INTERVAL_SECONDS=${FLEET_POLL_INTERVAL_SECONDS:-300}
+      - FLEET_BEARER_TOKEN=${FLEET_BEARER_TOKEN:-}
+    volumes:
+      - shaferhund_rules_fleet:/rules
+    networks:
+      - default
+
+volumes:
+  shaferhund_rules_fleet:
+    driver: local
