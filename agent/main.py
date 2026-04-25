@@ -102,8 +102,10 @@ from .canary import spawn_canary, record_hit, count_canary_triggers_since
 from . import red_team as _red_team
 from .models import (
     get_latest_posture_run,
+    get_open_slo_breach,
     insert_posture_run,
 )
+from . import slo as _slo
 
 log = logging.getLogger(__name__)
 
@@ -118,6 +120,7 @@ _tailer_task: Optional[asyncio.Task] = None
 _suricata_tailer_task: Optional[asyncio.Task] = None
 _urlhaus_task: Optional[asyncio.Task] = None
 _posture_task: Optional[asyncio.Task] = None
+_slo_task: Optional[asyncio.Task] = None
 _poller_healthy: bool = False
 _last_poll_at: Optional[str] = None
 
@@ -177,7 +180,7 @@ def _probe_sigmac(settings: Settings) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _settings, _db, _triage_queue, _clusterer, _tailer_task, _suricata_tailer_task, _urlhaus_task, _posture_task
+    global _settings, _db, _triage_queue, _clusterer, _tailer_task, _suricata_tailer_task, _urlhaus_task, _posture_task, _slo_task
 
     _settings = get_settings()
     _probe_sigmac(_settings)
@@ -228,6 +231,24 @@ async def lifespan(app: FastAPI):
                 name="posture-scheduler",
             )
 
+    # Phase 4 — Posture SLO evaluator (REQ-P0-P4-005, DEC-SLO-001/002/003)
+    # Starts only when POSTURE_SLO_ENABLED=true. Fails gracefully if the webhook
+    # URL is unreachable — logs and continues (same pattern as urlhaus-poller).
+    if _settings.posture_slo_enabled:
+        _slo_task = asyncio.create_task(
+            _slo.slo_evaluator_loop(
+                _db,
+                _settings,
+                interval_seconds=_settings.posture_slo_eval_interval_seconds,
+            ),
+            name="slo-evaluator",
+        )
+        log.info(
+            "SLO evaluator started (threshold=%.2f interval=%ds)",
+            _settings.posture_slo_threshold,
+            _settings.posture_slo_eval_interval_seconds,
+        )
+
     log.info(
         "Shaferhund agent started (wazuh-tailer + suricata-tailer + urlhaus-poller running)"
     )
@@ -235,7 +256,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown — cancel all background tasks
-    for task in (_tailer_task, _suricata_tailer_task, _urlhaus_task, _posture_task):
+    for task in (_tailer_task, _suricata_tailer_task, _urlhaus_task, _posture_task, _slo_task):
         if task:
             task.cancel()
             try:
@@ -350,6 +371,11 @@ async def health() -> JSONResponse:
         )
     except (IndexError, KeyError):
         posture_last_weighted_score = None
+    # Phase 4 (REQ-P0-P4-005): slo_breach_open — True when there is an open
+    # slo_breaches row (resolved_at IS NULL). False on fresh DB or healthy posture.
+    slo_breach_open = (
+        get_open_slo_breach(_db) is not None if _db is not None else False
+    )
     return JSONResponse({
         "status": "ok",
         "poller_healthy": _poller_healthy,
@@ -363,6 +389,7 @@ async def health() -> JSONResponse:
             "last_score": posture_last_score,
             "last_run_at": posture_last_run_at,
             "last_weighted_score": posture_last_weighted_score,
+            "slo_breach_open": slo_breach_open,
         },
     })
 

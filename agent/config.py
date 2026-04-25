@@ -92,6 +92,16 @@ class Settings(BaseSettings):
     # Relative paths are resolved from the process CWD (the repo root in compose).
     art_tests_file: str = "atomic_tests.yaml"
 
+    # Phase 4 — Posture SLO + webhook paging (REQ-P0-P4-005)
+    # Master switch — default OFF so existing deployments are unaffected.
+    posture_slo_enabled: bool = False
+    # Score below this threshold triggers a breach (0.0–1.0).
+    posture_slo_threshold: float = 0.7
+    # Webhook URL to POST on breach. Empty = record breach but don't page.
+    posture_slo_webhook_url: str = ""
+    # How often the SLO evaluator loop runs (seconds).
+    posture_slo_eval_interval_seconds: int = 60
+
     # Auto-deploy policy gate (Phase 2, REQ-P0-P2-006, DEC-AUTODEPLOY-001)
     # Default OFF — operator must explicitly enable via env var.
     AUTO_DEPLOY_ENABLED: bool = False

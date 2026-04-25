@@ -303,6 +303,47 @@ _POSTURE_TEST_RESULTS_PHASE4_COLUMNS: list[tuple[str, str]] = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Phase 4 schema additions — slo_breaches table (REQ-P0-P4-005)
+# ---------------------------------------------------------------------------
+#
+# slo_breaches tracks each SLO breach session. Idempotency relies on the
+# single open row constraint: at most one row has resolved_at IS NULL at
+# any time. A breach is "open" when resolved_at is NULL.
+#
+# Columns:
+#   started_at     — ISO8601 timestamp when breach was first detected.
+#   resolved_at    — ISO8601 timestamp when score recovered (NULL while open).
+#   threshold      — The configured SLO threshold at breach time.
+#   breach_score   — The posture score that triggered the breach.
+#   posture_run_id — FK to posture_runs.id (the run that triggered the breach).
+#   webhook_fired  — 0=not attempted, 1=fired OK, -1=fire failed (DEC-SLO-002).
+#   webhook_status — HTTP status code from the webhook attempt (NULL if no
+#                    attempt or network error).
+#   notes          — Optional operator notes.
+#
+# DEC-SLO-001: one row per breach session. The evaluator checks resolved_at
+# IS NULL before opening a new breach — this is the idempotency guard.
+# DEC-SCHEMA-002: CREATE TABLE IF NOT EXISTS is idempotent for Phase 4 DBs
+# (post-#43) and any earlier DB being upgraded.
+_SLO_BREACHES_SQL = """
+CREATE TABLE IF NOT EXISTS slo_breaches (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at      TEXT    NOT NULL,
+    resolved_at     TEXT,
+    threshold       REAL    NOT NULL,
+    breach_score    REAL    NOT NULL,
+    posture_run_id  INTEGER NOT NULL REFERENCES posture_runs(id),
+    webhook_fired   INTEGER NOT NULL DEFAULT 0,
+    webhook_status  INTEGER,
+    notes           TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_slo_breaches_resolved_at
+    ON slo_breaches(resolved_at);
+"""
+
+
 def init_db(db_path: str) -> sqlite3.Connection:
     """Open (or create) the SQLite database and apply schema.
 
@@ -395,6 +436,9 @@ def init_db(db_path: str) -> sqlite3.Connection:
                 f"ALTER TABLE posture_test_results ADD COLUMN {col_name} {col_def}"
             )
             log.info("posture_test_results table: added column %s", col_name)
+
+    # Phase 4: slo_breaches table (REQ-P0-P4-005) — idempotent via IF NOT EXISTS.
+    conn.executescript(_SLO_BREACHES_SQL)
 
     conn.commit()
     log.info("Database initialised at %s", db_path)
@@ -1426,3 +1470,104 @@ def insert_posture_test_result(
             (run_id, technique_id, test_name, fired_at, exit_code, safe_output, weight),
         )
         return cur.lastrowid
+
+
+# ---------------------------------------------------------------------------
+# SLO Breaches CRUD  (Phase 4 — REQ-P0-P4-005)
+# ---------------------------------------------------------------------------
+
+def insert_slo_breach(
+    conn: sqlite3.Connection,
+    started_at: str,
+    threshold: float,
+    breach_score: float,
+    posture_run_id: int,
+    notes: Optional[str] = None,
+) -> int:
+    """Insert a new slo_breaches row and return its id.
+
+    webhook_fired defaults to 0 (not yet attempted); the caller updates it
+    after the webhook POST attempt via mark_slo_breach_webhook().
+
+    Args:
+        conn:           Open SQLite connection.
+        started_at:     ISO8601 timestamp when breach was detected.
+        threshold:      The SLO threshold at breach time.
+        breach_score:   The posture score that triggered the breach.
+        posture_run_id: FK to posture_runs.id.
+        notes:          Optional operator note.
+
+    Returns:
+        The INTEGER PRIMARY KEY of the new row.
+    """
+    with get_cursor(conn) as cur:
+        cur.execute(
+            """
+            INSERT INTO slo_breaches
+                (started_at, threshold, breach_score, posture_run_id, webhook_fired, notes)
+            VALUES (?, ?, ?, ?, 0, ?)
+            """,
+            (started_at, threshold, breach_score, posture_run_id, notes),
+        )
+        return cur.lastrowid
+
+
+def get_open_slo_breach(conn: sqlite3.Connection) -> Optional[sqlite3.Row]:
+    """Return the single open slo_breaches row (resolved_at IS NULL), or None.
+
+    At most one breach is open at a time. This function is the idempotency
+    guard in evaluate_slo(): if it returns a row, no new breach is opened.
+
+    Args:
+        conn: Open SQLite connection.
+
+    Returns:
+        sqlite3.Row or None.
+    """
+    return conn.execute(
+        "SELECT * FROM slo_breaches WHERE resolved_at IS NULL ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+
+
+def mark_slo_breach_webhook(
+    conn: sqlite3.Connection,
+    breach_id: int,
+    status_code: Optional[int],
+    fired: int,
+) -> None:
+    """Update webhook_fired and webhook_status on a slo_breaches row.
+
+    Called after a webhook POST attempt (success or failure).
+
+    Args:
+        conn:        Open SQLite connection.
+        breach_id:   The slo_breaches.id to update.
+        status_code: HTTP status code from the POST (None on network error).
+        fired:       1=success, -1=failure, 0=not attempted.
+    """
+    with get_cursor(conn) as cur:
+        cur.execute(
+            "UPDATE slo_breaches SET webhook_fired = ?, webhook_status = ? WHERE id = ?",
+            (fired, status_code, breach_id),
+        )
+
+
+def resolve_slo_breach(
+    conn: sqlite3.Connection,
+    breach_id: int,
+    resolved_at: str,
+) -> None:
+    """Set resolved_at on a slo_breaches row, closing the breach session.
+
+    Called when the posture score recovers above the threshold.
+
+    Args:
+        conn:        Open SQLite connection.
+        breach_id:   The slo_breaches.id to close.
+        resolved_at: ISO8601 timestamp when score recovered.
+    """
+    with get_cursor(conn) as cur:
+        cur.execute(
+            "UPDATE slo_breaches SET resolved_at = ? WHERE id = ?",
+            (resolved_at, breach_id),
+        )

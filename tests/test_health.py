@@ -142,6 +142,7 @@ def test_health_returns_only_liveness_fields(tmp_path):
     Phase 3 (REQ-P0-P3-004) added canary.trigger_count_24h to /health.
     Phase 3 (REQ-P0-P3-001) added posture.last_score + posture.last_run_at to /health.
     Phase 4 (REQ-P0-P4-003) adds posture.last_weighted_score to /health.
+    Phase 4 (REQ-P0-P4-005) adds posture.slo_breach_open to /health.
     All fields are minimal summary values that do not expose operational detail,
     consistent with DEC-HEALTH-002's "public liveness probe" intent.
     """
@@ -169,10 +170,14 @@ def test_health_returns_only_liveness_fields(tmp_path):
     assert "last_weighted_score" in posture, (
         "posture.last_weighted_score missing — Phase 4 REQ-P0-P4-003"
     )
-    # Fresh DB — no runs yet, all three should be null
+    assert "slo_breach_open" in posture, (
+        "posture.slo_breach_open missing — Phase 4 REQ-P0-P4-005"
+    )
+    # Fresh DB — no runs yet, scores null, no open breach
     assert posture["last_score"] is None
     assert posture["last_run_at"] is None
     assert posture["last_weighted_score"] is None
+    assert posture["slo_breach_open"] is False
 
     conn.close()
 
