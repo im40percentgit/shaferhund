@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     # Auth — if unset, main.py binds to 127.0.0.1 only
     shaferhund_token: str = ""
 
+    # Phase 6 — Auth mode (REQ-P0-P6-003, REQ-P0-P6-006, DEC-COMPAT-P6-001)
+    # 'single' (default): legacy SHAFERHUND_TOKEN path, unchanged from Phase 1-5.
+    # 'multi': per-user auth via users + user_tokens tables with Argon2id passwords.
+    # Default is 'single' so existing deployments are byte-identical until opt-in.
+    shaferhund_auth_mode: str = "single"
+
     # Claude model
     claude_model: str = "claude-opus-4-5"
 
@@ -126,6 +132,14 @@ class Settings(BaseSettings):
     # JSON-encoded list in env: AUTO_DEPLOY_SEVERITIES='["Critical","High"]'
     # Falls back to the default list when the env var is absent.
     AUTO_DEPLOY_SEVERITIES: list[str] = ["Critical", "High"]
+
+    @field_validator("shaferhund_auth_mode")
+    @classmethod
+    def auth_mode_valid(cls, v: str) -> str:
+        """Ensure auth mode is one of the two supported values."""
+        if v not in {"single", "multi"}:
+            raise ValueError("SHAFERHUND_AUTH_MODE must be 'single' or 'multi'")
+        return v
 
     @field_validator("AUTO_DEPLOY_SEVERITIES", mode="before")
     @classmethod

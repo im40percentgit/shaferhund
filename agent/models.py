@@ -28,6 +28,16 @@ S3 StartAfter cursor for the CloudTrail poller — restart-safe, audit-friendly.
 CRUD helpers: get_cloudtrail_cursor, update_cloudtrail_cursor,
 insert_cloudtrail_alert.
 
+@decision DEC-SCHEMA-P6-001
+@title Phase 6 users + user_tokens tables via idempotent CREATE TABLE IF NOT EXISTS
+@status accepted
+@rationale Six new tables in Phase 6 (users, user_tokens, audit_log, fleet_agents,
+           fleet_checkins, rule_tags). This Wave A1 issue adds users + user_tokens.
+           Both use CREATE TABLE IF NOT EXISTS so a Phase 5 DB upgrades in place
+           without data loss or a migration framework (DEC-SCHEMA-002 pattern).
+           role CHECK constraint and UNIQUE constraints enforce integrity at the
+           DB layer, not only at the application layer.
+
 @decision DEC-CLOUD-011
 @title cloudtrail_progress uses CREATE TABLE IF NOT EXISTS — idempotent for all prior DBs
 @status accepted
@@ -499,6 +509,69 @@ CREATE INDEX IF NOT EXISTS idx_cloud_audit_findings_severity
 """
 
 
+# ---------------------------------------------------------------------------
+# Phase 6 Wave A1 schema additions — users + user_tokens tables
+# (REQ-P0-P6-003, DEC-AUTH-P6-001, DEC-SCHEMA-P6-001)
+# ---------------------------------------------------------------------------
+#
+# users: one row per named operator/service account.
+#   password_hash  — Argon2id encoded string (DEC-AUTH-P6-001). Never the raw
+#                    password. The hash includes salt + parameters.
+#   role           — CHECK constraint to (admin, operator, viewer). The set of
+#                    valid roles is code-resident (DEC-AUTH-P6-002).
+#   disabled       — integer boolean (0/1). Disabled users cannot authenticate
+#                    even with a valid token. Single auth gate — is_active was
+#                    dropped (see #69 follow-up) to eliminate drift risk.
+#
+# user_tokens: one row per issued bearer token.
+#   token_hash     — SHA-256 hex of the raw bearer token. The raw token is
+#                    shown once at creation and not stored (DEC-AUTH-P6-003).
+#   name           — operator-supplied label (e.g. 'fleet-agent-nyc').
+#   expires_at     — NULL means never expires.
+#   revoked_at     — NULL means active; set to revocation timestamp on revoke.
+#
+# Both tables use CREATE TABLE IF NOT EXISTS — idempotent for Phase 5 DBs
+# upgrading to Phase 6 (DEC-SCHEMA-002, DEC-SCHEMA-P6-001).
+#
+# @decision DEC-SCHEMA-P6-001
+# @title Six new Phase 6 tables via idempotent CREATE TABLE IF NOT EXISTS
+# @status accepted
+# @rationale Follows the DEC-SCHEMA-002 pattern. No migration framework.
+#            Phase 5 databases upgrade in place without data loss. Each table
+#            is created via init_db on first startup after the Phase 6 upgrade.
+
+_USERS_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    username        TEXT    NOT NULL UNIQUE,
+    password_hash   TEXT    NOT NULL,
+    role            TEXT    NOT NULL DEFAULT 'viewer'
+                            CHECK(role IN ('admin','operator','viewer')),
+    created_at      TEXT    NOT NULL,
+    last_login_at   TEXT,
+    disabled        INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
+"""
+
+_USER_TOKENS_SQL = """
+CREATE TABLE IF NOT EXISTS user_tokens (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL REFERENCES users(id),
+    token_hash      TEXT    NOT NULL UNIQUE,
+    name            TEXT    NOT NULL,
+    created_at      TEXT    NOT NULL,
+    last_used_at    TEXT,
+    expires_at      TEXT,
+    revoked_at      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_tokens_token_hash ON user_tokens(token_hash);
+CREATE INDEX IF NOT EXISTS idx_user_tokens_user_id    ON user_tokens(user_id);
+"""
+
+
 def init_db(db_path: str) -> sqlite3.Connection:
     """Open (or create) the SQLite database and apply schema.
 
@@ -603,6 +676,12 @@ def init_db(db_path: str) -> sqlite3.Connection:
 
     # Phase 5 Wave A2: cloud_audit_findings table (REQ-P0-P5-005, DEC-CLOUD-005).
     conn.executescript(_CLOUD_AUDIT_FINDINGS_SQL)
+
+    # Phase 6 Wave A1: users table (REQ-P0-P6-003, DEC-SCHEMA-P6-001).
+    conn.executescript(_USERS_SQL)
+
+    # Phase 6 Wave A1: user_tokens table (REQ-P0-P6-003, DEC-SCHEMA-P6-001).
+    conn.executescript(_USER_TOKENS_SQL)
 
     conn.commit()
     log.info("Database initialised at %s", db_path)
@@ -2217,3 +2296,175 @@ def get_cloudtrail_events_by_principal_since(
         (principal_arn, since_ts, limit),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 Wave A1 — users CRUD helpers (REQ-P0-P6-003)
+# ---------------------------------------------------------------------------
+
+def insert_user(
+    conn: sqlite3.Connection,
+    username: str,
+    password_hash: str,
+    role: str,
+) -> int:
+    """Insert a new user row and return the new ``users.id``.
+
+    ``created_at`` is set to the current UTC timestamp.
+    ``disabled`` defaults to 0 (active).
+    Raises ``sqlite3.IntegrityError`` if ``username`` already exists (UNIQUE).
+    Raises ``sqlite3.IntegrityError`` if ``role`` is not one of the CHECK values.
+    """
+    ts = datetime.now(timezone.utc).isoformat()
+    with get_cursor(conn) as cur:
+        cur.execute(
+            """
+            INSERT INTO users (username, password_hash, role, created_at, disabled)
+            VALUES (?, ?, ?, ?, 0)
+            """,
+            (username, password_hash, role, ts),
+        )
+        return cur.lastrowid  # type: ignore[return-value]
+
+
+def get_user_by_id(
+    conn: sqlite3.Connection,
+    user_id: int,
+) -> Optional[sqlite3.Row]:
+    """Return the ``users`` row for *user_id*, or None if not found."""
+    return conn.execute(
+        "SELECT * FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+
+
+def get_user_by_username(
+    conn: sqlite3.Connection,
+    username: str,
+) -> Optional[sqlite3.Row]:
+    """Return the ``users`` row for *username*, or None if not found."""
+    return conn.execute(
+        "SELECT * FROM users WHERE username = ?", (username,)
+    ).fetchone()
+
+
+def update_user_last_login(
+    conn: sqlite3.Connection,
+    user_id: int,
+    ts: str,
+) -> None:
+    """Set ``users.last_login_at`` to *ts* for the given user."""
+    with get_cursor(conn) as cur:
+        cur.execute(
+            "UPDATE users SET last_login_at = ? WHERE id = ?",
+            (ts, user_id),
+        )
+
+
+def set_user_disabled(
+    conn: sqlite3.Connection,
+    user_id: int,
+    disabled: bool,
+) -> None:
+    """Toggle the ``users.disabled`` flag.
+
+    ``disabled`` is the single auth gate — ``is_active`` was dropped in the
+    #69 follow-up to eliminate drift risk where a caller could set
+    ``is_active=0`` without setting ``disabled=1`` and silently fail to block
+    auth. One toggle, no ambiguity (DEC-AUTH-P6-004).
+    """
+    disabled_int = 1 if disabled else 0
+    with get_cursor(conn) as cur:
+        cur.execute(
+            "UPDATE users SET disabled = ? WHERE id = ?",
+            (disabled_int, user_id),
+        )
+
+
+def list_users(
+    conn: sqlite3.Connection,
+    limit: int = 100,
+) -> list[sqlite3.Row]:
+    """Return up to *limit* user rows ordered by ``created_at`` ascending."""
+    return conn.execute(
+        "SELECT * FROM users ORDER BY created_at ASC LIMIT ?", (limit,)
+    ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 Wave A1 — user_tokens CRUD helpers (REQ-P0-P6-003)
+# ---------------------------------------------------------------------------
+
+def insert_user_token(
+    conn: sqlite3.Connection,
+    user_id: int,
+    token_hash: str,
+    name: str,
+    expires_at: Optional[str] = None,
+) -> int:
+    """Insert a new user_token row and return the new ``user_tokens.id``.
+
+    ``created_at`` is set to the current UTC timestamp.
+    ``expires_at`` is stored as an ISO-8601 string; pass None for no expiry.
+    Raises ``sqlite3.IntegrityError`` if ``token_hash`` is not unique.
+    """
+    ts = datetime.now(timezone.utc).isoformat()
+    with get_cursor(conn) as cur:
+        cur.execute(
+            """
+            INSERT INTO user_tokens (user_id, token_hash, name, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, token_hash, name, ts, expires_at),
+        )
+        return cur.lastrowid  # type: ignore[return-value]
+
+
+def get_user_token_by_hash(
+    conn: sqlite3.Connection,
+    token_hash: str,
+) -> Optional[sqlite3.Row]:
+    """Return the ``user_tokens`` row matching *token_hash*, or None.
+
+    This is the hot path for every authenticated request in multi mode:
+    the presented bearer is SHA-256 hashed and looked up here.
+    """
+    return conn.execute(
+        "SELECT * FROM user_tokens WHERE token_hash = ?", (token_hash,)
+    ).fetchone()
+
+
+def update_user_token_last_used(
+    conn: sqlite3.Connection,
+    token_id: int,
+    ts: str,
+) -> None:
+    """Set ``user_tokens.last_used_at`` to *ts* for the given token id."""
+    with get_cursor(conn) as cur:
+        cur.execute(
+            "UPDATE user_tokens SET last_used_at = ? WHERE id = ?",
+            (ts, token_id),
+        )
+
+
+def revoke_user_token(
+    conn: sqlite3.Connection,
+    token_id: int,
+    ts: str,
+) -> None:
+    """Set ``user_tokens.revoked_at`` to *ts*, permanently revoking the token."""
+    with get_cursor(conn) as cur:
+        cur.execute(
+            "UPDATE user_tokens SET revoked_at = ? WHERE id = ?",
+            (ts, token_id),
+        )
+
+
+def list_user_tokens(
+    conn: sqlite3.Connection,
+    user_id: int,
+) -> list[sqlite3.Row]:
+    """Return all token rows for *user_id* ordered by ``created_at`` ascending."""
+    return conn.execute(
+        "SELECT * FROM user_tokens WHERE user_id = ? ORDER BY created_at ASC",
+        (user_id,),
+    ).fetchall()

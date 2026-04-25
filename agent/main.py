@@ -17,6 +17,17 @@ Auth:
   - If SHAFERHUND_TOKEN is unset, the server binds to 127.0.0.1 only
     (set via the uvicorn --host flag in __main__ / compose entrypoint).
 
+@decision DEC-AUTH-P6-003
+@title _require_auth returns a user dict in both single and multi modes
+@status accepted
+@rationale Wave A2 (_require_role) needs to inspect the resolved user's role
+           without re-authenticating. Returning a dict (rather than None) from
+           _require_auth gives downstream dependencies a stable interface.
+           In single mode, LEGACY_ADMIN_USER (role='admin') is returned so all
+           existing code paths that previously received None now receive a dict —
+           fully backwards compatible since nothing downstream inspected the
+           return value before Phase 6.
+
 @decision DEC-AUTH-001
 @title SHAFERHUND_TOKEN bearer auth; unset = localhost-only binding
 @status accepted
@@ -96,6 +107,7 @@ from .models import (
 from .orchestrator import get_orchestrator_stats
 from .triage import TriageResult, TriageQueue
 from . import threat_intel as _threat_intel
+from .auth import authenticate_token, LEGACY_ADMIN_USER
 from .models import count_threat_intel_records
 from . import canary as _canary
 from .canary import spawn_canary, record_hit, count_canary_triggers_since
@@ -344,27 +356,83 @@ _bearer_scheme = HTTPBearer(auto_error=False)
 
 def _require_auth(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer_scheme),
-) -> None:
-    """FastAPI dependency: enforce bearer token auth when SHAFERHUND_TOKEN is set.
+) -> dict:
+    """FastAPI dependency: enforce bearer token auth.
 
-    Accepts only the Authorization: Bearer <token> header.
-    The former ?token=<query-param> fallback was removed (DEC-AUTH-002) because
-    query-string tokens leak into access logs, browser history, and Referer headers.
+    Returns a user dict so downstream dependencies (Wave A2 _require_role) can
+    inspect the resolved user's role without re-authenticating.
+
+    Two modes (DEC-AUTH-P6-004, DEC-COMPAT-P6-001):
+
+    single (default):
+        Compares the presented bearer against SHAFERHUND_TOKEN. On match,
+        returns LEGACY_ADMIN_USER (role='admin') so all downstream role checks
+        pass. No database access. Phase 1-5 deployments are byte-identical.
+
+    multi:
+        Calls authenticate_token(conn, bearer) which looks up the SHA-256 hash
+        in user_tokens, validates not-revoked / not-expired / user-not-disabled,
+        and returns the owning user dict. On failure, raises 401.
+
+    In both modes, an unrecognised or missing token raises 401.
+    When SHAFERHUND_TOKEN is unset AND auth_mode is single, the server should
+    be bound to 127.0.0.1 only (uvicorn --host flag) — this function returns
+    LEGACY_ADMIN_USER in that case so health routes still work without a token.
+
+    @decision DEC-AUTH-P6-004
+    @title SHAFERHUND_TOKEN legacy path preserved; multi mode is opt-in
+    @status accepted
+    @rationale See auth.py module docstring for full rationale. The key invariant:
+               in single mode this function behaves identically to Phase 1-5 for
+               callers that don't inspect the return value. Callers that do
+               (Wave A2 role middleware) get a dict with role='admin'.
     """
-    token = _settings.shaferhund_token if _settings else ""
-    if not token:
-        return  # No token configured — localhost-only binding is the guard
+    # Use getattr with defaults so pre-Phase-6 test fixtures (SimpleNamespace)
+    # that lack shaferhund_auth_mode continue to work as single mode (DEC-COMPAT-P6-001).
+    auth_mode = getattr(_settings, "shaferhund_auth_mode", "single") if _settings else "single"
+    legacy_token = getattr(_settings, "shaferhund_token", "") if _settings else ""
 
     provided = None
     if credentials and credentials.scheme.lower() == "bearer":
         provided = credentials.credentials
 
-    if provided != token:
+    # ------------------------------------------------------------------
+    # single mode — legacy SHAFERHUND_TOKEN path (Phase 1-5 compatible)
+    # ------------------------------------------------------------------
+    if auth_mode == "single":
+        if not legacy_token:
+            # No token configured → localhost-only binding is the guard.
+            return LEGACY_ADMIN_USER
+        if provided != legacy_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or missing token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return LEGACY_ADMIN_USER
+
+    # ------------------------------------------------------------------
+    # multi mode — per-user token auth via users + user_tokens tables
+    # ------------------------------------------------------------------
+    # Legacy SHAFERHUND_TOKEN still works as admin-equivalent (DEC-AUTH-P6-004).
+    if legacy_token and provided == legacy_token:
+        return LEGACY_ADMIN_USER
+
+    if not provided:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    user = authenticate_token(_db, provided)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user
 
 
 # ---------------------------------------------------------------------------
