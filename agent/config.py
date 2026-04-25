@@ -92,6 +92,22 @@ class Settings(BaseSettings):
     # Relative paths are resolved from the process CWD (the repo root in compose).
     art_tests_file: str = "atomic_tests.yaml"
 
+    # Phase 5 — AWS CloudTrail S3 poller (REQ-P0-P5-001/002, DEC-CLOUD-002/012)
+    # Master switch — defaults OFF; absent AWS creds is a clean degraded mode.
+    # Setting CLOUDTRAIL_ENABLED=true without valid AWS credentials will log a
+    # warning on each poll cycle and continue — no startup failure (DEC-CLOUD-012).
+    cloudtrail_enabled: bool = False
+    # S3 bucket that receives CloudTrail log objects.
+    cloudtrail_s3_bucket: str = ""
+    # Key prefix within the bucket (e.g. AWSLogs/{account}/CloudTrail/).
+    # Defaults to empty string (polls the whole bucket — not recommended in prod).
+    cloudtrail_s3_prefix: str = ""
+    # AWS region for the boto3 S3 client. The CloudTrail bucket itself may be
+    # in any region; this controls the endpoint the client connects to.
+    cloudtrail_aws_region: str = "us-east-1"
+    # How often (seconds) the poller checks for new S3 objects.
+    cloudtrail_poll_interval_seconds: int = 60
+
     # Phase 4 — Posture SLO + webhook paging (REQ-P0-P4-005)
     # Master switch — default OFF so existing deployments are unaffected.
     posture_slo_enabled: bool = False

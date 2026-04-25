@@ -22,6 +22,21 @@ all prior Phase DBs (DEC-SCHEMA-002). CRUD helpers:
   list_pending_attack_recommendations, mark_attack_recommendation_executed,
   count_pending_attack_recommendations.
 
+Phase 5 Wave A1 additions: cloudtrail_progress table (REQ-P0-P5-001,
+DEC-CLOUD-002, DEC-CLOUD-011). One row per (bucket, prefix) holds the
+S3 StartAfter cursor for the CloudTrail poller — restart-safe, audit-friendly.
+CRUD helpers: get_cloudtrail_cursor, update_cloudtrail_cursor,
+insert_cloudtrail_alert.
+
+@decision DEC-CLOUD-011
+@title cloudtrail_progress uses CREATE TABLE IF NOT EXISTS — idempotent for all prior DBs
+@status accepted
+@rationale Follows DEC-SCHEMA-002 pattern. A Phase 4-baseline DB upgraded to
+           Phase 5 gets the new table on first startup without data loss or
+           migration scripts. The UNIQUE(bucket, prefix) constraint ensures
+           one cursor row per configured (bucket, prefix) pair regardless of
+           how many times init_db runs.
+
 @decision DEC-POSTURE-003
 @title Weighted posture score — declarative YAML weights, additive alongside flat score
 @status accepted
@@ -386,6 +401,44 @@ CREATE INDEX IF NOT EXISTS idx_attack_recommendations_status
 """
 
 
+# ---------------------------------------------------------------------------
+# Phase 5 Wave A1 schema additions — cloudtrail_progress table
+# (REQ-P0-P5-001, DEC-CLOUD-002, DEC-CLOUD-011)
+# ---------------------------------------------------------------------------
+#
+# cloudtrail_progress holds a restart-safe cursor for the S3 poller.
+# One row per (bucket, prefix) pair. The poller reads last_object_key,
+# passes it as StartAfter to list_objects_v2, and writes the new value
+# after each successful batch. Survives restarts without re-ingesting
+# already-processed objects.
+#
+# DEC-CLOUD-002: cursor-in-DB, not in-memory. A restart mid-poll does
+#   not re-process objects already consumed. Same shape as slo_breaches
+#   and deploy_events — consistency over convenience.
+# DEC-CLOUD-011: CREATE TABLE IF NOT EXISTS — idempotent for all prior
+#   Phase DBs (DEC-SCHEMA-002 pattern).
+#
+# Columns:
+#   bucket          — S3 bucket name (part of the unique key).
+#   prefix          — Key prefix within the bucket (part of the unique key).
+#   last_object_key — The S3 object key of the last fully consumed object.
+#                     NULL means "start from the beginning of the prefix."
+#   last_event_ts   — ISO-8601 timestamp of the last parsed event (informational;
+#                     used for /health lag_seconds computation in Wave A3).
+#   updated_at      — ISO-8601 timestamp of the last cursor write.
+_CLOUDTRAIL_PROGRESS_SQL = """
+CREATE TABLE IF NOT EXISTS cloudtrail_progress (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    bucket          TEXT    NOT NULL,
+    prefix          TEXT    NOT NULL,
+    last_object_key TEXT,
+    last_event_ts   TEXT,
+    updated_at      TEXT    NOT NULL,
+    UNIQUE(bucket, prefix)
+);
+"""
+
+
 def init_db(db_path: str) -> sqlite3.Connection:
     """Open (or create) the SQLite database and apply schema.
 
@@ -484,6 +537,9 @@ def init_db(db_path: str) -> sqlite3.Connection:
 
     # Phase 4 Wave B: attack_recommendations table (REQ-P0-P4-001/002) — idempotent.
     conn.executescript(_ATTACK_RECOMMENDATIONS_SQL)
+
+    # Phase 5 Wave A1: cloudtrail_progress table (REQ-P0-P5-001, DEC-CLOUD-011).
+    conn.executescript(_CLOUDTRAIL_PROGRESS_SQL)
 
     conn.commit()
     log.info("Database initialised at %s", db_path)
@@ -1754,3 +1810,126 @@ def count_pending_attack_recommendations(conn: sqlite3.Connection) -> int:
         "SELECT COUNT(*) FROM attack_recommendations WHERE status = 'pending'"
     ).fetchone()
     return int(row[0]) if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 Wave A1 CRUD — cloudtrail_progress cursor helpers
+# (REQ-P0-P5-001, DEC-CLOUD-002, DEC-CLOUD-011)
+# ---------------------------------------------------------------------------
+
+
+def get_cloudtrail_cursor(
+    conn: sqlite3.Connection,
+    bucket: str,
+    prefix: str,
+) -> Optional[sqlite3.Row]:
+    """Return the cloudtrail_progress row for (bucket, prefix), or None.
+
+    The row's last_object_key field is the S3 StartAfter cursor for the
+    next list_objects_v2 call. A None return means the poller has not yet
+    processed any objects for this (bucket, prefix) pair.
+
+    Args:
+        conn:   Open SQLite connection.
+        bucket: S3 bucket name.
+        prefix: Key prefix within the bucket.
+
+    Returns:
+        sqlite3.Row with columns (id, bucket, prefix, last_object_key,
+        last_event_ts, updated_at), or None if no row exists yet.
+    """
+    return conn.execute(
+        "SELECT * FROM cloudtrail_progress WHERE bucket = ? AND prefix = ?",
+        (bucket, prefix),
+    ).fetchone()
+
+
+def update_cloudtrail_cursor(
+    conn: sqlite3.Connection,
+    bucket: str,
+    prefix: str,
+    last_object_key: str,
+    last_event_ts: Optional[str],
+) -> None:
+    """Upsert the cloudtrail_progress cursor for (bucket, prefix).
+
+    Uses INSERT OR REPLACE keyed on the UNIQUE(bucket, prefix) constraint
+    so successive calls are idempotent and restart-safe (DEC-CLOUD-002).
+
+    Args:
+        conn:            Open SQLite connection.
+        bucket:          S3 bucket name.
+        prefix:          Key prefix within the bucket.
+        last_object_key: The S3 key of the last fully consumed object.
+        last_event_ts:   ISO-8601 timestamp of the last parsed event
+                         (may be None if no events were in the object).
+    """
+    from datetime import datetime, timezone as _tz
+    updated_at = datetime.now(_tz.utc).isoformat()
+    with get_cursor(conn) as cur:
+        cur.execute(
+            """
+            INSERT INTO cloudtrail_progress
+                (bucket, prefix, last_object_key, last_event_ts, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(bucket, prefix) DO UPDATE SET
+                last_object_key = excluded.last_object_key,
+                last_event_ts   = excluded.last_event_ts,
+                updated_at      = excluded.updated_at
+            """,
+            (bucket, prefix, last_object_key, last_event_ts, updated_at),
+        )
+
+
+def insert_cloudtrail_alert(
+    conn: sqlite3.Connection,
+    parsed: dict,
+) -> str:
+    """Insert a CloudTrail parsed alert into the alerts + alert_details tables.
+
+    Generates a deterministic alert ID from the parsed dict's rule_id,
+    timestamp, and src_ip so duplicate ingestion of the same CloudTrail event
+    (e.g. on restart before cursor advances) is silently ignored via
+    INSERT OR IGNORE.
+
+    Args:
+        conn:   Open SQLite connection.
+        parsed: Dict returned by parse_cloudtrail_event().
+
+    Returns:
+        The alert ID string (may already exist in the DB — caller can ignore).
+    """
+    import hashlib
+    import uuid as _uuid
+
+    # Build a deterministic ID from the most stable CloudTrail fields.
+    # raw_json contains the full event including eventID which AWS guarantees
+    # unique per event — hashing it gives us dedup for free.
+    raw = parsed.get("raw_json", "")
+    alert_id = str(_uuid.UUID(hashlib.md5(raw.encode(), usedforsecurity=False).hexdigest()))
+
+    with get_cursor(conn) as cur:
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO alerts
+                (id, rule_id, src_ip, severity, cluster_id, source,
+                 dest_ip, protocol, normalized_severity)
+            VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
+            """,
+            (
+                alert_id,
+                parsed.get("rule_id", "cloudtrail:unknown:unknown"),
+                parsed.get("src_ip", "unknown"),
+                parsed.get("severity", 5),
+                "cloudtrail",
+                parsed.get("dest_ip"),
+                parsed.get("protocol", "https"),
+                parsed.get("normalized_severity", "Low"),
+            ),
+        )
+        cur.execute(
+            "INSERT OR IGNORE INTO alert_details (alert_id, raw_json) VALUES (?, ?)",
+            (alert_id, raw),
+        )
+
+    return alert_id
