@@ -146,7 +146,8 @@ def _make_mock_client(responses: list) -> MagicMock:
 def test_tool_schema_valid():
     """Every entry in TOOLS has the required keys and a valid input_schema."""
     # Phase 3 added check_threat_intel as the 7th tool (DEC-ORCH-005).
-    assert len(TOOLS) == 7, f"Expected 7 tools, got {len(TOOLS)}"
+    # Phase 4 Wave B added recommend_attack as the 8th tool (REQ-P0-P4-001).
+    assert len(TOOLS) == 8, f"Expected 8 tools, got {len(TOOLS)}"
 
     required_names = {
         "get_cluster_context",
@@ -155,7 +156,8 @@ def test_tool_schema_valid():
         "write_sigma_rule",
         "recommend_deploy",
         "finalize_triage",
-        "check_threat_intel",  # Phase 3, REQ-P0-P3-005
+        "check_threat_intel",   # Phase 3, REQ-P0-P3-005
+        "recommend_attack",     # Phase 4 Wave B, REQ-P0-P4-001
     }
     found_names = {t["name"] for t in TOOLS}
     assert found_names == required_names, f"Tool name mismatch: {found_names}"

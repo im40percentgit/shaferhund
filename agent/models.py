@@ -15,6 +15,13 @@ column on `posture_test_results`, both added via the idempotent
 _POSTURE_RUNS_PHASE4_COLUMNS pattern (DEC-SCHEMA-002). New helper
 compute_posture_weighted_score_for_run() computes the weighted average.
 
+Phase 4 Wave B additions: attack_recommendations table (DEC-RECOMMEND-001,
+REQ-P0-P4-001/002). Created with CREATE TABLE IF NOT EXISTS — idempotent on
+all prior Phase DBs (DEC-SCHEMA-002). CRUD helpers:
+  insert_attack_recommendation, get_attack_recommendation,
+  list_pending_attack_recommendations, mark_attack_recommendation_executed,
+  count_pending_attack_recommendations.
+
 @decision DEC-POSTURE-003
 @title Weighted posture score — declarative YAML weights, additive alongside flat score
 @status accepted
@@ -344,6 +351,41 @@ CREATE INDEX IF NOT EXISTS idx_slo_breaches_resolved_at
 """
 
 
+# ---------------------------------------------------------------------------
+# Phase 4 Wave B schema additions — attack_recommendations table
+# (REQ-P0-P4-001, REQ-P0-P4-002)
+# ---------------------------------------------------------------------------
+#
+# attack_recommendations: one row per Claude-generated recommendation.
+# Claude writes rows via the recommend_attack tool handler (status='pending').
+# Operator approval flows through POST /recommendations/{id}/execute which
+# calls agent.recommendations.execute_recommendation() and transitions to
+# status='executed'. Rejection (operator declines) sets status='rejected'.
+# Expiration (future: TTL sweep) sets status='expired'.
+#
+# DEC-RECOMMEND-001: Claude's handler ONLY writes status='pending'. Execution
+#   is a separate operator-gated HTTP action, never triggered automatically.
+# DEC-SCHEMA-002: CREATE TABLE IF NOT EXISTS — idempotent for all prior DBs.
+_ATTACK_RECOMMENDATIONS_SQL = """
+CREATE TABLE IF NOT EXISTS attack_recommendations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    cluster_id      TEXT,
+    technique_id    TEXT    NOT NULL,
+    reason          TEXT    NOT NULL,
+    severity        TEXT    NOT NULL CHECK(severity IN ('Low','Medium','High','Critical')),
+    status          TEXT    NOT NULL DEFAULT 'pending'
+                            CHECK(status IN ('pending','executed','rejected','expired')),
+    created_at      TEXT    NOT NULL,
+    executed_at     TEXT,
+    posture_run_id  INTEGER REFERENCES posture_runs(id),
+    notes           TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_attack_recommendations_status
+    ON attack_recommendations(status);
+"""
+
+
 def init_db(db_path: str) -> sqlite3.Connection:
     """Open (or create) the SQLite database and apply schema.
 
@@ -439,6 +481,9 @@ def init_db(db_path: str) -> sqlite3.Connection:
 
     # Phase 4: slo_breaches table (REQ-P0-P4-005) — idempotent via IF NOT EXISTS.
     conn.executescript(_SLO_BREACHES_SQL)
+
+    # Phase 4 Wave B: attack_recommendations table (REQ-P0-P4-001/002) — idempotent.
+    conn.executescript(_ATTACK_RECOMMENDATIONS_SQL)
 
     conn.commit()
     log.info("Database initialised at %s", db_path)
@@ -1571,3 +1616,141 @@ def resolve_slo_breach(
             "UPDATE slo_breaches SET resolved_at = ? WHERE id = ?",
             (resolved_at, breach_id),
         )
+
+
+# ---------------------------------------------------------------------------
+# Attack Recommendations CRUD  (Phase 4 Wave B — REQ-P0-P4-001/002)
+# ---------------------------------------------------------------------------
+
+def insert_attack_recommendation(
+    conn: sqlite3.Connection,
+    technique_id: str,
+    reason: str,
+    severity: str,
+    cluster_id: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> int:
+    """Insert a new attack_recommendations row with status='pending'.
+
+    Called by the recommend_attack tool handler in orchestrator.py. The row
+    represents Claude's suggestion to run an ART technique — it is NOT executed
+    automatically (DEC-RECOMMEND-001). Execution requires operator approval via
+    POST /recommendations/{id}/execute.
+
+    Args:
+        conn:         Open SQLite connection.
+        technique_id: MITRE ATT&CK technique ID (e.g. 'T1059.003').
+        reason:       Claude's rationale (sanitized by the handler before insert).
+        severity:     One of 'Low', 'Medium', 'High', 'Critical'.
+        cluster_id:   Optional cluster being triaged when the recommendation was made.
+                      Soft reference to clusters.id (TEXT). No FK constraint —
+                      the link is informational; tests and standalone handler calls
+                      may supply a cluster_id that does not exist in clusters.
+        notes:        Optional operator notes.
+
+    Returns:
+        The INTEGER PRIMARY KEY of the new row.
+    """
+    created_at = datetime.now(timezone.utc).isoformat()
+    with get_cursor(conn) as cur:
+        cur.execute(
+            """
+            INSERT INTO attack_recommendations
+                (cluster_id, technique_id, reason, severity, status, created_at, notes)
+            VALUES (?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (cluster_id, technique_id, reason, severity, created_at, notes),
+        )
+        return cur.lastrowid
+
+
+def get_attack_recommendation(
+    conn: sqlite3.Connection,
+    recommendation_id: int,
+) -> Optional[sqlite3.Row]:
+    """Return a single attack_recommendations row by id, or None.
+
+    Args:
+        conn:              Open SQLite connection.
+        recommendation_id: The attack_recommendations.id to fetch.
+
+    Returns:
+        sqlite3.Row or None if not found.
+    """
+    return conn.execute(
+        "SELECT * FROM attack_recommendations WHERE id = ?",
+        (recommendation_id,),
+    ).fetchone()
+
+
+def list_pending_attack_recommendations(
+    conn: sqlite3.Connection,
+    limit: int = 50,
+) -> list[sqlite3.Row]:
+    """Return attack_recommendations rows with status='pending', newest first.
+
+    Used by GET /recommendations to surface pending items for operator review.
+
+    Args:
+        conn:  Open SQLite connection.
+        limit: Maximum rows to return (default 50).
+
+    Returns:
+        List of sqlite3.Row objects ordered by created_at DESC.
+    """
+    return conn.execute(
+        """
+        SELECT * FROM attack_recommendations
+        WHERE status = 'pending'
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+
+def mark_attack_recommendation_executed(
+    conn: sqlite3.Connection,
+    recommendation_id: int,
+    posture_run_id: Optional[int] = None,
+) -> None:
+    """Flip a recommendation row from 'pending' to 'executed'.
+
+    Sets executed_at to now(UTC) and links posture_run_id so the operator can
+    correlate the recommendation with the resulting posture run.
+
+    Args:
+        conn:              Open SQLite connection.
+        recommendation_id: The attack_recommendations.id to update.
+        posture_run_id:    The posture_runs.id created by execute_recommendation().
+    """
+    executed_at = datetime.now(timezone.utc).isoformat()
+    with get_cursor(conn) as cur:
+        cur.execute(
+            """
+            UPDATE attack_recommendations
+               SET status         = 'executed',
+                   executed_at    = ?,
+                   posture_run_id = ?
+             WHERE id = ?
+            """,
+            (executed_at, posture_run_id, recommendation_id),
+        )
+
+
+def count_pending_attack_recommendations(conn: sqlite3.Connection) -> int:
+    """Return the count of attack_recommendations rows with status='pending'.
+
+    Used by /health to expose recommendations.pending_count without returning
+    full rows (DEC-HEALTH-002 — public, minimal).
+
+    Args:
+        conn: Open SQLite connection.
+
+    Returns:
+        Integer count, 0 when no pending rows exist.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) FROM attack_recommendations WHERE status = 'pending'"
+    ).fetchone()
+    return int(row[0]) if row else 0
