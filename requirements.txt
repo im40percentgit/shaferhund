@@ -1,4 +1,7 @@
-fastapi==0.115.5
+fastapi==0.124.2
+# FastAPI 0.124 allows Starlette 0.40-0.50; pin the lower bound above
+# CVE-2025-54121 and CVE-2025-62727 affected releases.
+starlette>=0.49.1,<0.51.0
 uvicorn[standard]==0.32.1
 anthropic==0.40.0
 pydantic-settings==2.6.1
@@ -10,8 +13,9 @@ pysigma>=1.2.0
 # sigma-cli: CLI wrapper for pySigma rule conversion.
 # pysigma-backend-wazuh does not exist on PyPI; the Wazuh backend is
 # installed at container build time via `sigma plugin install wazuh`
-# (see Dockerfile).  sigma-cli==1.0.4 is the last stable 1.x release.
-sigma-cli==1.0.4
+# (see Dockerfile).  1.x depends on pysigma<0.12 and conflicts with the
+# pysigma>=1.2 parser API used by the app/tests, so keep this on 3.x.
+sigma-cli==3.0.2
 pytest==9.0.3
 pytest-asyncio==1.3.0
 httpx==0.28.1

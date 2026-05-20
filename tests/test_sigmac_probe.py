@@ -84,21 +84,50 @@ def _make_metrics_client(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_probe_sets_available_true_on_success():
-    """Successful sigma --version → sigmac_available=True, sigmac_version populated."""
+    """Both ``sigma --version`` and ``sigma convert -t wazuh`` succeed →
+    sigmac_available=True, sigmac_version populated (DEC-DEPS-001).
+    """
     settings = _fresh_settings()
-    mock_result = _make_completed_process(0, "sigma-cli, version 1.0.4\n")
+    version_result = _make_completed_process(0, "sigma-cli, version 3.0.2\n")
+    backend_result = _make_completed_process(
+        0, "<group name='probe'><rule id='100100'/></group>\n"
+    )
 
-    with patch("agent.main.subprocess.run", return_value=mock_result) as mock_run:
+    with patch(
+        "agent.main.subprocess.run",
+        side_effect=[version_result, backend_result],
+    ) as mock_run:
         _probe_sigmac(settings)
 
-    mock_run.assert_called_once_with(
-        ["sigma", "--version"],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
+    assert mock_run.call_count == 2
+    first_call, second_call = mock_run.call_args_list
+    assert first_call.args[0] == ["sigma", "--version"]
+    assert second_call.args[0] == ["sigma", "convert", "-t", "wazuh"]
     assert settings.sigmac_available is True
-    assert settings.sigmac_version == "sigma-cli, version 1.0.4"
+    assert settings.sigmac_version == "sigma-cli, version 3.0.2"
+
+
+def test_probe_sets_available_false_when_wazuh_backend_missing(caplog):
+    """``sigma --version`` succeeds but ``sigma convert -t wazuh`` errors →
+    sigmac_available=False, one WARNING citing the missing backend
+    (DEC-DEPS-001: upstream sigma-cli 3.x dropped the wazuh plugin).
+    """
+    settings = _fresh_settings()
+    version_result = _make_completed_process(0, "sigma-cli, version 3.0.2\n")
+    backend_result = _make_completed_process(2, "")  # Click "invalid --target"
+
+    with caplog.at_level(logging.WARNING, logger="agent.main"):
+        with patch(
+            "agent.main.subprocess.run",
+            side_effect=[version_result, backend_result],
+        ):
+            _probe_sigmac(settings)
+
+    assert settings.sigmac_available is False
+    assert settings.sigmac_version is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "wazuh backend" in warnings[0].message
 
 
 def test_probe_sets_available_false_on_filenotfound(caplog):

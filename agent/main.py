@@ -215,14 +215,36 @@ _last_poll_at: Optional[str] = None
 # Sigma-cli startup probe
 # ---------------------------------------------------------------------------
 
-def _probe_sigmac(settings: Settings) -> None:
-    """Probe for sigma-cli at startup and mutate settings fields in place.
+# Minimal Sigma rule used by the wazuh-backend probe.  Kept as a module
+# constant so test_main_probe.py can import and assert against it.
+_PROBE_SIGMA_YAML = (
+    "title: Probe\n"
+    "id: 00000000-0000-0000-0000-000000000001\n"
+    "status: experimental\n"
+    "logsource:\n"
+    "  category: process_creation\n"
+    "  product: linux\n"
+    "detection:\n"
+    "  selection:\n"
+    "    Image|endswith: '/probe'\n"
+    "  condition: selection\n"
+    "level: low\n"
+)
 
-    Runs ``sigma --version`` once. On success, sets sigmac_available=True
-    and sigmac_version to the version string. On any failure
-    (FileNotFoundError, non-zero exit, or TimeoutExpired), leaves
-    sigmac_available=False and logs a single WARNING. Does NOT raise —
-    graceful degradation is the point.
+
+def _probe_sigmac(settings: Settings) -> None:
+    """Probe for sigma-cli + wazuh backend at startup; mutate settings in place.
+
+    Two-step probe:
+      1. ``sigma --version`` must return rc=0 with non-empty stdout.
+      2. ``sigma convert -t wazuh`` (fed _PROBE_SIGMA_YAML on stdin) must
+         return rc=0 with non-empty stdout — proving the wazuh backend plugin
+         is registered and actually converts.
+
+    Only when BOTH succeed is ``sigmac_available`` set to True.  Any other
+    outcome (binary missing, version succeeds but backend missing, convert
+    times out, etc.) leaves ``sigmac_available=False`` and logs a single
+    WARNING.  Does NOT raise — graceful degradation is the point.
 
     @decision DEC-SIGMA-DEGRADE-001
     @title Startup probe flips settings.sigmac_available once; downstream reads the bool
@@ -233,31 +255,56 @@ def _probe_sigmac(settings: Settings) -> None:
                for no benefit. Defaults to False so a misconfigured container can
                never accidentally auto-deploy Sigma rules before the probe confirms
                sigma-cli is usable (fail-safe default).
+
+    @decision DEC-DEPS-001
+    @title Probe verifies wazuh backend, not just sigma binary
+    @status accepted
+    @rationale sigma-cli 3.x dropped the upstream ``wazuh`` plugin from its
+               registry while pysigma>=1.2 is required by the orchestrator's
+               parser.  ``sigma --version`` succeeds on 3.x but
+               ``sigma convert -t wazuh`` errors with rc=2 ("invalid value for
+               --target").  Probing only ``--version`` would set
+               sigmac_available=True against a runtime that errors on every
+               deploy.  The probe must verify the backend it will actually
+               use; honest startup state is non-negotiable.
     """
+    unavailable_msg = (
+        "sigma-cli not available; Sigma rules will generate but not auto-deploy"
+    )
     try:
-        result = subprocess.run(
+        version_result = subprocess.run(
             ["sigma", "--version"],
             capture_output=True,
             text=True,
             timeout=5,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            settings.sigmac_available = True
-            settings.sigmac_version = result.stdout.strip()
-            log.info("sigma-cli available: %s", settings.sigmac_version)
+        if version_result.returncode != 0 or not version_result.stdout.strip():
+            log.warning(unavailable_msg)
             return
-        # Non-zero exit — treat as unavailable
-        log.warning(
-            "sigma-cli not available; Sigma rules will generate but not auto-deploy"
+        version_str = version_result.stdout.strip()
+
+        backend_result = subprocess.run(
+            ["sigma", "convert", "-t", "wazuh"],
+            input=_PROBE_SIGMA_YAML,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
+        if backend_result.returncode != 0 or not backend_result.stdout.strip():
+            log.warning(
+                "sigma-cli %s present but wazuh backend missing or non-functional; "
+                "Sigma rules will generate but not auto-deploy",
+                version_str,
+            )
+            return
+
+        settings.sigmac_available = True
+        settings.sigmac_version = version_str
+        log.info("sigma-cli available with wazuh backend: %s", version_str)
     except FileNotFoundError:
-        log.warning(
-            "sigma-cli not available; Sigma rules will generate but not auto-deploy"
-        )
+        log.warning(unavailable_msg)
     except subprocess.TimeoutExpired:
-        log.warning(
-            "sigma-cli not available; Sigma rules will generate but not auto-deploy"
-        )
+        log.warning(unavailable_msg)
 
 
 # ---------------------------------------------------------------------------

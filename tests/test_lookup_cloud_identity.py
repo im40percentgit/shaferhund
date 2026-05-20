@@ -208,11 +208,18 @@ def test_handler_aggregates_events_for_principal():
     alice = "arn:aws:iam::123:user/alice"
     bob = "arn:aws:iam::123:user/bob"
 
-    _seed_event(conn, alice, src_ip="10.0.0.1", event_name="DescribeInstances", event_time="2026-04-25T01:00:00Z")
-    _seed_event(conn, alice, src_ip="10.0.0.2", event_name="ListBuckets",        event_time="2026-04-25T02:00:00Z")
-    _seed_event(conn, alice, src_ip="10.0.0.3", event_name="GetObject",          event_time="2026-04-25T03:00:00Z")
-    _seed_event(conn, bob,   src_ip="10.1.0.1", event_name="CreateUser",         event_time="2026-04-25T01:30:00Z")
-    _seed_event(conn, bob,   src_ip="10.1.0.2", event_name="DeleteUser",         event_time="2026-04-25T02:30:00Z")
+    # Relative timestamps (1–5h ago) so the test is not time-bombed: a
+    # hardcoded calendar date would fall outside the default ``lookback_hours``
+    # window once enough wall-clock time passes after the test was written.
+    now = datetime.now(timezone.utc)
+    def _ago(hours: int) -> str:
+        return (now - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    _seed_event(conn, alice, src_ip="10.0.0.1", event_name="DescribeInstances", event_time=_ago(5))
+    _seed_event(conn, alice, src_ip="10.0.0.2", event_name="ListBuckets",        event_time=_ago(4))
+    _seed_event(conn, alice, src_ip="10.0.0.3", event_name="GetObject",          event_time=_ago(3))
+    _seed_event(conn, bob,   src_ip="10.1.0.1", event_name="CreateUser",         event_time=_ago(4))
+    _seed_event(conn, bob,   src_ip="10.1.0.2", event_name="DeleteUser",         event_time=_ago(3))
 
     result_str = _handle_lookup_cloud_identity(
         {"principal_arn": alice, "lookback_hours": 168},
