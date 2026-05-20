@@ -265,11 +265,11 @@ Wave A is fully parallel — four independent worktrees (auth schema, RBAC dep, 
 
 ---
 
-## Phase 7: Multi-Cloud + Adversarial Cloud-Technique Scoring (3–4 weeks)
+## Phase 7: Multi-Cloud + Adversarial Cloud-Technique Scoring (4–5 weeks)
 
 **Status:** planned
-**Timebox:** 3–4 weeks
-**Entry checklist:** PR #87 (`chore/security-hardening-htmx-cve-sigmac3`) merged so `main` is on sigma-cli 3.x with the honest probe; issue #77 (Wave D dashboards) folded into Wave A4 below; issue #78 (`lookup_cloud_identity` operator-chain join) recommend-closed (see DEC-PHASE7-009).
+**Timebox:** 4–5 weeks (extended from Phase 6's 3–4 weeks; Phase 7 ships two new source pipelines AND the scoring loop, vs Phase 6's two paired areas).
+**Entry checklist:** PR #87 (`chore/security-hardening-htmx-cve-sigmac3`) merged so `main` is on sigma-cli 3.x with the honest probe; issue #77 (Wave D dashboards) folded into Phase 7 Wave A as REQ-P0-P7-006; issue #78 (`lookup_cloud_identity` operator-chain join) **folded into Phase 7 Wave C as REQ-P0-P7-008** (advisor-flagged 2026-05-19: the chain-join primitive is provider-agnostic and is exactly what cross-provider T1078.004 scoring needs — close-recommend would have orphaned the primitive Phase 7's scoring loop depends on).
 
 ### Intent
 
@@ -300,6 +300,7 @@ Phase 7 explicitly does NOT touch multi-tenant (Phase 6 RBAC has not yet complet
 - **REQ-P0-P7-005:** Adversarial cloud-technique scoring loop — `agent/cloud_score.py` runs T1078.004 + T1098.001 + T1098.002 + T1098.003 scenarios via `agent/redteam_target.py`, executes them against each provider's normalised event store, records `cloud_technique_scores` rows (technique × provider × score × ran_at), surfaces via `GET /cloud/score`.
 - **REQ-P0-P7-006:** Wave D #77 dashboards folded in — `/auth/users`, `/fleet/agents`, rule-tag editor (REQ-P1-P6-001 / 002 / 003 carry-forward) with the per-provider filter added to the cluster + cloud-findings views.
 - **REQ-P0-P7-007:** Zero-regression gate — all Phase 1–6 tests pass unchanged; `/health` block count grows from 9 to 10 (adds `cloud.providers` + `cloud.score`); orchestrator tool count stays at 9 (Phase 7 is source + scoring, not new agent tools).
+- **REQ-P0-P7-008:** Cross-provider operator-chain join — `lookup_cloud_identity` response shape gains `operator_chain` (from issue #78, REQ-P1-P6-004 carry-forward) joining `audit_log.actor_user_id` with cloud findings by IAM principal × time window; the join is **provider-agnostic** and supplies the cross-provider operator-deconfliction signal that REQ-P0-P7-005 (adversarial scoring) needs to detect T1078.004 *Valid Accounts: Cloud Accounts* across AWS/GCP/Azure (when one operator's credential surfaces on a provider they never touched manually).
 
 ### Non-Goals
 
@@ -318,11 +319,12 @@ Phase 7 explicitly does NOT touch multi-tenant (Phase 6 RBAC has not yet complet
 
 ### Pair Rationale
 
-Phase 6 succeeded because fleet + auth reinforced each other (per-endpoint identity unblocked rule scoping; rule scoping was the concrete requirement that prevented over-engineering the identity surface). Phase 7 picks the same shape:
+Phase 6 succeeded because fleet + auth were *symmetrically* coupled: fleet without auth was unsafe (no per-endpoint identity), auth without fleet was over-engineering (no concrete operational requirement). Phase 7's pair is **asymmetric** and the rationale is honest about that:
 
-- **Multi-cloud creates the surface** adversarial scoring needs. Coverage measurement against one provider tells you about *that detector*, not about cloud-technique coverage. Three providers × shared techniques is the smallest matrix that produces a real coverage signal.
-- **Adversarial scoring earns the multi-cloud spend.** Without it, "we ingest GCP audit logs too" is just three taps instead of one. The scoring loop turns the broader surface into a falsifiable claim: *for technique T, on provider P, our detector fires N% of the time we exercise the adversary path.*
-- **Both halves use Phase 6 primitives.** GCP + Azure ingest scopes through the Phase 6 RBAC tag model; scoring runs through `_require_role('operator')` + `audit_log` exactly like every other write-side route. No new identity surface needed.
+- **Scoring is the loop-closer.** Multi-cloud without adversarial scoring is just three taps instead of one — broader surface with no signal-quality feedback. The scoring loop turns the surface into a falsifiable claim: *for technique T, on provider P, our detector fires N% of the time we exercise the adversary path.*
+- **Multi-cloud is the substrate.** Scoring genuinely needs cross-provider data — T1078.004 and T1098.x are inherently cross-provider techniques (the adversary uses *one* credential across providers). Single-provider scoring is anaemic; you'd be measuring the AWS detector against the AWS detector. Three providers is the smallest matrix that produces a real coverage signal.
+- **The asymmetry is acceptable because the substrate has standalone value.** Even without the scoring loop, GCP + Azure ingest gives an AWS-only deployment immediate visibility expansion to teams that aren't pure-AWS. Scoring layered on top earns the multi-cloud spend by turning visibility into measurement. (Contrast with Phase 6: fleet without auth was *negative* value because it was unsafe; here multi-cloud without scoring is *positive but incomplete*.)
+- **Both halves use Phase 6 primitives.** GCP + Azure ingest scopes through the Phase 6 RBAC tag model; scoring runs through `_require_role('operator')` + `audit_log` exactly like every other write-side route. No new identity surface needed. REQ-P0-P7-008 (cross-provider operator-chain join, folded in from issue #78) supplies the deconfliction primitive scoring requires.
 
 Alternative pairs considered and rejected:
 
@@ -338,8 +340,10 @@ Alternative pairs considered and rejected:
 
 - **Wave A** (parallel, ~5 issues): Sigma → Wazuh backend restoration (REQ-P0-P7-004 — pre-req for Sigma resume); GCP audit source skeleton (REQ-P0-P7-001); Azure activity source skeleton (REQ-P0-P7-002); cross-provider detector mapping (REQ-P0-P7-003); P1 dashboards fold-in (REQ-P0-P7-006).
 - **Wave B** (gated on A, ~3 issues): GCP source end-to-end + RBAC scoping; Azure source end-to-end + RBAC scoping; per-provider `/cloud/findings` filter + `/health` `cloud.providers[]` block.
-- **Wave C** (gated on B, ~2 issues): adversarial cloud-technique scoring loop (REQ-P0-P7-005); `/cloud/score` + `POST /cloud/score/run`; `cloud_technique_scores` table + history retention.
+- **Wave C** (gated on B, ~3 issues): cross-provider operator-chain join — `lookup_cloud_identity.operator_chain` (REQ-P0-P7-008); adversarial cloud-technique scoring loop (REQ-P0-P7-005); `/cloud/score` + `POST /cloud/score/run`; `cloud_technique_scores` table + history retention.
 - **Wave D** (regression gate, 1 issue): zero-regression on all Phase 1–6 tests; 9-tool transcript holds; `/health` grows to 10 blocks (REQ-P0-P7-007).
+
+**Scope honesty:** ~12 issues across waves, vs Phase 6's 10. The 4–5-week timebox (vs Phase 6's 3–4) reflects the additional surface — two new providers AND the scoring loop AND the chain-join primitive. If GCP+Azure ingest proves more involved than the CloudTrail-pattern lift suggests, Wave A may split Azure into Phase 7.5 (no architecture change, just timebox honesty).
 
 Wave A is fully parallel: five independent worktrees. Wave B gates on A. Wave C gates on B (needs the multi-provider surface populated). Wave D is the regression gate, same shape as Phase 6 Wave C.
 
@@ -355,7 +359,7 @@ Wave A is fully parallel: five independent worktrees. Wave B gates on A. Wave C 
 | DEC-PHASE7-006 | No new orchestrator tools (count stays at 9); same rationale as DEC-ORCH-P6-001 | planned |
 | DEC-PHASE7-007 | Sigma → Wazuh backend restoration in Wave A is **mandatory** — DEC-DEPS-001 (sigma-cli 3.x dropped wazuh plugin) cannot stand for the duration of Phase 7; either upstream restores, we fork, or we vendor | planned |
 | DEC-PHASE7-008 | Wave D #77 dashboards (auth/users, fleet/agents, rule-tag editor) **folded in** as REQ-P0-P7-006 — already P1 polish, dashboards are needed regardless once multi-cloud lands so users can filter by provider | planned |
-| DEC-PHASE7-009 | Wave D #78 (`lookup_cloud_identity` operator-chain join, REQ-P1-P6-004) **recommend-close** — AWS-specific principal-chain join; multi-cloud architecture supersedes the single-provider chain model; revisit if Phase 8+ multi-tenant work demands it | planned |
+| DEC-PHASE7-009 | Wave D #78 (`lookup_cloud_identity` operator-chain join, REQ-P1-P6-004) **folded in** as REQ-P0-P7-008 — re-read on advisor flag revealed the join is provider-agnostic (`audit_log.actor_user_id` ⨝ cloud findings by IAM principal × time window) and is the exact deconfliction primitive REQ-P0-P7-005 (cross-provider T1078.004/T1098.x scoring) needs. Closing it would have orphaned a Phase 7 dependency. | planned |
 | DEC-PHASE7-010 | `hund → ROADMAP.md` carry-forward **recommend-close** — Phase 6 architecture is settled; the `hund` repo's intent is now operationally encoded in this `MASTER_PLAN.md` plus the archived Phase 1–5 plan; further conversion adds no signal | planned |
 
 ### Standing Invariants Honoured
@@ -372,6 +376,6 @@ Wave A is fully parallel: five independent worktrees. Wave B gates on A. Wave C 
 ## TODOs
 
 - [x] Phase 7 scoping — superseded by the `## Phase 7` section above (pair = multi-cloud + adversarial cloud-technique scoring; 10 P0 requirements + 12 NOGOs enumerated). Carry-forward candidates not selected for Phase 7 remain NOGO until a future phase picks them up.
-- [x] Phase 6 Wave D — resolved in DEC-PHASE7-008 (#77 dashboards **folded into Phase 7 as REQ-P0-P7-006**) and DEC-PHASE7-009 (#78 `lookup_cloud_identity` operator-chain join **recommend-close** as superseded by the multi-cloud architecture).
+- [x] Phase 6 Wave D — resolved in DEC-PHASE7-008 (#77 dashboards **folded into Phase 7 as REQ-P0-P7-006**) and DEC-PHASE7-009 (#78 `lookup_cloud_identity` operator-chain join **folded into Phase 7 as REQ-P0-P7-008** — the chain-join primitive is provider-agnostic and supplies the cross-provider deconfliction signal Phase 7's adversarial scoring needs).
 - [x] Convert `hund` repo to ROADMAP.md form — **recommend-close** per DEC-PHASE7-010 (Phase 6 architecture is settled; intent is operationally encoded in this `MASTER_PLAN.md` plus the archived Phase 1–5 plan; further conversion adds no signal).
 - [ ] CONFIG-level harness todos surviving from Phase 5: backlog #2 (rule-test fixtures harness), backlog #4 (Wazuh integration test harness), backlog #6 (CI matrix for source pipelines). Backlog #5 was closed by DEC-CLOUD-013 in Phase 5. Phase 6 added no new harness debt — DEC-FLEET-P6-005 honours the standing `*_INTEGRATION=1` gate pattern.
