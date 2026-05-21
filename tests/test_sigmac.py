@@ -192,23 +192,24 @@ def test_convert_raises_on_invalid_yaml():
 # ---------------------------------------------------------------------------
 
 
-def _sigma_on_path() -> bool:
-    """Return True if sigma-cli is available."""
+def _sigma_wazuh_backend_available() -> bool:
+    """Return True if sigma-cli can convert with the Wazuh backend."""
     try:
-        subprocess.run(
-            ["sigma", "--version"],
+        result = subprocess.run(
+            ["sigma", "convert", "-t", "wazuh"],
+            input=MINIMAL_SIGMA_YAML,
             capture_output=True,
             text=True,
             timeout=5,
         )
-        return True
+        return result.returncode == 0 and bool(result.stdout.strip())
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
 
 
 @pytest.mark.skipif(
-    not _sigma_on_path(),
-    reason="sigma-cli not installed in this environment",
+    not _sigma_wazuh_backend_available(),
+    reason="sigma-cli Wazuh backend is not installed in this environment",
 )
 def test_convert_real_invocation_happy_path(tmp_path):
     """Real sigma-cli invocation: verifies the subprocess contract end-to-end.
